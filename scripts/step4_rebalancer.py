@@ -52,6 +52,11 @@ STEP4_ENABLE_SPOT_PATCH = os.getenv("STEP4_ENABLE_SPOT_PATCH", "1").strip().lowe
 STEP4_SPOT_PATCH_RETRIES = int(os.getenv("STEP4_SPOT_PATCH_RETRIES", "2"))
 STEP4_SPOT_PATCH_SLEEP = float(os.getenv("STEP4_SPOT_PATCH_SLEEP", "0.3"))
 STEP4_ATR_SLIPPAGE_FACTOR = float(os.getenv("STEP4_ATR_SLIPPAGE_FACTOR", "0.25"))
+STEP4_BUY_BLOCK_REGIMES = {
+    x.strip().upper()
+    for x in os.getenv("STEP4_BUY_BLOCK_REGIMES", "CRASH,BLACK_SWAN").split(",")
+    if x.strip() and x.strip().upper() != "COOLDOWN"
+}
 
 
 @dataclass
@@ -140,12 +145,14 @@ class WyckoffOrderEngine:
         position_map: dict[str, PositionItem],
         latest_price_map: dict[str, float],
         atr_map: dict[str, float] | None = None,
+        market_regime: str | None = None,
     ) -> None:
         self.total_equity = float(max(total_equity, 0.0))
         self.free_cash = float(max(free_cash, 0.0))
         self.position_map = position_map
         self.latest_price_map = latest_price_map
         self.atr_map = atr_map or {}
+        self.market_regime = str(market_regime or "NEUTRAL").strip().upper()
 
     def process(self, decisions: list[DecisionItem]) -> tuple[list[ExecutionTicket], float]:
         ordered = sorted(decisions, key=lambda d: self.PRIORITY_MAP.get(d.action, 99))
@@ -296,6 +303,12 @@ class WyckoffOrderEngine:
             )
 
         # BUY: PROBE / ATTACK
+        if action in {"PROBE", "ATTACK"} and self.market_regime in STEP4_BUY_BLOCK_REGIMES:
+            return self._no_trade(
+                dec,
+                name,
+                f"系统性风控拦截: regime={self.market_regime} 禁止买入",
+            )
         if effective_stop_loss is None:
             if held_shares >= 100:
                 return self._approved_hold(
@@ -1141,13 +1154,25 @@ def run(
     name_map = {p.code: p.name for p in portfolio.positions}
 
     benchmark_text = ""
+    market_regime = "NEUTRAL"
+    panic_reasons = []
     if benchmark_context:
+        market_regime = str(benchmark_context.get("regime", "NEUTRAL") or "NEUTRAL").upper()
+        panic_reasons = benchmark_context.get("panic_reasons", []) or []
         benchmark_text = (
             "[宏观水温]\n"
-            f"regime={benchmark_context.get('regime')}, close={benchmark_context.get('close')}, "
+            f"regime={market_regime}, close={benchmark_context.get('close')}, "
             f"ma50={benchmark_context.get('ma50')}, ma200={benchmark_context.get('ma200')}, "
-            f"recent3={benchmark_context.get('recent3_pct')}, cum3={benchmark_context.get('recent3_cum_pct')}\n\n"
+            f"recent3={benchmark_context.get('recent3_pct')}, cum3={benchmark_context.get('recent3_cum_pct')}, "
+            f"smallcap_today={benchmark_context.get('smallcap_today_pct')}\n"
         )
+        if market_regime in STEP4_BUY_BLOCK_REGIMES:
+            benchmark_text += (
+                "⚠️ 当前为系统防御期，OMS 将强制拦截全部买入动作（仅允许 HOLD/TRIM/EXIT）。\n"
+            )
+        if panic_reasons:
+            benchmark_text += "panic_reasons=" + " | ".join(str(x) for x in panic_reasons) + "\n"
+        benchmark_text += "\n"
 
     user_message = (
         benchmark_text
@@ -1257,6 +1282,7 @@ def run(
         position_map={p.code: p for p in portfolio.positions},
         latest_price_map=latest_price_map,
         atr_map=atr_map,
+        market_regime=market_regime,
     )
     tickets, free_cash_after = engine.process(decisions)
 

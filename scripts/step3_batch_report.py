@@ -378,6 +378,10 @@ def _safe_return(series: pd.Series, lookback: int = 10) -> float | None:
 
 def _resolve_bias_range(regime: str | None) -> tuple[float, float]:
     r = str(regime or "").upper()
+    if r == "BLACK_SWAN":
+        return (0.0, 15.0)
+    if r == "CRASH":
+        return (0.0, 20.0)
     if r == "RISK_ON":
         return (-5.0, 45.0)
     if r == "RISK_OFF":

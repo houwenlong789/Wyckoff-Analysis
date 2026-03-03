@@ -4,7 +4,7 @@
 # 商业授权请联系作者支付授权费用。
 
 """
-统一数据源：个股 akshare→baostock→efinance→tushare；大盘 tushare 直连
+统一数据源：个股默认 akshare→baostock→efinance→tushare；大盘 tushare 直连
 
 输出格式与 akshare 兼容：日期, 开盘, 最高, 最低, 收盘, 成交量, 成交额, 涨跌幅, 换手率, 振幅
 """
@@ -15,6 +15,7 @@ import atexit
 import json
 import os
 import re
+import socket
 import threading
 import time
 from datetime import date
@@ -39,11 +40,48 @@ _DATA_SOURCE_DEBUG = os.getenv("DATA_SOURCE_DEBUG", "").strip().lower() in {
     "yes",
     "on",
 }
+_BAOSTOCK_MAX_SECONDS = float(os.getenv("BAOSTOCK_MAX_SECONDS", "2.0"))
+_BAOSTOCK_SOCKET_TIMEOUT = float(os.getenv("BAOSTOCK_SOCKET_TIMEOUT", "3.0"))
+_BAOSTOCK_CIRCUIT_THRESHOLD = int(os.getenv("BAOSTOCK_CIRCUIT_THRESHOLD", "10"))
+_BAOSTOCK_CONSEC_FAILS = 0
+_BAOSTOCK_CIRCUIT_OPEN = False
+_BAOSTOCK_CIRCUIT_NOTE = ""
 
 
 def _debug_source_fail(source: str, err: Exception) -> None:
     if _DATA_SOURCE_DEBUG:
         print(f"[data_source] {source} failed: {type(err).__name__}: {err}")
+
+
+def _baostock_circuit_state() -> tuple[bool, str]:
+    with _BAOSTOCK_LOCK:
+        return (_BAOSTOCK_CIRCUIT_OPEN, _BAOSTOCK_CIRCUIT_NOTE)
+
+
+def _baostock_mark_success() -> None:
+    global _BAOSTOCK_CONSEC_FAILS
+    with _BAOSTOCK_LOCK:
+        _BAOSTOCK_CONSEC_FAILS = 0
+
+
+def _baostock_mark_failure(reason: str) -> None:
+    global _BAOSTOCK_CONSEC_FAILS, _BAOSTOCK_CIRCUIT_OPEN, _BAOSTOCK_CIRCUIT_NOTE
+    with _BAOSTOCK_LOCK:
+        _BAOSTOCK_CONSEC_FAILS += 1
+        if (
+            not _BAOSTOCK_CIRCUIT_OPEN
+            and _BAOSTOCK_CIRCUIT_THRESHOLD > 0
+            and _BAOSTOCK_CONSEC_FAILS >= _BAOSTOCK_CIRCUIT_THRESHOLD
+        ):
+            _BAOSTOCK_CIRCUIT_OPEN = True
+            _BAOSTOCK_CIRCUIT_NOTE = (
+                f"consecutive_failures={_BAOSTOCK_CONSEC_FAILS}, reason={reason}"
+            )
+            if _DATA_SOURCE_DEBUG:
+                print(
+                    "[data_source] baostock circuit opened: "
+                    f"{_BAOSTOCK_CIRCUIT_NOTE}"
+                )
 
 
 def _compact_error(err: Exception, max_len: int = 120) -> str:
@@ -249,20 +287,34 @@ def _fetch_stock_baostock(symbol: str, start: str, end: str) -> pd.DataFrame:
     start_dash = f"{start[:4]}-{start[4:6]}-{start[6:]}"
     end_dash = f"{end[:4]}-{end[4:6]}-{end[6:]}"
     with _BAOSTOCK_LOCK:
+        old_sock_timeout = socket.getdefaulttimeout()
+        if _BAOSTOCK_SOCKET_TIMEOUT > 0:
+            socket.setdefaulttimeout(_BAOSTOCK_SOCKET_TIMEOUT)
         bs = _ensure_baostock_login()
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount,pctChg",
-            start_date=start_dash,
-            end_date=end_dash,
-            frequency="d",
-            adjustflag="2",  # 前复权
-        )
-        if rs.error_code != "0":
-            raise RuntimeError(f"baostock: {rs.error_msg}")
-        rows: list[list[str]] = []
-        while rs.next():
-            rows.append(rs.get_row_data())
+        try:
+            started = time.monotonic()
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,open,high,low,close,volume,amount,pctChg",
+                start_date=start_dash,
+                end_date=end_dash,
+                frequency="d",
+                adjustflag="2",  # 前复权
+            )
+            if rs.error_code != "0":
+                raise RuntimeError(f"baostock: {rs.error_msg}")
+            rows: list[list[str]] = []
+            while rs.next():
+                if (
+                    _BAOSTOCK_MAX_SECONDS > 0
+                    and (time.monotonic() - started) > _BAOSTOCK_MAX_SECONDS
+                ):
+                    raise TimeoutError(
+                        f"baostock hard timeout > {_BAOSTOCK_MAX_SECONDS:.2f}s"
+                    )
+                rows.append(rs.get_row_data())
+        finally:
+            socket.setdefaulttimeout(old_sock_timeout)
     if not rows:
         raise RuntimeError("baostock empty")
     df = pd.DataFrame(rows, columns=rs.fields)
@@ -454,6 +506,10 @@ def fetch_stock_hist(
 ) -> pd.DataFrame:
     """
     个股日线：akshare → baostock → efinance（各试一次），全失败再用 tushare。
+    可用环境变量按需禁用数据源：
+    - DATA_SOURCE_DISABLE_AKSHARE=1
+    - DATA_SOURCE_DISABLE_BAOSTOCK=1
+    - DATA_SOURCE_DISABLE_EFINANCE=1
     返回列：日期, 开盘, 最高, 最低, 收盘, 成交量, 成交额, 涨跌幅, 换手率, 振幅
     """
     start_s = (
@@ -467,7 +523,19 @@ def fetch_stock_hist(
 
     failed_sources: list[str] = []
     failed_details: list[str] = []
+    disable_akshare = os.getenv("DATA_SOURCE_DISABLE_AKSHARE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     disable_baostock = os.getenv("DATA_SOURCE_DISABLE_BAOSTOCK", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    disable_efinance = os.getenv("DATA_SOURCE_DISABLE_EFINANCE", "").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -475,46 +543,69 @@ def fetch_stock_hist(
     }
 
     # 1. akshare
-    try:
-        return _tag_source(
-            _fetch_stock_akshare(symbol, start_s, end_s, adjust), "akshare"
-        )
-    except ModuleNotFoundError as e:
-        _debug_source_fail("akshare", e)
-        failed_sources.append(f"akshare(缺少依赖 {e.name})")
-        failed_details.append(f"akshare={_compact_error(e)}")
-    except Exception as e:
-        _debug_source_fail("akshare", e)
-        failed_sources.append("akshare")
-        failed_details.append(f"akshare={_compact_error(e)}")
+    if disable_akshare:
+        failed_sources.append("akshare(disabled)")
+        failed_details.append("akshare=disabled_by_env")
+    else:
+        try:
+            return _tag_source(
+                _fetch_stock_akshare(symbol, start_s, end_s, adjust), "akshare"
+            )
+        except ModuleNotFoundError as e:
+            _debug_source_fail("akshare", e)
+            failed_sources.append(f"akshare(缺少依赖 {e.name})")
+            failed_details.append(f"akshare={_compact_error(e)}")
+        except Exception as e:
+            _debug_source_fail("akshare", e)
+            failed_sources.append("akshare")
+            failed_details.append(f"akshare={_compact_error(e)}")
 
     # 2. baostock (仅前复权)
+    baostock_circuit_open, baostock_circuit_note = _baostock_circuit_state()
     if disable_baostock:
         failed_sources.append("baostock(disabled)")
         failed_details.append("baostock=disabled_by_env")
+    elif baostock_circuit_open:
+        note = baostock_circuit_note or "circuit_open"
+        failed_sources.append("baostock(circuit_open)")
+        failed_details.append(f"baostock={note}")
     else:
+        started = time.monotonic()
         try:
-            return _tag_source(_fetch_stock_baostock(symbol, start_s, end_s), "baostock")
+            df = _fetch_stock_baostock(symbol, start_s, end_s)
+            elapsed = time.monotonic() - started
+            if _BAOSTOCK_MAX_SECONDS > 0 and elapsed > _BAOSTOCK_MAX_SECONDS:
+                raise TimeoutError(
+                    f"baostock slow={elapsed:.2f}s > {_BAOSTOCK_MAX_SECONDS:.2f}s"
+                )
+            _baostock_mark_success()
+            return _tag_source(df, "baostock")
         except ModuleNotFoundError as e:
             _debug_source_fail("baostock", e)
+            _baostock_mark_failure(_compact_error(e))
             failed_sources.append(f"baostock(未安装: {e.name})")
             failed_details.append(f"baostock={_compact_error(e)}")
         except Exception as e:
             _debug_source_fail("baostock", e)
+            _baostock_mark_failure(_compact_error(e))
             failed_sources.append("baostock")
             failed_details.append(f"baostock={_compact_error(e)}")
 
     # 3. efinance (仅前复权)
-    try:
-        return _tag_source(_fetch_stock_efinance(symbol, start_s, end_s), "efinance")
-    except ModuleNotFoundError as e:
-        _debug_source_fail("efinance", e)
-        failed_sources.append(f"efinance(未安装: {e.name})")
-        failed_details.append(f"efinance={_compact_error(e)}")
-    except Exception as e:
-        _debug_source_fail("efinance", e)
-        failed_sources.append("efinance")
-        failed_details.append(f"efinance={_compact_error(e)}")
+    if disable_efinance:
+        failed_sources.append("efinance(disabled)")
+        failed_details.append("efinance=disabled_by_env")
+    else:
+        try:
+            return _tag_source(_fetch_stock_efinance(symbol, start_s, end_s), "efinance")
+        except ModuleNotFoundError as e:
+            _debug_source_fail("efinance", e)
+            failed_sources.append(f"efinance(未安装: {e.name})")
+            failed_details.append(f"efinance={_compact_error(e)}")
+        except Exception as e:
+            _debug_source_fail("efinance", e)
+            failed_sources.append("efinance")
+            failed_details.append(f"efinance={_compact_error(e)}")
 
     # 4. tushare（可选，未配置则直接报错）
     from utils.tushare_client import get_pro
