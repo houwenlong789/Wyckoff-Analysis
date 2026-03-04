@@ -12,7 +12,7 @@
 
 | 功能 | 说明 |
 |------|------|
-| 📊 **每日选股** | 配置 GitHub Actions 后，工作日 18:30 自动跑 Wyckoff Funnel，从主板+创业板筛选候选并推送飞书 |
+| 📊 **每日选股** | 配置 GitHub Actions 后，北京时间周日到周四 18:30 自动跑 Wyckoff Funnel，从主板+创业板筛选候选并推送飞书 |
 | 📘 **策略手册** | 见 `README_STRATEGY.md`（策略流程、风控公式、Step2/3/4 执行口径） |
 | 🔬 **Wyckoff Funnel** | 4 层漏斗筛选：剥离垃圾 → 强弱甄别 → 板块共振 → 威科夫狙击 |
 | 🤖 **AI 研报** | 对筛选结果生成观察池 + 操作池，含技术结构、阻力位、交易计划等 |
@@ -86,7 +86,7 @@ python -u -m integrations.fetch_a_share_csv --symbols 000973 600798 601390
 
 仓库内置工作流：`.github/workflows/wyckoff_funnel.yml`
 
-- **定时**：工作日 16:30（北京时间）
+- **定时**：北京时间周日到周四 18:30
 - **手动**：Actions 页面选择 `Wyckoff Funnel` → `Run workflow`
 
 ### 配置 GitHub Secrets
