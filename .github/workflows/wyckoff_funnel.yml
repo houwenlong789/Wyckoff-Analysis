@@ -36,7 +36,6 @@ jobs:
       STEP4_MAX_HOLD_DAYS: "5"
       STEP4_PROBE_BUDGET_LIMIT: "0.10"
       STEP4_ATTACK_BUDGET_LIMIT: "0.20"
-      FUNNEL_PANIC_SNAPSHOT_TIMEOUT: "25"
       TZ: Asia/Shanghai
 
     steps:

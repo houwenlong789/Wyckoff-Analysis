@@ -65,13 +65,6 @@ RETRY_BASE_DELAY = float(os.getenv("FUNNEL_RETRY_BASE_DELAY", "1.0"))
 SOCKET_TIMEOUT = int(os.getenv("FUNNEL_SOCKET_TIMEOUT", "20"))
 FETCH_TIMEOUT = int(os.getenv("FUNNEL_FETCH_TIMEOUT", "45"))
 BATCH_TIMEOUT = int(os.getenv("FUNNEL_BATCH_TIMEOUT", "420"))
-PANIC_SNAPSHOT_TIMEOUT = max(
-    float(os.getenv("FUNNEL_PANIC_SNAPSHOT_TIMEOUT", "25.0")),
-    1.0,
-)
-PANIC_SNAPSHOT_RETRIES = max(int(os.getenv("FUNNEL_PANIC_SNAPSHOT_RETRIES", "3")), 1)
-PANIC_SNAPSHOT_BACKOFF_BASE = max(float(os.getenv("FUNNEL_PANIC_SNAPSHOT_BACKOFF_BASE", "1.0")), 0.0)
-PANIC_LOCAL_MIN_SAMPLES = max(int(os.getenv("FUNNEL_PANIC_LOCAL_MIN_SAMPLES", "1000")), 1)
 BATCH_SIZE = int(os.getenv("FUNNEL_BATCH_SIZE", "250"))
 BATCH_SLEEP = float(os.getenv("FUNNEL_BATCH_SLEEP", "2"))
 MAX_WORKERS = int(os.getenv("FUNNEL_MAX_WORKERS", "8"))
@@ -97,8 +90,6 @@ CRASH_MAIN_DAY_DROP_PCT = float(os.getenv("FUNNEL_CRASH_MAIN_DAY_DROP_PCT", "-1.
 CRASH_SMALL_DAY_DROP_PCT = float(os.getenv("FUNNEL_CRASH_SMALL_DAY_DROP_PCT", "-2.5"))
 CRASH_BREADTH_RATIO_PCT = float(os.getenv("FUNNEL_CRASH_BREADTH_RATIO_PCT", "15.0"))
 CRASH_BREADTH_DELTA_PCT = float(os.getenv("FUNNEL_CRASH_BREADTH_DELTA_PCT", "-20.0"))
-CRASH_EXTREME_DROP_PCT = float(os.getenv("FUNNEL_CRASH_EXTREME_DROP_PCT", "-9.0"))
-CRASH_EXTREME_DROP_COUNT = int(os.getenv("FUNNEL_CRASH_EXTREME_DROP_COUNT", "50"))
 PANIC_REPAIR_ENABLE = os.getenv("FUNNEL_PANIC_REPAIR_ENABLE", "1").strip().lower() in {
     "1",
     "true",
@@ -110,9 +101,6 @@ PANIC_REPAIR_MAIN_REBOUND_PCT = float(
 )
 PANIC_REPAIR_SMALL_REBOUND_PCT = float(
     os.getenv("FUNNEL_PANIC_REPAIR_SMALL_REBOUND_PCT", "1.5")
-)
-PANIC_REPAIR_MAX_EXTREME_COUNT = int(
-    os.getenv("FUNNEL_PANIC_REPAIR_MAX_EXTREME_COUNT", "20")
 )
 FUNNEL_EXPORT_FULL_FETCH = os.getenv("FUNNEL_EXPORT_FULL_FETCH", "0").strip().lower() in {
     "1",
@@ -358,7 +346,6 @@ def _analyze_benchmark_and_tune_cfg(
     smallcap_df: pd.DataFrame | None,
     cfg: FunnelConfig,
     breadth: dict | None = None,
-    panic_snapshot: dict | None = None,
 ) -> dict:
     """
     Step 0：大盘总闸
@@ -383,14 +370,6 @@ def _analyze_benchmark_and_tune_cfg(
         "panic_reasons": [],
         "repair_triggered": False,
         "repair_reasons": [],
-        "panic_snapshot": {
-            "ok": False,
-            "total": 0,
-            "down_extreme_count": 0,
-            "down_9_count": 0,
-            "down_10_count": 0,
-            "up_9_count": 0,
-        },
         "tuned": {
             "min_avg_amount_wan": cfg.min_avg_amount_wan,
             "rs_min_long": cfg.rs_min_long,
@@ -515,24 +494,8 @@ def _analyze_benchmark_and_tune_cfg(
         panic_reasons.append(
             f"breadth_delta={float(breadth_delta):.2f}%<=阈值{CRASH_BREADTH_DELTA_PCT:.2f}%"
         )
-    snap = panic_snapshot or {}
-    snap_ok = bool(snap.get("ok"))
-    snap_down_extreme = int(snap.get("down_extreme_count") or 0)
-    snap_down_9 = int(snap.get("down_9_count") or 0)
-    extreme_snapshot_panic = (
-        snap_ok
-        and CRASH_EXTREME_DROP_COUNT > 0
-        and snap_down_extreme >= CRASH_EXTREME_DROP_COUNT
-    )
-    if extreme_snapshot_panic:
-        panic_reasons.append(
-            f"down_{CRASH_EXTREME_DROP_PCT:g}_count={snap_down_extreme}>=阈值{CRASH_EXTREME_DROP_COUNT}"
-        )
-
     repair_reasons: list[str] = []
-    if extreme_snapshot_panic:
-        regime = "BLACK_SWAN"
-    elif panic_reasons:
+    if panic_reasons:
         regime = "CRASH"
     elif PANIC_REPAIR_ENABLE:
         prev_panic = (
@@ -549,33 +512,19 @@ def _analyze_benchmark_and_tune_cfg(
                 and float(small_today_pct) >= float(PANIC_REPAIR_SMALL_REBOUND_PCT)
             )
         )
-        extreme_ok = (not snap_ok) or (
-            snap_down_extreme <= max(PANIC_REPAIR_MAX_EXTREME_COUNT, 0)
-        )
-        if prev_panic and rebound_ok and extreme_ok:
+        if prev_panic and rebound_ok:
             regime = "PANIC_REPAIR"
             repair_reasons = [
                 f"prev_panic(main_prev={main_prev_pct}, small_prev={small_prev_pct})",
                 f"rebound_ok(main_today={main_today_pct}, small_today={small_today_pct})",
-                (
-                    f"down_{CRASH_EXTREME_DROP_PCT:g}_count={snap_down_extreme}<=阈值{PANIC_REPAIR_MAX_EXTREME_COUNT}"
-                    if snap_ok
-                    else "snapshot_unavailable"
-                ),
             ]
 
     # EVR 按市场水温自动开关（不受环境变量覆盖）。
-    # 冷市场（RISK_OFF/CRASH/BLACK_SWAN）开启 EVR 防派发；其余关闭以减少踏空。
-    cfg.enable_evr_trigger = regime in {"RISK_OFF", "CRASH", "BLACK_SWAN"}
+    # 冷市场（RISK_OFF/CRASH）开启 EVR 防派发；其余关闭以减少踏空。
+    cfg.enable_evr_trigger = regime in {"RISK_OFF", "CRASH"}
 
     # 动态调参：风险越冷，过滤越严
-    if regime == "BLACK_SWAN":
-        cfg.min_avg_amount_wan = max(cfg.min_avg_amount_wan, 30000.0)
-        cfg.rs_min_long = max(cfg.rs_min_long, 8.0)
-        cfg.rs_min_short = max(cfg.rs_min_short, 2.0)
-        cfg.rps_fast_min = max(cfg.rps_fast_min, 95.0)
-        cfg.rps_slow_min = max(cfg.rps_slow_min, 90.0)
-    elif regime == "CRASH":
+    if regime == "CRASH":
         cfg.min_avg_amount_wan = max(cfg.min_avg_amount_wan, 18000.0)
         cfg.rs_min_long = max(cfg.rs_min_long, 4.0)
         cfg.rs_min_short = max(cfg.rs_min_short, 1.0)
@@ -621,14 +570,6 @@ def _analyze_benchmark_and_tune_cfg(
             "panic_reasons": panic_reasons,
             "repair_triggered": bool(repair_reasons),
             "repair_reasons": repair_reasons,
-            "panic_snapshot": {
-                "ok": snap_ok,
-                "total": int(snap.get("total") or 0),
-                "down_extreme_count": snap_down_extreme,
-                "down_9_count": snap_down_9,
-                "down_10_count": int(snap.get("down_10_count") or 0),
-                "up_9_count": int(snap.get("up_9_count") or 0),
-            },
             "tuned": {
                 "min_avg_amount_wan": cfg.min_avg_amount_wan,
                 "rs_min_long": cfg.rs_min_long,
@@ -701,180 +642,6 @@ def _calc_market_breadth(
         "prev_ratio_pct": ratio_prev,
         "delta_pct": delta,
         "sample_size": valid_now,
-    }
-
-
-def _extract_spot_snapshot_trade_date(df: pd.DataFrame) -> date | None:
-    """
-    尝试从实时快照表中提取“行情日期”。
-    不同数据源/版本列名可能不同，这里做 best-effort 兼容。
-    """
-    if df is None or df.empty:
-        return None
-    candidates = (
-        "数据日期",
-        "日期",
-        "更新时间",
-        "最新时间",
-        "行情时间",
-        "时间",
-    )
-    for col in candidates:
-        if col not in df.columns:
-            continue
-        ts = pd.to_datetime(df[col], errors="coerce")
-        ts = ts.dropna()
-        if ts.empty:
-            continue
-        ts = ts[ts.dt.year >= 2000]
-        if ts.empty:
-            continue
-        return ts.max().date()
-    return None
-
-
-def _fetch_market_extreme_snapshot(target_trade_date: date | None = None) -> dict:
-    """
-    快照级市场恐慌探针（不依赖全量日线拉取完成）：
-    - down_extreme_count: 涨跌幅 <= CRASH_EXTREME_DROP_PCT 数量
-    - down_9_count: 涨跌幅 <= -9.0% 数量
-    - down_10_count: 涨跌幅 <= -10.0% 数量
-    - up_9_count: 涨跌幅 >= 9.0% 数量
-
-    防错位约束：
-    - 当 target_trade_date 不是“今天”时，跳过快照（避免把历史目标日与当下快照混用）。
-    - 若快照含日期列，要求其日期与 target_trade_date 一致。
-    """
-    out = {
-        "ok": False,
-        "total": 0,
-        "down_extreme_count": 0,
-        "down_9_count": 0,
-        "down_10_count": 0,
-        "up_9_count": 0,
-        "snapshot_trade_date": None,
-    }
-    timeout_s = PANIC_SNAPSHOT_TIMEOUT
-    now_cn = datetime.now(CN_TZ)
-    if target_trade_date is not None:
-        if target_trade_date != now_cn.date():
-            print(
-                "[funnel] 市场极端快照跳过: "
-                f"target_trade_date={target_trade_date}, today={now_cn.date()}"
-            )
-            return out
-        if (now_cn.hour, now_cn.minute) < (9, 15):
-            print(
-                "[funnel] 市场极端快照跳过: 当前早于 09:15，"
-                "避免读取隔夜残留快照"
-            )
-            return out
-    try:
-        import akshare as ak
-    except Exception as e:
-        print(f"[funnel] 市场极端快照模块不可用: {e}")
-        return out
-
-    df = None
-    for attempt in range(1, PANIC_SNAPSHOT_RETRIES + 1):
-        try:
-            with ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(ak.stock_zh_a_spot_em)
-                df = fut.result(timeout=max(timeout_s, 1.0))
-            if df is not None and not df.empty:
-                break
-            print(f"[funnel] 市场极端快照为空 (尝试 {attempt}/{PANIC_SNAPSHOT_RETRIES})")
-        except FuturesTimeoutError:
-            print(f"[funnel] 市场极端快照超时 (尝试 {attempt}/{PANIC_SNAPSHOT_RETRIES})")
-        except Exception as e:
-            print(f"[funnel] 市场极端快照获取失败 (尝试 {attempt}/{PANIC_SNAPSHOT_RETRIES}): {e}")
-
-        if attempt < PANIC_SNAPSHOT_RETRIES:
-            sleep_s = PANIC_SNAPSHOT_BACKOFF_BASE * (2 ** (attempt - 1))
-            if sleep_s > 0:
-                time.sleep(sleep_s)
-
-    try:
-        if df is None or df.empty:
-            return out
-        snap_trade_date = _extract_spot_snapshot_trade_date(df)
-        if snap_trade_date is not None:
-            out["snapshot_trade_date"] = snap_trade_date.isoformat()
-        if (
-            target_trade_date is not None
-            and snap_trade_date is not None
-            and snap_trade_date != target_trade_date
-        ):
-            print(
-                "[funnel] 市场极端快照日期不匹配: "
-                f"snapshot_date={snap_trade_date}, target_trade_date={target_trade_date}"
-            )
-            return out
-        pct = pd.to_numeric(df.get("涨跌幅"), errors="coerce")
-        if pct is None or pct.dropna().empty:
-            return out
-        out["ok"] = True
-        out["total"] = int(pct.dropna().shape[0])
-        out["down_extreme_count"] = int((pct <= CRASH_EXTREME_DROP_PCT).sum())
-        out["down_9_count"] = int((pct <= -9.0).sum())
-        out["down_10_count"] = int((pct <= -10.0).sum())
-        out["up_9_count"] = int((pct >= 9.0).sum())
-        return out
-    except Exception as e:
-        print(f"[funnel] 市场极端快照解析失败: {e}")
-        return out
-
-
-def _build_panic_snapshot_from_hist(
-    df_map: dict[str, pd.DataFrame],
-    target_date: date,
-) -> dict:
-    """
-    远端实时快照不可用时，使用本地已拉取的全市场日线做恐慌指标降级推算。
-    """
-    total = 0
-    down_extreme = 0
-    down_9 = 0
-    down_10 = 0
-    up_9 = 0
-    target_iso = target_date.isoformat()
-
-    for df in df_map.values():
-        if df is None or df.empty or "date" not in df.columns:
-            continue
-        try:
-            last_row = df.iloc[-1]
-        except Exception:
-            continue
-
-        row_date = pd.to_datetime(last_row.get("date"), errors="coerce")
-        if pd.isna(row_date):
-            continue
-        if row_date.date().isoformat() != target_iso:
-            continue
-
-        pct = pd.to_numeric(last_row.get("pct_chg"), errors="coerce")
-        if pd.isna(pct):
-            continue
-        pct_f = float(pct)
-        total += 1
-        if pct_f <= CRASH_EXTREME_DROP_PCT:
-            down_extreme += 1
-        if pct_f <= -9.0:
-            down_9 += 1
-        if pct_f <= -10.0:
-            down_10 += 1
-        if pct_f >= 9.0:
-            up_9 += 1
-
-    return {
-        "ok": total > 0,
-        "total": total,
-        "down_extreme_count": down_extreme,
-        "down_9_count": down_9,
-        "down_10_count": down_10,
-        "up_9_count": up_9,
-        "snapshot_trade_date": target_iso,
     }
 
 
@@ -1252,23 +1019,6 @@ def run_funnel_job() -> tuple[dict[str, list[tuple[str, float]]], dict]:
         print(f"[funnel] 小盘基准加载成功: {SMALLCAP_BENCH_CODE}")
     except Exception as e:
         print(f"[funnel] 小盘基准加载失败 {SMALLCAP_BENCH_CODE}: {e}")
-    panic_snapshot = _fetch_market_extreme_snapshot(
-        target_trade_date=window.end_trade_date
-    )
-    if panic_snapshot.get("ok"):
-        snap_date = panic_snapshot.get("snapshot_trade_date")
-        snap_date_prefix = f"date={snap_date}, " if snap_date else ""
-        print(
-            f"[funnel] 市场极端快照: {snap_date_prefix}"
-            f"total={panic_snapshot.get('total')}, "
-            f"down_extreme({CRASH_EXTREME_DROP_PCT:g})={panic_snapshot.get('down_extreme_count')}, "
-            f"down_9={panic_snapshot.get('down_9_count')}, "
-            f"down_10={panic_snapshot.get('down_10_count')}, "
-            f"up_9={panic_snapshot.get('up_9_count')}"
-        )
-    else:
-        print("[funnel] 市场极端快照: unavailable")
-
     # 并发拉取日线（只负责取数，不负责计算）
     all_df_map: dict[str, pd.DataFrame] = {}
     fetch_ok = 0
@@ -1279,7 +1029,7 @@ def run_funnel_job() -> tuple[dict[str, list[tuple[str, float]]], dict]:
     print(
         f"[funnel] 开始拉取 {len(all_symbols)} 只股票日线 "
         f"(executor={EXECUTOR_MODE}, batch_size={BATCH_SIZE}, max_workers={MAX_WORKERS}, batch_timeout={BATCH_TIMEOUT}s, "
-        f"fetch_timeout={FETCH_TIMEOUT}s, panic_snapshot_timeout={PANIC_SNAPSHOT_TIMEOUT:.1f}s, retries={MAX_RETRIES})"
+        f"fetch_timeout={FETCH_TIMEOUT}s, retries={MAX_RETRIES})"
     )
     total_fetch_started = time.monotonic()
     for i in range(0, len(all_symbols), BATCH_SIZE):
@@ -1398,30 +1148,11 @@ def run_funnel_job() -> tuple[dict[str, list[tuple[str, float]]], dict]:
 
     # Step 0: 大盘总闸 + 全市场广度 + 动态阈值
     breadth_context = _calc_market_breadth(all_df_map, BREADTH_MA_WINDOW)
-    if not panic_snapshot.get("ok"):
-        print("[funnel] 远端快照 API 获取失败，启动本地全量日线降级推算...")
-        local_snap = _build_panic_snapshot_from_hist(all_df_map, window.end_trade_date)
-        if int(local_snap.get("total") or 0) >= PANIC_LOCAL_MIN_SAMPLES:
-            panic_snapshot = local_snap
-            print(
-                "[funnel] 本地推算成功: "
-                f"样本={local_snap.get('total')}只, "
-                f"down_extreme({CRASH_EXTREME_DROP_PCT:g})={local_snap.get('down_extreme_count')}, "
-                f"down_9={local_snap.get('down_9_count')}, "
-                f"up_9={local_snap.get('up_9_count')}"
-            )
-        else:
-            print(
-                f"[funnel] 本地推算样本不足(仅 {local_snap.get('total')} 只，阈值 {PANIC_LOCAL_MIN_SAMPLES})，"
-                "可能日线未更新，继续按 unavailable 处理。"
-            )
-
     benchmark_context = _analyze_benchmark_and_tune_cfg(
         bench_df,
         smallcap_df,
         cfg,
         breadth=breadth_context,
-        panic_snapshot=panic_snapshot,
     )
     print(
         "[funnel] 大盘总闸: "
@@ -1433,7 +1164,6 @@ def run_funnel_job() -> tuple[dict[str, list[tuple[str, float]]], dict]:
         f"breadth={benchmark_context.get('breadth')}, "
         f"panic_triggered={benchmark_context.get('panic_triggered')}, panic_reasons={benchmark_context.get('panic_reasons')}, "
         f"repair_triggered={benchmark_context.get('repair_triggered')}, repair_reasons={benchmark_context.get('repair_reasons')}, "
-        f"panic_snapshot={benchmark_context.get('panic_snapshot')}, "
         f"tuned={benchmark_context['tuned']}"
     )
 
@@ -1450,19 +1180,6 @@ def run_funnel_job() -> tuple[dict[str, list[tuple[str, float]]], dict]:
     l2_momentum = sum(1 for v in l2_channel_map.values() if "主升通道" in v)
     l2_ambush   = sum(1 for v in l2_channel_map.values() if "潜伏通道" in v)
     l2_accum    = sum(1 for v in l2_channel_map.values() if "吸筹通道" in v)
-
-    # 新增：统计 Markup 和 Accumulation ABC
-    markup_symbols = metrics.get("markup_symbols", [])
-    accum_stage_map = metrics.get("accum_stage_map", {})
-    exit_signals = metrics.get("exit_signals", {})
-
-    markup_count = len(markup_symbols)
-    accum_a_count = sum(1 for v in accum_stage_map.values() if v == "Accum_A")
-    accum_b_count = sum(1 for v in accum_stage_map.values() if v == "Accum_B")
-    accum_c_count = sum(1 for v in accum_stage_map.values() if v == "Accum_C")
-    profit_target_count = sum(1 for sig in exit_signals.values() if sig.get("signal") == "profit_target")
-    stop_loss_count = sum(1 for sig in exit_signals.values() if sig.get("signal") == "stop_loss")
-    dist_warning_count = sum(1 for sig in exit_signals.values() if sig.get("signal") == "distribution_warning")
 
     # Layer 3 (Sector Resonance)
     l3_passed, top_sectors = layer3_sector_resonance(
@@ -1582,6 +1299,22 @@ def run(webhook_url: str) -> tuple[bool, list[dict], dict]:
     l2_momentum = int(metrics.get("layer2_momentum", 0) or 0)
     l2_ambush   = int(metrics.get("layer2_ambush", 0) or 0)
     l2_accum    = int(metrics.get("layer2_accum", 0) or 0)
+    markup_symbols = metrics.get("markup_symbols", []) or []
+    accum_stage_map = metrics.get("accum_stage_map", {}) or {}
+    exit_signals = metrics.get("exit_signals", {}) or {}
+    markup_count = len(markup_symbols)
+    accum_a_count = sum(1 for v in accum_stage_map.values() if v == "Accum_A")
+    accum_b_count = sum(1 for v in accum_stage_map.values() if v == "Accum_B")
+    accum_c_count = sum(1 for v in accum_stage_map.values() if v == "Accum_C")
+    profit_target_count = sum(
+        1 for sig in exit_signals.values() if sig.get("signal") == "profit_target"
+    )
+    stop_loss_count = sum(
+        1 for sig in exit_signals.values() if sig.get("signal") == "stop_loss"
+    )
+    dist_warning_count = sum(
+        1 for sig in exit_signals.values() if sig.get("signal") == "distribution_warning"
+    )
 
     print(
         f"[funnel] 候选分层: 命中事件={metrics['total_hits']}, 命中股票={unique_hit_count}, "
@@ -1592,18 +1325,10 @@ def run(webhook_url: str) -> tuple[bool, list[dict], dict]:
     bench_line = "未知"
     if benchmark_context:
         breadth = benchmark_context.get("breadth", {}) or {}
-        panic_snapshot = benchmark_context.get("panic_snapshot", {}) or {}
         breadth_text = (
             f"，上涨家数占比 {breadth.get('ratio_pct'):.1f}%"
             f"（前日 {breadth.get('prev_ratio_pct'):.1f}%，变化 {breadth.get('delta_pct'):+.1f}%，样本 {breadth.get('sample_size')} 只）"
             if breadth
-            else ""
-        )
-        panic_text = (
-            f"，恐慌信号：极端下跌({CRASH_EXTREME_DROP_PCT:g}%) {panic_snapshot.get('down_extreme_count')} 只"
-            f" / 跌9% {panic_snapshot.get('down_9_count')} 只"
-            f" / 涨停 {panic_snapshot.get('up_9_count')} 只"
-            if panic_snapshot.get("ok")
             else ""
         )
         repair_text = (
@@ -1623,7 +1348,7 @@ def run(webhook_url: str) -> tuple[bool, list[dict], dict]:
             f"（MA50={benchmark_context.get('ma50'):.1f} MA200={benchmark_context.get('ma200'):.1f}）"
             f"，近3日 {benchmark_context.get('recent3_cum_pct'):+.2f}%"
             f"{smallcap_text}"
-            f"{breadth_text}{panic_text}{repair_text}"
+            f"{breadth_text}{repair_text}"
         )
 
     lines = [

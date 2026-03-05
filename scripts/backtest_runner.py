@@ -452,7 +452,6 @@ def run_backtest(
             None,
             day_cfg,
             breadth=day_breadth,
-            panic_snapshot={"ok": False},
         )
 
         eval_days += 1
