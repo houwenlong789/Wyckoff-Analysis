@@ -1287,9 +1287,10 @@ def run(webhook_url: str) -> tuple[bool, list[dict], dict]:
     dist_warning_count = sum(
         1 for sig in exit_signals.values() if sig.get("signal") == "distribution_warning"
     )
+    blocked_exit_signals_set = {"stop_loss", "distribution_warning"}
     blocked_exit_codes = [
         code for code in l3_ranked_symbols
-        if _is_blocked_exit(code)
+        if str((exit_signals.get(code, {}) or {}).get("signal", "")).strip() in blocked_exit_signals_set
     ]
 
     print(
