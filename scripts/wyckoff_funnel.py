@@ -1276,6 +1276,7 @@ def run(webhook_url: str) -> tuple[bool, list[dict], dict]:
     sos_hit_set = set(str(code).strip() for code, _ in triggers.get("sos", []))
     spring_hit_set = set(str(code).strip() for code, _ in triggers.get("spring", []))
     lps_hit_set = set(str(code).strip() for code, _ in triggers.get("lps", []))
+    evr_hit_set = set(str(code).strip() for code, _ in triggers.get("evr", []))
     blocked_exit_signals = {"stop_loss", "distribution_warning"}
 
     def _stage_name(code: str) -> str:
@@ -1513,45 +1514,78 @@ def run(webhook_url: str) -> tuple[bool, list[dict], dict]:
             f"{breadth_text}{repair_text}"
         )
 
-    lines = [
-        (
-        f"**股票池**: 主板{metrics['pool_main']} + 创业板{metrics['pool_chinext']} "
-        f"-> 去重{metrics['pool_merged']} -> 去ST{metrics['pool_st_excluded']} "
-        f"= {metrics['total_symbols']} (共{metrics['pool_batches']}批)"
-        ),
-        f"**漏斗概览**: {metrics['total_symbols']}只 → L1:{metrics['layer1']} → L2:{metrics['layer2']} → L3:{metrics['layer3']} → 命中:{metrics['total_hits']}",
-        f"**L2通道分布**: 主升{l2_momentum} | 潜伏{l2_ambush} | 吸筹{l2_accum} | 地量{l2_dry_vol} | 护盘{l2_rs_div} | 点火{l2_sos}",
-        f"**威科夫阶段**: Markup{markup_count} | Accum_A{accum_a_count} | Accum_B{accum_b_count} | Accum_C{accum_c_count}",
-        f"**Exit信号**: 止盈{profit_target_count} | 止损{stop_loss_count} | Distribution警告{dist_warning_count}",
-        (
-        f"**数据质量**: 成功拉取 {metrics['fetch_ok']} 只"
+    data_quality_line = (
+        f"成功拉取 {metrics['fetch_ok']} 只"
         + (f"，失败 {metrics['fetch_fail']} 只" if metrics['fetch_fail'] else "，无失败")
         + (f"，日期不对齐跳过 {metrics.get('fetch_date_mismatch', 0)} 只" if metrics.get('fetch_date_mismatch') else "")
         + (f"，实时快照补偿 {metrics.get('fetch_spot_patched', 0)} 只" if metrics.get('fetch_spot_patched') else "")
-        ),
-        f"**大盘水温**: {bench_line}",
+    )
+    ai_channel_summary = " | ".join(
+        f"{k}{channel_counts[k]}"
+        for k in ["主升通道", "潜伏通道", "吸筹通道", "地量蓄势", "暗中护盘", "点火破局"]
+        if channel_counts[k] > 0
+    ) or "无"
+    l4_non_hit_count = max(int(metrics["layer3"]) - int(unique_hit_count), 0)
+    top_priority_count = sum(
+        1 for c in selected_for_ai if c in markup_symbols or c in sos_hit_set or c in spring_hit_set
+    )
+
+    lines = [
+        "## 一览",
         (
-            f"**候选分层**: L3股票{metrics['layer3']} "
-            f"-> AI双轨输入={len(selected_for_ai)} "
-            f"[{regime} 配额 Trend={trend_quota}/Accum={accum_quota}, 总上限{total_cap}] "
-            f"[Markup优先{len([c for c in selected_for_ai if c in markup_symbols])} | L4命中{hit_selected_count} | 硬剔除{len(blocked_exit_codes)}]"
+            f"- **股票池**：主板{metrics['pool_main']} + 创业板{metrics['pool_chinext']} "
+            f"→ 去重{metrics['pool_merged']} → 去ST{metrics['pool_st_excluded']} "
+            f"= **{metrics['total_symbols']}**（共{metrics['pool_batches']}批）"
         ),
-        f"**Top 行业**: {', '.join(metrics['top_sectors']) if metrics['top_sectors'] else '无'}",
+        f"- **大盘水温**：{bench_line}",
+        f"- **Top 行业**：{', '.join(metrics['top_sectors']) if metrics['top_sectors'] else '无'}",
+        f"- **数据质量**：{data_quality_line}",
         "",
-        f"**AI输入质量**: 最高优先级{sum(1 for c in selected_for_ai if c in markup_symbols or c in sos_hit_set or c in spring_hit_set)} | Markup{len([c for c in selected_for_ai if c in markup_symbols])} | 通道: {' | '.join(f'{k}{channel_counts[k]}' for k in ['主升通道', '潜伏通道', '吸筹通道', '地量蓄势', '暗中护盘', '点火破局'] if channel_counts[k] > 0)}",
+        "## 漏斗进度",
+        f"- **L1 通过**：{metrics['layer1']} / {metrics['total_symbols']}（剔除 {metrics['total_symbols'] - metrics['layer1']}）",
+        f"- **L2 通过**：{metrics['layer2']} / {metrics['layer1']}（至少满足一条二级通道）",
+        f"- **L3 保留**：{metrics['layer3']} / {metrics['layer2']}（当前仅做行业标记，不做硬剔除）",
+        f"- **L4 命中股票**：{unique_hit_count} 只（命中事件 {metrics['total_hits']} 次）",
+        f"- **L4 未命中**：{l4_non_hit_count} 只（仍留在 L3 观察池）",
+        "",
+        "## L2 通道与阶段",
+        f"- **L2 通道分布**：主升{l2_momentum} | 潜伏{l2_ambush} | 吸筹{l2_accum} | 地量{l2_dry_vol} | 护盘{l2_rs_div} | 点火{l2_sos}",
+        f"- **威科夫阶段**：Markup{markup_count} | Accum_A{accum_a_count} | Accum_B{accum_b_count} | Accum_C{accum_c_count}",
+        "",
+        "## L4 形态触发",
+        f"- **SOS（量价点火）**：{len(sos_hit_set)}",
+        f"- **Spring（终极震仓）**：{len(spring_hit_set)}",
+        f"- **LPS（缩量回踩）**：{len(lps_hit_set)}",
+        f"- **EVR（放量不跌）**：{len(evr_hit_set)}",
+        "",
+        "## 风控与 AI 筛后",
+        f"- **Exit 信号**：止盈{profit_target_count} | 止损{stop_loss_count} | Distribution警告{dist_warning_count}",
+        f"- **硬剔除**：{len(blocked_exit_codes)} 只（已触发止损或派发警告，不再送入 AI）",
+        (
+            f"- **最终送 AI**：{len(selected_for_ai)} 只"
+            f"（{regime} 配额：Trend={trend_quota} / Accum={accum_quota} / 总上限={total_cap}）"
+        ),
+        f"- **AI 入选构成**：L4命中 {hit_selected_count} | L3补充 {l3_only_count}",
+        f"- **Trend 轨**：{len(trend_selected)} 只（L4命中 {trend_hit_selected} | L3补充 {trend_l3_only}）",
+        f"- **Accum 轨**：{len(accum_selected)} 只（L4命中 {accum_hit_selected} | L3补充 {accum_l3_only}）",
+        f"- **高优先级候选**：{top_priority_count} 只",
+        f"- **AI 输入通道分布**：{ai_channel_summary}",
     ]
 
-    def _append_ai_section(lines_obj: list[str], section_title: str, codes: list[str]) -> None:
+    def _append_ai_section(
+        lines_obj: list[str], section_title: str, section_desc: str, codes: list[str]
+    ) -> None:
         lines_obj.extend(
             [
                 "",
                 section_title,
-                "**代码 名称 | 阶段 | 来源标签 | Exit信号 | 分值**",
+                f"- **说明**：{section_desc}",
+                "- **字段**：代码 名称 | 阶段 | 来源标签 | Exit信号 | 分值",
                 "",
             ]
         )
         if not codes:
-            lines_obj.append("无")
+            lines_obj.append("- 无")
             return
         for code in codes:
             name = name_map.get(code, code)
@@ -1575,17 +1609,19 @@ def run(webhook_url: str) -> tuple[bool, list[dict], dict]:
 
             score = float(l3_score_map.get(code, 0.0))
             lines_obj.append(
-                f"• {code} {name} {stage_str} | {reasons} {exit_str} | score={score:.2f}"
+                f"- {code} {name} {stage_str} | {reasons} {exit_str} | score={score:.2f}"
             )
 
     _append_ai_section(
         lines,
-        f"**AI输入·Trend轨（右侧主升，优先 SOS + Markup）**",
+        "## AI 输入·Trend轨",
+        "右侧主升，优先 SOS（量价点火）与 Markup 阶段。",
         trend_selected,
     )
     _append_ai_section(
         lines,
-        f"**AI输入·Accum轨（左侧潜伏，优先 Spring/LPS + Accum_C）**",
+        "## AI 输入·Accum轨",
+        "左侧潜伏，优先 Spring（终极震仓）/LPS（缩量回踩）与 Accum_C 阶段。",
         accum_selected,
     )
 
