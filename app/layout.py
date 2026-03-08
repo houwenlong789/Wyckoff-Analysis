@@ -6,11 +6,6 @@ from app.auth_component import check_auth, login_form
 from core.token_storage import restore_tokens_from_storage
 from integrations.supabase_market_signal import load_latest_market_signal_daily
 
-
-def _log_layout(message: str) -> None:
-    print(f"[layout] {message}", flush=True)
-
-
 def _set_default(key: str, value) -> None:
     if key not in st.session_state or st.session_state.get(key) is None:
         st.session_state[key] = value
@@ -248,18 +243,30 @@ def _tone_slug(tone: str) -> str:
     return mapping.get(str(tone or "").strip(), "cautious")
 
 
+def _benchmark_regime_cn(regime: str) -> str:
+    mapping = {
+        "RISK_ON": "偏强",
+        "NEUTRAL": "中性",
+        "RISK_OFF": "偏弱",
+        "CRASH": "极弱",
+        "BLACK_SWAN": "恶劣",
+    }
+    return mapping.get(str(regime or "").strip().upper(), "待确认")
+
+
 def _render_market_signal_banner() -> None:
-    _log_layout("market signal banner: render start")
     row = load_latest_market_signal_daily()
     if not isinstance(row, dict):
-        _log_layout("market signal banner: no row returned")
         return
 
     tone = str(row.get("banner_tone", "谨慎") or "谨慎").strip()
     title = str(row.get("banner_title", "") or "").strip()
     body = str(row.get("banner_message", "") or "").strip()
-    regime = str(row.get("benchmark_regime", "--") or "--").strip()
+    regime = _benchmark_regime_cn(str(row.get("benchmark_regime", "") or ""))
+    main_close = row.get("main_index_close")
+    a50_close = row.get("a50_close")
     a50_pct = row.get("a50_pct_chg")
+    vix_close = row.get("vix_close")
     vix_pct = row.get("vix_pct_chg")
 
     def _fmt_pct(raw) -> str:
@@ -270,16 +277,19 @@ def _render_market_signal_banner() -> None:
         except Exception:
             return "--"
 
+    def _fmt_plain(raw) -> str:
+        try:
+            if raw is None or str(raw).strip() == "":
+                return "--"
+            return f"{float(raw):.2f}"
+        except Exception:
+            return "--"
+
     chips = [
-        ("水温", regime),
-        ("A50", _fmt_pct(a50_pct)),
-        ("VIX", _fmt_pct(vix_pct)),
+        ("大盘水温（上证）", f"{regime} {_fmt_plain(main_close)}"),
+        ("A50（盘前风向标）", f"{_fmt_plain(a50_close)} / {_fmt_pct(a50_pct)}"),
+        ("VIX（恐慌指数）", f"{_fmt_plain(vix_close)} / {_fmt_pct(vix_pct)}"),
     ]
-    _log_layout(
-        "market signal banner: row loaded "
-        f"trade_date={row.get('trade_date')} tone={tone} regime={regime} "
-        f"title_len={len(title)} body_len={len(body)}"
-    )
     chips_html = "".join(
         (
             '<span class="ms-chip">'
@@ -304,7 +314,6 @@ def _render_market_signal_banner() -> None:
         """,
         unsafe_allow_html=True,
     )
-    _log_layout("market signal banner: markdown emitted")
 
 
 def require_auth() -> None:
@@ -323,18 +332,11 @@ def setup_page(
     layout: str = "wide",
     require_login: bool = True,
 ) -> None:
-    _log_layout(
-        f"setup_page start title={page_title} require_login={require_login} "
-        f"user_present={bool(st.session_state.get('user'))}"
-    )
     st.set_page_config(page_title=page_title, page_icon=page_icon, layout=layout)
     init_session_state()
     _inject_base_ui_css()
     if require_login:
         require_auth()
-        user = st.session_state.get("user")
-        user_id = user.get("id") if isinstance(user, dict) else None
-        _log_layout(f"setup_page authenticated user_id={user_id}")
         _render_market_signal_banner()
 
 

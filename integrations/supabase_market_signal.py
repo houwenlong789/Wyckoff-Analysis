@@ -16,11 +16,6 @@ from supabase import Client, create_client
 
 from core.constants import TABLE_MARKET_SIGNAL_DAILY
 
-
-def _log_market_signal(message: str) -> None:
-    print(f"[supabase_market_signal] {message}", flush=True)
-
-
 def _get_supabase_admin_client() -> Client:
     url = (os.getenv("SUPABASE_URL") or "").strip()
     key = (
@@ -138,27 +133,18 @@ def compose_market_banner(row: dict[str, Any] | None) -> dict[str, str]:
     else:
         title = "亲爱的投资者，最新交易日请顺势而为，保持节奏。"
 
-    tone_tail = {
-        "恶劣": "市场环境恶劣，先保命，再谈进攻。",
-        "保守": "市场当前更适合保守应对，既要乘风而上，也要顺水推舟。",
-        "谨慎": "当前更适合耐心观察，等待更清晰的结构确认。",
-        "谨慎乐观": "可以顺势，但不宜激进，优先做确定性更高的机会。",
-        "乐观": "水温与风险信号配合良好，可以在纪律下积极把握机会。",
+    action_text = {
+        "恶劣": "以上指标均为最新交易日盘后数据。当前以防守为先，先控制风险，盘中沉着应对，只在把握足够高时再考虑出手。",
+        "保守": "以上指标均为最新交易日盘后数据。当前宜收敛仓位，盘中沉着应对，少做激进追价，优先寻找更清晰、更高胜率的打法。",
+        "谨慎": "以上指标均为最新交易日盘后数据。当前信号仍有分歧，盘中先耐心观察，等方向更明确后再做高胜率出手。",
+        "谨慎乐观": "以上指标均为最新交易日盘后数据。可以顺势跟随，但盘中仍要沉着应对，控制节奏和仓位，优先做更确定的高胜率机会。",
+        "乐观": "以上指标均为最新交易日盘后数据。当前环境相对顺风，但盘中仍要沉着应对，优先参与有确认、有纪律的高胜率打法。",
     }
-    benchmark_text = (
-        f"最新交易日（{trade_date}）的大盘水温为 {benchmark_regime or 'UNKNOWN'}（{bench_desc}）"
-        if trade_date
-        else f"大盘水温为 {benchmark_regime or 'UNKNOWN'}（{bench_desc}）"
-    )
-    a50_text = f"A50 最新 {_format_plain(data.get('a50_close'))}（{_format_signed_pct(data.get('a50_pct_chg'))}）"
-    vix_text = f"VIX {_format_plain(data.get('vix_close'))}（{_format_signed_pct(data.get('vix_pct_chg'))}）"
-    risk_text = f"盘前风险信号{pre_desc}，{a50_text}，{vix_text}。"
-    tail_text = tone_tail.get(tone, "保持纪律，尊重市场。")
 
     return {
         "banner_tone": tone,
         "banner_title": title,
-        "banner_message": f"{benchmark_text}；{risk_text}{tail_text}",
+        "banner_message": action_text.get(tone, "保持纪律，尊重市场。"),
     }
 
 
@@ -250,18 +236,14 @@ def load_latest_market_signal_daily(client: Client | None = None) -> dict[str, A
         if is_supabase_admin_configured():
             try:
                 attempts.append(("admin", _get_supabase_admin_client()))
-            except Exception as e:
-                _log_market_signal(
-                    f"load_latest_market_signal_daily admin init failed: {type(e).__name__}: {e}"
-                )
+            except Exception:
+                pass
         try:
             from integrations.supabase_client import get_supabase_client
 
             attempts.append(("session", get_supabase_client()))
-        except Exception as e:
-            _log_market_signal(
-                f"load_latest_market_signal_daily session init failed: {type(e).__name__}: {e}"
-            )
+        except Exception:
+            pass
 
     for source, sb in attempts:
         try:
@@ -274,16 +256,8 @@ def load_latest_market_signal_daily(client: Client | None = None) -> dict[str, A
                 .limit(1)
                 .execute()
             )
-            if not resp.data:
-                _log_market_signal(f"load_latest_market_signal_daily: no rows (source={source})")
-                continue
-            row = dict(resp.data[0])
-            _log_market_signal(
-                f"load_latest_market_signal_daily: ok trade_date={row.get('trade_date')} source={source}"
-            )
-            return row
-        except Exception as e:
-            _log_market_signal(
-                f"load_latest_market_signal_daily failed (source={source}): {type(e).__name__}: {e}"
-            )
+            if resp.data:
+                return dict(resp.data[0])
+        except Exception:
+            continue
     return None
