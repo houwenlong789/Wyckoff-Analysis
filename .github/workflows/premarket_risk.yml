@@ -16,6 +16,9 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       TZ: Asia/Shanghai
 
     steps:
@@ -48,4 +51,3 @@ jobs:
           path: logs/premarket_risk*.log
           retention-days: 7
           if-no-files-found: warn
-

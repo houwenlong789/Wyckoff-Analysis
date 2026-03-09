@@ -21,10 +21,8 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from integrations.fetch_a_share_csv import _resolve_trading_window
 from integrations.supabase_market_signal import upsert_market_signal_daily
 from utils.feishu import send_feishu_notification
-from utils.trading_clock import resolve_end_calendar_day
 
 TZ = ZoneInfo("Asia/Shanghai")
 RISK_A50_CRASH_PCT = float(os.getenv("PREMARKET_A50_CRASH_PCT", "-2.0"))
@@ -106,12 +104,12 @@ def _safe_float(v) -> float | None:
         return None
 
 
-def _latest_trade_date_str() -> str:
-    window = _resolve_trading_window(
-        end_calendar_day=resolve_end_calendar_day(),
-        trading_days=30,
-    )
-    return window.end_trade_date.isoformat()
+def _premarket_session_trade_date_str() -> str:
+    """
+    盘前风控服务于“当天即将开盘的会话”，写库键必须是北京时间当天，
+    否则晚间 OMS 无法按自然日读取到同一天的盘前红灯。
+    """
+    return datetime.now(TZ).date().isoformat()
 
 
 def _fetch_a50() -> dict:
@@ -437,7 +435,7 @@ def main() -> int:
         _log("--dry-run: 不发送飞书", logs_path)
         return 0
 
-    trade_date = _latest_trade_date_str()
+    trade_date = _premarket_session_trade_date_str()
     db_ok = upsert_market_signal_daily(
         trade_date,
         {

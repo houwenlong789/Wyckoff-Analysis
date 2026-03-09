@@ -404,6 +404,27 @@ def _load_market_signal_by_trade_date(client: Client, trade_date: str) -> dict[s
     return dict(resp.data[0])
 
 
+def _iter_market_signal_clients(client: Client | None = None) -> list[Client]:
+    clients: list[Client] = []
+    if client is not None:
+        clients.append(client)
+        return clients
+    if is_supabase_admin_configured():
+        try:
+            clients.append(_get_supabase_admin_client())
+        except Exception:
+            pass
+    try:
+        from integrations.supabase_client import get_supabase_client
+
+        session_client = get_supabase_client()
+        if session_client is not None:
+            clients.append(session_client)
+    except Exception:
+        pass
+    return clients
+
+
 def upsert_market_signal_daily(trade_date: date | str, patch: dict[str, Any]) -> bool:
     if not is_supabase_admin_configured():
         return False
@@ -437,24 +458,20 @@ def upsert_market_signal_daily(trade_date: date | str, patch: dict[str, Any]) ->
         return False
 
 
-def load_latest_market_signal_daily(client: Client | None = None) -> dict[str, Any] | None:
-    attempts: list[tuple[str, Client | None]] = []
-    if client is not None:
-        attempts.append(("provided", client))
-    else:
-        if is_supabase_admin_configured():
-            try:
-                attempts.append(("admin", _get_supabase_admin_client()))
-            except Exception:
-                pass
+def load_market_signal_daily(trade_date: date | str, client: Client | None = None) -> dict[str, Any] | None:
+    trade_date_text = _normalize_trade_date(trade_date)
+    for sb in _iter_market_signal_clients(client):
         try:
-            from integrations.supabase_client import get_supabase_client
-
-            attempts.append(("session", get_supabase_client()))
+            row = _load_market_signal_by_trade_date(sb, trade_date_text)
+            if row:
+                return row
         except Exception:
-            pass
+            continue
+    return None
 
-    for source, sb in attempts:
+
+def load_latest_market_signal_daily(client: Client | None = None) -> dict[str, Any] | None:
+    for sb in _iter_market_signal_clients(client):
         try:
             if sb is None:
                 continue

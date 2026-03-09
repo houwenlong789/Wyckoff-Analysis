@@ -24,6 +24,7 @@ from integrations.ai_prompts import PRIVATE_PM_DECISION_JSON_PROMPT
 from integrations.fetch_a_share_csv import _fetch_hist, _resolve_trading_window
 from integrations.llm_client import call_llm
 from integrations.data_source import fetch_stock_spot_snapshot
+from integrations.supabase_market_signal import compose_market_banner, load_market_signal_daily
 from integrations.supabase_portfolio import (
     cancel_trade_orders,
     check_daily_run_exists,
@@ -82,6 +83,28 @@ STEP4_CHASE_ATR_MULT_MAX = max(float(os.getenv("STEP4_CHASE_ATR_MULT_MAX", "2.4"
 # --- 新增：OMS 防追高与滑点保护配置 ---
 STEP4_MAX_GAP_UP_PCT = float(os.getenv("STEP4_MAX_GAP_UP_PCT", "3.0"))          # 最大允许跳空/追高幅度(%)
 STEP4_MAX_GAP_UP_ATR_MULT = float(os.getenv("STEP4_MAX_GAP_UP_ATR_MULT", "1.5")) # 最大允许追高 ATR 倍数
+
+BENCHMARK_REGIME_SEVERITY = {
+    "RISK_ON": 0,
+    "NEUTRAL": 1,
+    "RISK_OFF": 3,
+    "CRASH": 4,
+    "BLACK_SWAN": 5,
+}
+PREMARKET_REGIME_SEVERITY = {
+    "NORMAL": 0,
+    "CAUTION": 2,
+    "RISK_OFF": 3,
+    "BLACK_SWAN": 5,
+}
+EFFECTIVE_REGIME_BY_SEVERITY = {
+    0: "RISK_ON",
+    1: "NEUTRAL",
+    2: "CAUTION",
+    3: "RISK_OFF",
+    4: "CRASH",
+    5: "BLACK_SWAN",
+}
 
 
 @dataclass
@@ -160,6 +183,116 @@ class CandidateMeta:
 
 def _clean_text(raw: object) -> str:
     return str(raw or "").strip()
+
+
+def _normalize_benchmark_regime(raw: object) -> str:
+    regime = _clean_text(raw).upper()
+    if regime in BENCHMARK_REGIME_SEVERITY:
+        return regime
+    return "NEUTRAL"
+
+
+def _normalize_premarket_regime(raw: object) -> str:
+    regime = _clean_text(raw).upper()
+    if regime in PREMARKET_REGIME_SEVERITY:
+        return regime
+    return "NORMAL"
+
+
+def _resolve_effective_market_regime(benchmark_regime: object, premarket_regime: object) -> str:
+    benchmark_norm = _normalize_benchmark_regime(benchmark_regime)
+    premarket_norm = _normalize_premarket_regime(premarket_regime)
+    severity = max(
+        BENCHMARK_REGIME_SEVERITY.get(benchmark_norm, 1),
+        PREMARKET_REGIME_SEVERITY.get(premarket_norm, 0),
+    )
+    return EFFECTIVE_REGIME_BY_SEVERITY.get(severity, benchmark_norm)
+
+
+def _load_market_signal_for_trade_date(trade_date: str) -> dict[str, object] | None:
+    try:
+        return load_market_signal_daily(trade_date)
+    except Exception as e:
+        print(f"[step4] 读取 market_signal_daily 失败: trade_date={trade_date}, err={e}")
+        return None
+
+
+def _build_market_guardrail(
+    *,
+    trade_date: str,
+    benchmark_context: dict | None,
+    market_signal_row: dict[str, object] | None,
+) -> tuple[str, str, str]:
+    row = dict(market_signal_row or {})
+    benchmark_regime = _normalize_benchmark_regime(
+        row.get("benchmark_regime")
+        or (benchmark_context or {}).get("regime")
+    )
+    premarket_regime = _normalize_premarket_regime(row.get("premarket_regime"))
+    effective_regime = _resolve_effective_market_regime(benchmark_regime, premarket_regime)
+
+    if benchmark_context:
+        row.update(
+            {
+                "benchmark_regime": benchmark_regime,
+                "main_index_close": benchmark_context.get("close"),
+                "main_index_ma50": benchmark_context.get("ma50"),
+                "main_index_ma200": benchmark_context.get("ma200"),
+                "main_index_recent3_cum_pct": benchmark_context.get("recent3_cum_pct"),
+                "main_index_today_pct": benchmark_context.get("main_today_pct"),
+                "smallcap_close": benchmark_context.get("smallcap_close"),
+                "smallcap_recent3_cum_pct": benchmark_context.get("smallcap_recent3_cum_pct"),
+            }
+        )
+    row["premarket_regime"] = premarket_regime
+
+    banner = compose_market_banner(row)
+    panic_reasons = [
+        str(x).strip()
+        for x in ((benchmark_context or {}).get("panic_reasons", []) or [])
+        if str(x).strip()
+    ]
+    premarket_reasons = [
+        str(x).strip()
+        for x in (row.get("premarket_reasons", []) or [])
+        if str(x).strip()
+    ]
+
+    lines = [
+        "[全局风控]",
+        f"trade_date={trade_date}, effective_regime={effective_regime}, "
+        f"benchmark_regime={benchmark_regime}, premarket_regime={premarket_regime}",
+    ]
+    if benchmark_context:
+        lines.append(
+            f"benchmark_close={benchmark_context.get('close')}, ma50={benchmark_context.get('ma50')}, "
+            f"ma200={benchmark_context.get('ma200')}, recent3={benchmark_context.get('recent3_pct')}, "
+            f"cum3={benchmark_context.get('recent3_cum_pct')}, smallcap_today={benchmark_context.get('smallcap_today_pct')}"
+        )
+    if effective_regime in STEP4_BUY_BLOCK_REGIMES:
+        lines.append("⚠️ 全局风控一票否决：OMS 将强制拦截全部买入动作（仅允许 HOLD/TRIM/EXIT）。")
+    elif premarket_regime == "CAUTION":
+        lines.append("⚠️ 盘前情绪扰动已触发：OMS 会自动收紧追价阈值并优先防守。")
+    if panic_reasons:
+        lines.append("panic_reasons=" + " | ".join(panic_reasons))
+    if premarket_reasons:
+        lines.append("premarket_reasons=" + " | ".join(premarket_reasons))
+    lines.append("")
+
+    posture_name = _clean_text(banner.get("market_posture_name"))
+    action_phrase = _clean_text(banner.get("action_phrase"))
+    system_market_view = f"系统风控：{effective_regime}"
+    if posture_name:
+        system_market_view += f" / {posture_name}"
+    view_parts = [f"收盘={benchmark_regime}"]
+    if premarket_regime != "NORMAL":
+        view_parts.append(f"盘前={premarket_regime}")
+    if action_phrase:
+        view_parts.append(action_phrase)
+    if view_parts:
+        system_market_view += " | " + "；".join(view_parts)
+
+    return (effective_regime, "\n".join(lines), system_market_view)
 
 
 def _contains_keyword(text: str, keywords: tuple[str, ...]) -> bool:
@@ -279,6 +412,7 @@ def _resolve_chase_limits(dec: DecisionItem, market_regime: str) -> tuple[float,
     regime_mult = {
         "RISK_ON": 1.10,
         "NEUTRAL": 1.00,
+        "CAUTION": 0.92,
         "PANIC_REPAIR": 0.95,
         "RISK_OFF": 0.85,
         "CRASH": 0.70,
@@ -1514,26 +1648,20 @@ def run(
         if code in allowed_codes and code not in name_map:
             name_map[code] = meta.name or code
 
-    benchmark_text = ""
-    market_regime = "NEUTRAL"
-    panic_reasons = []
-    if benchmark_context:
-        market_regime = str(benchmark_context.get("regime", "NEUTRAL") or "NEUTRAL").upper()
-        panic_reasons = benchmark_context.get("panic_reasons", []) or []
-        benchmark_text = (
-            "[宏观水温]\n"
-            f"regime={market_regime}, close={benchmark_context.get('close')}, "
-            f"ma50={benchmark_context.get('ma50')}, ma200={benchmark_context.get('ma200')}, "
-            f"recent3={benchmark_context.get('recent3_pct')}, cum3={benchmark_context.get('recent3_cum_pct')}, "
-            f"smallcap_today={benchmark_context.get('smallcap_today_pct')}\n"
+    market_signal_row = _load_market_signal_for_trade_date(trade_date)
+    if market_signal_row:
+        print(
+            f"[step4] 读取全局风控: trade_date={trade_date}, "
+            f"benchmark={market_signal_row.get('benchmark_regime') or '-'}, "
+            f"premarket={market_signal_row.get('premarket_regime') or '-'}"
         )
-        if market_regime in STEP4_BUY_BLOCK_REGIMES:
-            benchmark_text += (
-                "⚠️ 当前为系统防御期，OMS 将强制拦截全部买入动作（仅允许 HOLD/TRIM/EXIT）。\n"
-            )
-        if panic_reasons:
-            benchmark_text += "panic_reasons=" + " | ".join(str(x) for x in panic_reasons) + "\n"
-        benchmark_text += "\n"
+    else:
+        print(f"[step4] 未读取到当日全局风控: trade_date={trade_date}")
+    market_regime, benchmark_text, system_market_view = _build_market_guardrail(
+        trade_date=trade_date,
+        benchmark_context=benchmark_context,
+        market_signal_row=market_signal_row,
+    )
 
     user_message = (
         benchmark_text
@@ -1581,6 +1709,12 @@ def run(
     if not decisions:
         print("[step4] 模型未产出有效决策，跳过")
         return (True, "skipped_no_decisions")
+
+    rendered_market_view = system_market_view
+    if market_view and system_market_view:
+        rendered_market_view = f"{system_market_view} | 模型摘要：{market_view}"
+    elif market_view:
+        rendered_market_view = market_view
 
     # 确保所有持仓至少有一个动作，避免遗漏
     mentioned_codes = {d.code for d in decisions}
@@ -1694,7 +1828,7 @@ def run(
 
     report = _render_trade_ticket(
         model=model,
-        market_view=market_view,
+        market_view=rendered_market_view,
         total_equity=float(total_equity),
         free_cash_before=portfolio.free_cash,
         free_cash_after=free_cash_after,
@@ -1714,7 +1848,7 @@ def run(
         portfolio_id=portfolio_id,
         model=model,
         trade_date=trade_date,
-        market_view=market_view,
+        market_view=rendered_market_view,
         orders=ticket_rows,
     ):
         print(f"[step4] 已写入 AI 订单记录: run_id={run_id}, count={len(ticket_rows)}, portfolio_id={portfolio_id}")
