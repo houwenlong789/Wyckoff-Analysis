@@ -43,6 +43,30 @@ def is_supabase_configured() -> bool:
     return bool(url and key)
 
 
+def load_user_settings_admin(user_id: str) -> dict[str, Any] | None:
+    user_id = str(user_id or "").strip()
+    if not user_id or not is_supabase_configured():
+        return None
+    try:
+        client = _get_supabase_admin_client()
+        resp = (
+            client.table(TABLE_USER_SETTINGS)
+            .select("*")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if not resp.data:
+            return None
+        row = resp.data[0] or {}
+        if not isinstance(row, dict):
+            return None
+        return row
+    except Exception as e:
+        print(f"[supabase_portfolio] load_user_settings_admin failed: {e}")
+        return None
+
+
 def _normalize_buy_dt_text(raw: Any) -> str:
     text = str(raw or "").strip()
     if re.fullmatch(r"\d{8}", text):

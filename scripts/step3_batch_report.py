@@ -941,6 +941,8 @@ def run(
     api_key: str,
     model: str,
     benchmark_context: dict | None = None,
+    *,
+    notify: bool = True,
 ) -> tuple[bool, str, str]:
     """
     拉取 OHLCV → 第五步特征工程 → AI 研报 → 飞书发送。
@@ -1176,12 +1178,13 @@ def run(
         )
         if rag_veto_lines:
             report = rag_veto_preview + report + "\n\n## 🛑 RAG 防雷剔除清单\n" + "\n".join(rag_veto_lines)
-        model_banner = f"🤖 模型: {model}"
-        content = f"{model_banner}\n\n{report}"
-        title = f"📄 批量研报 {date.today().strftime('%Y-%m-%d')}"
-        sent = send_feishu_notification(webhook_url, title, content)
-        if not sent:
-            return (False, "feishu_failed", report)
+        if notify:
+            model_banner = f"🤖 模型: {model}"
+            content = f"{model_banner}\n\n{report}"
+            title = f"📄 批量研报 {date.today().strftime('%Y-%m-%d')}"
+            sent = send_feishu_notification(webhook_url, title, content)
+            if not sent:
+                return (False, "feishu_failed", report)
         return (True, "ok", report)
 
     payloads_by_track: dict[str, list[str]] = {"Trend": [], "Accum": []}
@@ -1295,14 +1298,34 @@ def run(
         )
 
     if STEP3_SKIP_LLM:
-        ok, preview_report = _send_input_preview(
-            webhook_url=webhook_url,
-            model=model,
-            system_prompt=WYCKOFF_FUNNEL_SYSTEM_PROMPT,
-            previews=track_requests,
-        )
-        if not ok:
-            return (False, "feishu_failed", preview_report)
+        if notify:
+            ok, preview_report = _send_input_preview(
+                webhook_url=webhook_url,
+                model=model,
+                system_prompt=WYCKOFF_FUNNEL_SYSTEM_PROMPT,
+                previews=track_requests,
+            )
+            if not ok:
+                return (False, "feishu_failed", preview_report)
+        else:
+            preview_blocks: list[str] = [
+                "# 🧪 Step3 模型输入预演（未调用大模型）",
+                "",
+                f"- 目标模型: `{model}`",
+                f"- 输入股票数: `{sum(int(x.get('selected_count', 0) or 0) for x in track_requests)}`",
+                "- 模式: `STEP3_SKIP_LLM=1`",
+                "",
+            ]
+            for req in track_requests:
+                preview_blocks.extend(
+                    [
+                        f"## {TRACK_LABELS.get(str(req.get('track', '')), str(req.get('track', '')))}",
+                        "",
+                        str(req.get("user_message", "") or ""),
+                        "",
+                    ]
+                )
+            preview_report = "\n".join(preview_blocks).strip()
         return (True, "ok_preview", preview_report)
 
     track_reports: list[tuple[str, str]] = []
@@ -1375,10 +1398,11 @@ def run(
         content += f"\n\n**获取失败**: {', '.join(f'{s}({e})' for s, e in failed)}"
 
     title = f"📄 批量研报 {date.today().strftime('%Y-%m-%d')}"
-    sent = send_feishu_notification(webhook_url, title, content)
-    if not sent:
-        print("[step3] 飞书推送失败")
-        return (False, "feishu_failed", report)
+    if notify:
+        sent = send_feishu_notification(webhook_url, title, content)
+        if not sent:
+            print("[step3] 飞书推送失败")
+            return (False, "feishu_failed", report)
     print(
         f"[step3] 研报发送成功，股票数={sum(len(payloads_by_track.get(t, [])) for t in active_tracks)}，"
         f"拉取失败数={len(failed)}"

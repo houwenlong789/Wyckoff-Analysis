@@ -119,6 +119,16 @@ FUNNEL_EXPORT_FULL_FETCH = os.getenv("FUNNEL_EXPORT_FULL_FETCH", "0").strip().lo
 FUNNEL_EXPORT_DIR = os.getenv("FUNNEL_EXPORT_DIR", "data/funnel_snapshots").strip() or "data/funnel_snapshots"
 
 
+def _parse_int_env(name: str, default: int) -> int:
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except Exception:
+        return default
+
+
 def _parse_bool(raw: str) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
@@ -247,6 +257,90 @@ def _job_end_calendar_day() -> date:
     - 北京时间 00:00-16:59 走 T-1（上一自然日）
     """
     return resolve_end_calendar_day()
+
+
+def _resolve_symbol_pool_from_env() -> tuple[list[str], dict[str, str], dict[str, int | str]]:
+    pool_mode = str(os.getenv("FUNNEL_POOL_MODE", "") or "").strip().lower()
+    limit_count = max(_parse_int_env("FUNNEL_POOL_LIMIT_COUNT", 0), 0)
+
+    if pool_mode == "manual":
+        manual_raw = str(os.getenv("FUNNEL_POOL_MANUAL_SYMBOLS", "") or "")
+        all_name_map = _stock_name_map()
+        symbols = _normalize_symbols(
+            [x.strip() for x in manual_raw.replace(";", ",").replace("\n", ",").split(",")]
+        )
+        name_map = {code: all_name_map.get(code, "") for code in symbols}
+        return (
+            symbols,
+            name_map,
+            {
+                "pool_mode": "manual",
+                "pool_main": 0,
+                "pool_chinext": 0,
+                "pool_merged": len(symbols),
+                "pool_st_excluded": 0,
+                "pool_limit": limit_count,
+            },
+        )
+
+    board_name = str(os.getenv("FUNNEL_POOL_BOARD", "") or "").strip().lower()
+    if pool_mode == "board" and board_name in {"main", "chinext", "all"}:
+        if board_name == "all":
+            items = get_stocks_by_board("main") + get_stocks_by_board("chinext")
+        else:
+            items = get_stocks_by_board(board_name)
+        merged_code_to_name: dict[str, str] = {}
+        for item in items:
+            code = str(item.get("code", "")).strip()
+            if not code:
+                continue
+            if code not in merged_code_to_name:
+                merged_code_to_name[code] = str(item.get("name", "")).strip()
+        symbols = _normalize_symbols(list(merged_code_to_name.keys()))
+        if limit_count > 0:
+            symbols = symbols[:limit_count]
+        return (
+            symbols,
+            {code: merged_code_to_name.get(code, "") for code in symbols},
+            {
+                "pool_mode": "board",
+                "pool_main": len(items) if board_name == "main" else len(get_stocks_by_board("main")) if board_name == "all" else 0,
+                "pool_chinext": len(items) if board_name == "chinext" else len(get_stocks_by_board("chinext")) if board_name == "all" else 0,
+                "pool_merged": len(symbols),
+                "pool_st_excluded": 0,
+                "pool_limit": limit_count,
+            },
+        )
+
+    main_items = get_stocks_by_board("main")
+    chinext_items = get_stocks_by_board("chinext")
+    merged_code_to_name: dict[str, str] = {}
+    for item in main_items + chinext_items:
+        code = str(item.get("code", "")).strip()
+        if not code:
+            continue
+        if code not in merged_code_to_name:
+            merged_code_to_name[code] = str(item.get("name", "")).strip()
+    merged_symbols = _normalize_symbols(list(merged_code_to_name.keys()))
+    st_symbols = [
+        sym for sym in merged_symbols if "ST" in merged_code_to_name.get(sym, "").upper()
+    ]
+    st_set = set(st_symbols)
+    all_symbols = [sym for sym in merged_symbols if sym not in st_set]
+    if limit_count > 0:
+        all_symbols = all_symbols[:limit_count]
+    return (
+        all_symbols,
+        {code: merged_code_to_name.get(code, "") for code in all_symbols},
+        {
+            "pool_mode": "default",
+            "pool_main": len(main_items),
+            "pool_chinext": len(chinext_items),
+            "pool_merged": len(merged_symbols),
+            "pool_st_excluded": len(st_symbols),
+            "pool_limit": limit_count,
+        },
+    )
 
 
 def _latest_trade_date_from_hist(df: pd.DataFrame) -> date | None:
@@ -908,32 +1002,19 @@ def run_funnel_job(
     start_s = window.start_trade_date.strftime("%Y%m%d")
     end_s = window.end_trade_date.strftime("%Y%m%d")
 
-    # 股票池：主板 + 创业板 - ST（预过滤，减少无效拉取）
-    main_items = get_stocks_by_board("main")
-    chinext_items = get_stocks_by_board("chinext")
-    merged_code_to_name: dict[str, str] = {}
-    for item in main_items + chinext_items:
-        code = str(item.get("code", "")).strip()
-        if not code:
-            continue
-        if code not in merged_code_to_name:
-            merged_code_to_name[code] = str(item.get("name", "")).strip()
-    merged_symbols = _normalize_symbols(list(merged_code_to_name.keys()))
-    st_symbols = [
-        sym
-        for sym in merged_symbols
-        if "ST" in merged_code_to_name.get(sym, "").upper()
-    ]
-    st_set = set(st_symbols)
-    all_symbols = [sym for sym in merged_symbols if sym not in st_set]
+    all_symbols, pool_name_map, pool_stats = _resolve_symbol_pool_from_env()
+    main_items = [None] * int(pool_stats.get("pool_main", 0) or 0)
+    chinext_items = [None] * int(pool_stats.get("pool_chinext", 0) or 0)
+    merged_symbols = list(pool_name_map.keys())
+    st_symbols = [None] * int(pool_stats.get("pool_st_excluded", 0) or 0)
     total_batches = (
         (len(all_symbols) + BATCH_SIZE - 1) // BATCH_SIZE if all_symbols else 0
     )
     print(
         "[funnel] 股票池统计: "
-        f"main={len(main_items)}, chinext={len(chinext_items)}, "
+        f"mode={pool_stats.get('pool_mode')}, main={len(main_items)}, chinext={len(chinext_items)}, "
         f"merged={len(merged_symbols)}, st_excluded={len(st_symbols)}, "
-        f"final={len(all_symbols)}, batches={total_batches} (batch_size={BATCH_SIZE})"
+        f"final={len(all_symbols)}, limit={pool_stats.get('pool_limit', 0)}, batches={total_batches} (batch_size={BATCH_SIZE})"
     )
 
     # 批量元数据
@@ -1164,6 +1245,7 @@ def run_funnel_job(
     )
     metrics = {
         "total_symbols": len(all_symbols),
+        "pool_mode": str(pool_stats.get("pool_mode", "") or ""),
         "pool_main": len(main_items),
         "pool_chinext": len(chinext_items),
         "pool_merged": len(merged_symbols),
@@ -1220,7 +1302,12 @@ def run_funnel_job(
     return triggers, metrics
 
 
-def run(webhook_url: str) -> tuple[bool, list[dict], dict]:
+def run(
+    webhook_url: str,
+    *,
+    notify: bool = True,
+    return_details: bool = False,
+) -> tuple[bool, list[dict], dict] | tuple[bool, list[dict], dict, dict]:
     """
     执行 Wyckoff Funnel，漏斗完成后立即发送飞书通知。
     返回 (成功与否, 用于研报的股票信息列表, 大盘上下文)。
@@ -1529,7 +1616,7 @@ def run(webhook_url: str) -> tuple[bool, list[dict], dict]:
 
     content = "\n".join(lines)
     title = f"🔬 Wyckoff Funnel {date.today().strftime('%Y-%m-%d')}"
-    ok = send_feishu_notification(webhook_url, title, content)
+    ok = True if not notify else send_feishu_notification(webhook_url, title, content)
 
     symbols_for_report = [
         {
@@ -1568,4 +1655,18 @@ def run(webhook_url: str) -> tuple[bool, list[dict], dict]:
         }
         for c in selected_for_ai
     ]
+    if return_details:
+        details = {
+            "metrics": metrics,
+            "triggers": triggers,
+            "content": content,
+            "title": title,
+            "symbols_for_report": symbols_for_report,
+            "selected_for_ai": selected_for_ai,
+            "trend_selected": trend_selected,
+            "accum_selected": accum_selected,
+            "name_map": name_map,
+            "sector_map": sector_map,
+        }
+        return (ok, symbols_for_report, benchmark_context, details)
     return (ok, symbols_for_report, benchmark_context)

@@ -1,366 +1,233 @@
 # -*- coding: utf-8 -*-
-"""AI 分析页：Alpha 虚拟投委会研报。"""
+"""AI 分析页：单股本地，批量后台。"""
 import os
-import random
 import sys
-from datetime import date, datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd
 import streamlit as st
-import akshare as ak
 
+from app.background_jobs import (
+    background_jobs_ready_for_current_user,
+    load_latest_job_result,
+    refresh_background_job_data,
+    submit_background_job,
+    sync_background_job_state,
+)
 from app.layout import setup_page
 from app.navigation import show_right_nav
-from app.ui_helpers import show_page_loading
-from integrations.ai_prompts import ALPHA_CIO_SYSTEM_PROMPT
-from integrations.llm_client import call_llm, SUPPORTED_PROVIDERS, GEMINI_MODELS
-from integrations.fetch_a_share_csv import (
-    _resolve_trading_window,
-    _fetch_hist,
-    _build_export,
-    get_all_stocks,
-    get_stocks_by_board,
-    _normalize_symbols,
-    _stock_name_from_code,
-)
-from utils import extract_symbols_from_text, stock_sector_em
-from core.wyckoff_engine import (
-    FunnelConfig,
-    normalize_hist_from_fetch,
-    run_funnel,
-)
-from integrations.data_source import fetch_index_hist, fetch_sector_map, fetch_market_cap_map
 from core.single_stock_logic import render_single_stock_page
-from scripts.step3_batch_report import generate_stock_payload
-from integrations.ai_prompts import WYCKOFF_FUNNEL_SYSTEM_PROMPT
-
-# 等待时随机展示的股市名人名言（本地列表）
-STOCK_QUOTES = [
-    "市场永远是对的。——杰西·利弗莫尔",
-    "不要与市场争辩，最小阻力线才是方向。——杰西·利弗莫尔",
-    "买你懂的，不懂不买。——彼得·林奇",
-    "当你持有好公司时，时间站在你这一边。——彼得·林奇",
-    "别人恐惧时我贪婪，别人贪婪时我恐惧。——沃伦·巴菲特",
-    "价格是你付出的，价值是你得到的。——沃伦·巴菲特",
-    "趋势是你的朋友。——华尔街谚语",
-    "截断亏损，让利润奔跑。——威廉·埃克哈特",
-    "计划你的交易，交易你的计划。——佚名",
-    "本金安全第一，先求不败再求胜。——杰西·利弗莫尔",
-    "没有纪律，再好的策略也是空谈。——理查德·丹尼斯",
-    "市场会奖励耐心与纪律。——查理·芒格",
-    "只在关键点出手。——杰西·利弗莫尔",
-    "量在价先，资金不会骗人。——威科夫",
-    "买在分歧，卖在一致。——情绪流龙头战法",
-]
-
-TRIGGER_LABELS = {
-    "sos": "SOS（量价点火）",
-    "spring": "Spring（终极震仓）",
-    "lps": "LPS（缩量回踩）",
-    "evr": "Effort vs Result（放量不跌）",
-}
-
-TRADING_DAYS_OHLCV = 60
-ADJUST = "qfq"
-MAX_SYMBOLS = 6
+from integrations.llm_client import SUPPORTED_PROVIDERS, GEMINI_MODELS
+from utils import extract_symbols_from_text
 
 setup_page(page_title="AI 分析", page_icon="🤖")
+
+STATE_KEY = "batch_ai_background_job"
+
+
+def _parse_manual_codes(text: str) -> list[dict]:
+    raw_codes = extract_symbols_from_text(str(text or ""))
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for code in raw_codes:
+        code_s = str(code or "").strip()
+        if not code_s or code_s in seen:
+            continue
+        seen.add(code_s)
+        rows.append({"code": code_s, "name": code_s, "tag": ""})
+    return rows[:6]
+
+
+def _load_find_gold_source() -> tuple[list[dict], dict]:
+    session_rows = st.session_state.get("ai_find_gold_background_symbols") or []
+    if isinstance(session_rows, list) and session_rows:
+        return (session_rows, {})
+    _, latest_result = load_latest_job_result("funnel_screen")
+    if latest_result:
+        return (
+            latest_result.get("symbols_for_report", []) or [],
+            latest_result.get("benchmark_context", {}) or {},
+        )
+    return ([], {})
+
+
+def _render_ai_status(state: dict | None) -> dict | None:
+    if not isinstance(state, dict):
+        return None
+    run = state.get("run")
+    result = state.get("result")
+    request_id = str(state.get("request_id", "") or "").strip()
+    if request_id:
+        st.caption(f"请求 ID: `{request_id}`")
+    if run is None:
+        st.info("后台 AI 任务已提交，正在等待 GitHub Actions 创建运行实例。")
+        return result if isinstance(result, dict) else None
+    status = str(getattr(run, "status", "") or "")
+    conclusion = str(getattr(run, "conclusion", "") or "")
+    if status == "completed":
+        if conclusion == "success":
+            st.success("后台 AI 任务已完成。")
+        else:
+            st.error(f"后台 AI 任务结束，但结论为 `{conclusion or '--'}`。")
+    else:
+        st.info(f"后台 AI 任务进行中：`{status}`")
+    html_url = str(getattr(run, "html_url", "") or "").strip()
+    if html_url:
+        st.markdown(f"[打开 GitHub Actions 运行详情]({html_url})")
+    if isinstance(result, dict) and str(result.get("status", "") or "") == "error":
+        st.error(str(result.get("error", "后台 AI 任务失败")))
+    return result if isinstance(result, dict) else None
+
 
 content_col = show_right_nav()
 with content_col:
     st.title("🤖 AI 分析")
-    st.markdown("选定股票或筛出候选后，一键生成多维度深度研报，供你决策参考。")
+    st.markdown("单股维持本地分析；批量研报和漏斗联动已经迁到 GitHub Actions 后台。")
 
-    # 1) 供应商与模型（首期仅 Gemini）
-    st.subheader("API 与模型")
-    provider = st.selectbox(
-        "API 供应商",
-        options=list(SUPPORTED_PROVIDERS),
-        format_func=lambda x: "Gemini" if x == "gemini" else x,
-        key="ai_provider",
-    )
-    default_model = (
-        st.session_state.get("ai_model")
-        or st.session_state.get("gemini_model")
-        or "gemini-2.5-flash-lite"
-    )
-    model = st.text_input(
-        "模型",
-        value=str(default_model),
-        key="ai_model",
-        help="可手动填写任意 Gemini 模型名，不再受下拉框限制。",
-    ).strip()
-    if not model:
-        model = str(default_model).strip()
-    st.caption("常用模型示例：" + "、".join(GEMINI_MODELS[:6]))
-
-    # 2) API Key 校验
-    api_key = (st.session_state.get("gemini_api_key") or "").strip()
-    if not api_key:
-        st.toast("请先在设置页录入 API Key", icon="⚠️")
-        st.warning("未检测到 API Key，请先在设置页录入后再使用 AI 分析。")
-        st.page_link("pages/Settings.py", label="前往设置", icon="⚙️")
-        st.stop()
-
-    # 3) 分析类型与标的
-    st.subheader("分析内容")
     analysis_type = st.radio(
         "分析类型",
         options=["single_stock", "stock_list", "find_gold"],
         format_func=lambda x: {
-            "single_stock": "单股分析 (威科夫大师模式)",
-            "stock_list": "指定股票代码 (批量研报)",
-            "find_gold": "Wyckoff Funnel (批量研报)"
+            "single_stock": "单股分析 (本地)",
+            "stock_list": "指定股票代码 (后台批量研报)",
+            "find_gold": "使用后台漏斗候选 (后台批量研报)",
         }.get(x, x),
         horizontal=True,
         key="ai_analysis_type",
     )
 
     if analysis_type == "single_stock":
-        render_single_stock_page(provider, model, api_key)
-        st.stop()  # 单股模式独占页面下方
+        provider = st.selectbox(
+            "API 供应商",
+            options=list(SUPPORTED_PROVIDERS),
+            format_func=lambda x: "Gemini" if x == "gemini" else x,
+            key="ai_provider_single",
+        )
+        default_model = (
+            st.session_state.get("ai_model")
+            or st.session_state.get("gemini_model")
+            or "gemini-2.5-flash-lite"
+        )
+        model = st.text_input(
+            "模型",
+            value=str(default_model),
+            key="ai_model_single",
+            help="单股模式继续走本地直连。",
+        ).strip()
+        api_key = (st.session_state.get("gemini_api_key") or "").strip()
+        if not api_key:
+            st.warning("单股模式需要本地 API Key，请先在设置页录入。")
+            st.page_link("pages/Settings.py", label="前往设置", icon="⚙️")
+            st.stop()
+        st.caption("常用模型示例：" + "、".join(GEMINI_MODELS[:6]))
+        render_single_stock_page(provider, model or str(default_model), api_key)
+        st.stop()
 
-    symbols: list[str] = []
+    ready, ready_msg = background_jobs_ready_for_current_user()
+    if not ready:
+        st.error(ready_msg)
+        st.stop()
+
+    st.info(
+        "批量模式已改成后台任务。页面只提交参数并读取结果，不再在 Streamlit 进程里拉全量 OHLCV 或等待长时间模型调用。"
+    )
+    model_override = st.text_input(
+        "后台模型覆盖（可留空）",
+        value=str(st.session_state.get("gemini_model") or "gemini-2.5-flash-lite"),
+        help="留空则优先使用你在设置页保存的 Gemini 模型。",
+    ).strip()
+    preview_only = st.checkbox("仅生成输入预演，不真正调用模型", value=False)
+
+    selected_symbols_info: list[dict] = []
+    benchmark_context: dict = {}
+
     if analysis_type == "stock_list":
         stock_input = st.text_area(
             "股票代码（最多 6 个）",
-            placeholder="例如：000001；600519；300364（分号或空格分隔）",
-            height=100,
-            key="ai_stock_list_input",
+            placeholder="例如：000001；600519；300364",
+            height=110,
+            key="ai_stock_list_input_bg",
         )
-        candidates = extract_symbols_from_text(stock_input or "")
-        symbols = _normalize_symbols(candidates)[:MAX_SYMBOLS]
-        if not symbols:
-            st.info("请至少输入 1 个、最多 6 个股票代码。")
-        elif len(_normalize_symbols(candidates)) > MAX_SYMBOLS:
-            st.caption(f"已自动截取前 {MAX_SYMBOLS} 个代码：{', '.join(symbols)}")
-    else:
-        # Wyckoff Funnel：本页直接执行，无需跳转
-        find_gold_result: list[tuple[str, float]] = st.session_state.get("ai_find_gold_result") or []
-        if find_gold_result:
-            symbols = [s for s, _ in find_gold_result[:MAX_SYMBOLS]]
-            st.caption(f"将使用漏斗结果中的 {len(symbols)} 只股票：{', '.join(symbols)}")
-            if st.button("重新漏斗筛选", key="ai_reset_find_gold"):
-                del st.session_state["ai_find_gold_result"]
-                st.rerun()
+        selected_symbols_info = _parse_manual_codes(stock_input)
+        if not selected_symbols_info:
+            st.caption("请至少输入 1 个股票代码。")
         else:
-            with st.container(border=True):
-                st.markdown("**先通过 Wyckoff Funnel 筛选值得关注的股票**")
-                pool_mode = st.radio("股票池", options=["板块", "手动输入"], horizontal=True, key="ai_pool_mode")
-                symbols_input_fg = ""
-                board_fg = "all"
-                limit_fg = 500
-                if pool_mode == "手动输入":
-                    symbols_input_fg = st.text_area(
-                        "股票代码",
-                        placeholder="例如：600519, 000001",
-                        height=80,
-                        key="ai_find_gold_symbols_text",
-                    )
-                else:
-                    board_fg = st.selectbox(
-                        "板块",
-                        options=["all", "main", "chinext"],
-                        format_func=lambda v: {"all": "全部主板+创业板", "main": "主板", "chinext": "创业板"}.get(v, v),
-                        key="ai_find_gold_board",
-                    )
-                    limit_fg = int(st.number_input("股票数量上限", min_value=50, max_value=5000, value=500, step=100, key="ai_find_gold_limit"))
-
-                run_find_gold = st.button("执行 Wyckoff Funnel", type="primary", key="ai_run_find_gold")
-                if run_find_gold:
-                    if pool_mode == "手动输入":
-                        candidates_fg = extract_symbols_from_text(symbols_input_fg or "")
-                        pool_symbols = _normalize_symbols(candidates_fg)
-                    else:
-                        pool_symbols = [s.get("code") for s in get_stocks_by_board(board_fg) if s.get("code")][:limit_fg]
-                    if not pool_symbols:
-                        st.warning("请先输入股票代码或选择板块。")
-                        st.stop()
-                    end_cal = date.today() - timedelta(days=1)
-                    try:
-                        window_fg = _resolve_trading_window(end_cal, 500)
-                    except Exception as e:
-                        st.error(f"交易日窗口解析失败：{e}")
-                        st.stop()
-                    start_s = window_fg.start_trade_date.strftime("%Y%m%d")
-                    end_s = window_fg.end_trade_date.strftime("%Y%m%d")
-
-                    with st.spinner("加载行业 & 市值数据..."):
-                        sector_map_fg = fetch_sector_map()
-                        market_cap_fg = fetch_market_cap_map()
-                    name_map_fg = {s.get("code", ""): s.get("name", "") for s in get_all_stocks() if isinstance(s, dict) and s.get("code")}
-
-                    progress_ph = st.empty()
-                    progress_bar = progress_ph.progress(0)
-                    data_map_fg: dict[str, pd.DataFrame] = {}
-                    for idx, sym in enumerate(pool_symbols):
-                        try:
-                            df_h = _fetch_hist(sym, window_fg, "qfq")
-                            data_map_fg[sym] = normalize_hist_from_fetch(df_h)
-                        except Exception:
-                            pass
-                        progress_bar.progress((idx + 1) / len(pool_symbols))
-                    progress_ph.empty()
-
-                    # web 端优先尝试加载大盘基准；失败则自动降级，不影响继续筛选。
-                    bench_df_fg = None
-                    if os.getenv("TUSHARE_TOKEN", "").strip():
-                        try:
-                            bench_df_fg = fetch_index_hist("000001", start_s, end_s)
-                            st.caption("Find Gold 大盘基准: 已启用上证指数基准")
-                        except Exception as exc:
-                            st.caption(f"Find Gold 大盘基准: 加载失败，已自动降级（{exc}）")
-                    else:
-                        st.caption("Find Gold 大盘基准: 未配置 TUSHARE_TOKEN，已自动降级为无基准模式")
-
-                    funnel_result = run_funnel(
-                        all_symbols=list(data_map_fg.keys()),
-                        df_map=data_map_fg,
-                        bench_df=bench_df_fg,
-                        name_map=name_map_fg,
-                        market_cap_map=market_cap_fg,
-                        sector_map=sector_map_fg,
-                    )
-                    result_list: list[tuple[str, float]] = []
-                    seen: set[str] = set()
-                    for trig_key in ("sos", "spring", "lps", "evr"):
-                        for code, score in funnel_result.triggers.get(trig_key, []):
-                            if code not in seen:
-                                seen.add(code)
-                                result_list.append((code, score))
-                    st.session_state["ai_find_gold_result"] = result_list
-                    st.toast(f"漏斗筛选完成，共 {len(result_list)} 只", icon="✅")
-                    st.rerun()
-                st.stop()
-
-    if not symbols:
-        st.stop()
-
-    run_btn = st.button("开始分析", type="primary", key="ai_run_btn")
-
-    if run_btn:
-        # 时间窗口：近 60 个交易日，前复权
-        end_calendar = date.today() - timedelta(days=1)
-        try:
-            window = _resolve_trading_window(end_calendar, TRADING_DAYS_OHLCV)
-        except Exception as e:
-            st.error(f"无法解析交易日窗口：{e}")
-            st.stop()
-
-        loading = show_page_loading(
-            title="正在拉取 OHLCV 与生成研报…",
-            subtitle="请稍候",
-            quote=random.choice(STOCK_QUOTES),
-        )
-        failed: list[str] = []
-        parts: list[str] = []
-
-        try:
-            if analysis_type == "find_gold":
-                # 使用和 step3_batch_report.py 完全一致的格式
-                # funnel_result 已经存在了 session 里 (code, score)
-                # find_gold 已经提取出了 symbols 列表
-                # 取出 tag 和 score
-                # 由于之前的 funnel 没有把完整的 row 存到 session，我们在这动态生成。
-                fg_list = st.session_state.get("ai_find_gold_result") or []
-                score_map = {code: score for code, score in fg_list}
-
-                parts: list[str] = []
-                for symbol in symbols:
-                    try:
-                        df_hist = _fetch_hist(symbol, window, ADJUST)
-                        df = normalize_hist_from_fetch(df_hist)
-                        sector = stock_sector_em(symbol, timeout=30)
-                        try:
-                            name = _stock_name_from_code(symbol)
-                        except Exception:
-                            name = symbol
-
-                        score = score_map.get(symbol)
-                        # 生成统一的高密度盘口切片文本
-                        payload = generate_stock_payload(
-                            stock_code=symbol,
-                            stock_name=name,
-                            wyckoff_tag="AI分析", # 网页端简化
-                            df=df,
-                            industry=sector,
-                            quant_score=score,
-                        )
-                        parts.append(payload)
-                    except Exception as e:
-                        failed.append(f"{symbol}（{e}）")
-                        continue
-
-                system_prompt_to_use = WYCKOFF_FUNNEL_SYSTEM_PROMPT
-                user_message = (
-                    "请按最新的《Alpha 投委会机密电报》流程，使用综合人视角，对以下票池进行诊断与分流。\n\n"
-                    + "\n\n".join(parts)
-                )
-
-            else:
-                # 兼容旧单股 / stock_list 模式
-                for symbol in symbols:
-                    try:
-                        df_hist = _fetch_hist(symbol, window, ADJUST)
-                        sector = stock_sector_em(symbol, timeout=30)
-                        df_export = _build_export(df_hist, sector)
-                        try:
-                            name = _stock_name_from_code(symbol)
-                        except Exception:
-                            name = symbol
-                        csv_text = df_export.to_csv(index=False, encoding="utf-8-sig")
-                        parts.append(f"## {symbol} {name}\n\n```csv\n{csv_text}\n```")
-                    except Exception as e:
-                        failed.append(f"{symbol}（{e}）")
-                        continue
-
-                system_prompt_to_use = ALPHA_CIO_SYSTEM_PROMPT
-                user_message = (
-                    "请按 Alpha 投委会流程分析以下 OHLCV 数据（CSV 格式）。\n\n"
-                    + "\n\n".join(parts)
-                )
-
-            if not parts:
-                st.error("所有标的拉取失败，无法进行分析。失败详情：" + "; ".join(failed))
-                loading.empty()
-                st.stop()
-
-            if failed:
-                st.caption("以下标的拉取失败，已跳过：" + "; ".join(failed))
-
-            report_text = call_llm(
-                provider=provider,
-                model=model,
-                api_key=api_key,
-                system_prompt=system_prompt_to_use,
-                user_message=user_message,
-                timeout=120,
+            st.dataframe(
+                pd.DataFrame(
+                    [{"代码": x["code"], "名称": x["name"]} for x in selected_symbols_info]
+                ),
+                use_container_width=True,
+                hide_index=True,
             )
-        except ValueError as e:
-            loading.empty()
-            st.error(str(e))
-            st.stop()
-        except RuntimeError as e:
-            loading.empty()
-            st.error(f"模型调用失败：{e}。请检查 Key、网络或稍后重试。")
-            st.stop()
-        except Exception as e:
-            loading.empty()
-            st.error(f"发生错误：{e}")
-            st.stop()
-        finally:
-            loading.empty()
+    else:
+        source_rows, benchmark_context = _load_find_gold_source()
+        if not source_rows:
+            st.warning("当前没有可用的后台漏斗候选。")
+            st.page_link("pages/WyckoffScreeners.py", label="前往后台漏斗页", icon="🔬")
+        else:
+            options = {
+                f"{row.get('code', '')} {row.get('name', '')} | {row.get('track', '')} | {row.get('stage', '')}": row
+                for row in source_rows
+            }
+            default_labels = list(options.keys())[: min(6, len(options))]
+            picked = st.multiselect(
+                "选择要送去后台 AI 的候选",
+                options=list(options.keys()),
+                default=default_labels,
+                help="默认选前 6 个 AI 候选。",
+            )
+            selected_symbols_info = [options[label] for label in picked][:6]
+            if selected_symbols_info:
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "代码": row.get("code", ""),
+                                "名称": row.get("name", ""),
+                                "行业": row.get("industry", ""),
+                                "轨道": row.get("track", ""),
+                                "阶段": row.get("stage", ""),
+                                "标签": row.get("tag", ""),
+                            }
+                            for row in selected_symbols_info
+                        ]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
+    run_btn = st.button("提交后台 AI 研报", type="primary", disabled=not bool(selected_symbols_info))
+    refresh_btn = st.button("刷新后台状态")
+
+    if run_btn and selected_symbols_info:
+        payload = {
+            "symbols_info": selected_symbols_info,
+            "benchmark_context": benchmark_context,
+            "model": model_override,
+            "preview_only": preview_only,
+        }
+        request_id = submit_background_job("batch_ai_report", payload, state_key=STATE_KEY)
+        st.success(f"后台 AI 任务已提交：`{request_id}`")
+
+    state = sync_background_job_state(state_key=STATE_KEY)
+    active_result = _render_ai_status(state)
+    if refresh_btn:
+        refresh_background_job_data()
+        st.rerun()
+
+    if not active_result:
+        latest_run, latest_result = load_latest_job_result("batch_ai_report")
+        if latest_result:
+            st.divider()
+            st.caption(
+                "以下展示当前账号最近一次成功的后台批量研报。"
+                + (f" Run #{latest_run.run_number}" if latest_run else "")
+            )
+            active_result = latest_result
+
+    if active_result:
         st.subheader("📄 深度研报")
-        st.markdown(report_text)
-
-        # --- 新增飞书推送 ---
-        if st.session_state.feishu_webhook:
-            try:
-                from utils.feishu import send_feishu_notification
-                title = "AI 深度研报 (网页端批量分析)" if analysis_type != "single_stock" else "AI 深度研报 (网页端单股)"
-                send_feishu_notification(st.session_state.feishu_webhook, title, report_text)
-            except Exception as e:
-                st.toast(f"飞书推送失败: {e}", icon="⚠️")
+        if active_result.get("preview_only"):
+            st.caption("当前结果来自输入预演模式。")
+        st.markdown(str(active_result.get("report_text", "") or ""))

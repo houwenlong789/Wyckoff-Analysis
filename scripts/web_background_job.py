@@ -1,0 +1,242 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import traceback
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _sanitize(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {str(k): _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_sanitize(x) for x in obj]
+    if hasattr(obj, "item"):
+        try:
+            return obj.item()
+        except Exception:
+            pass
+    return str(obj)
+
+
+def _write_result(path: str, payload: dict[str, Any]) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8") as f:
+        json.dump(_sanitize(payload), f, ensure_ascii=False, indent=2)
+
+
+def _load_payload(raw: str) -> dict[str, Any]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    data = json.loads(text)
+    return data if isinstance(data, dict) else {}
+
+
+def _apply_funnel_env(payload: dict[str, Any]) -> None:
+    pool_mode = str(payload.get("pool_mode", "") or "").strip().lower()
+    if pool_mode in {"manual", "board"}:
+        os.environ["FUNNEL_POOL_MODE"] = pool_mode
+    board = str(payload.get("board", "") or "").strip().lower()
+    if board:
+        os.environ["FUNNEL_POOL_BOARD"] = board
+    manual_symbols = str(payload.get("manual_symbols", "") or "").strip()
+    if manual_symbols:
+        os.environ["FUNNEL_POOL_MANUAL_SYMBOLS"] = manual_symbols
+    limit_count = payload.get("limit_count")
+    if limit_count not in {None, ""}:
+        os.environ["FUNNEL_POOL_LIMIT_COUNT"] = str(limit_count)
+
+    env_map = {
+        "trading_days": "FUNNEL_TRADING_DAYS",
+        "max_workers": "FUNNEL_MAX_WORKERS",
+        "batch_size": "FUNNEL_BATCH_SIZE",
+        "min_market_cap_yi": "FUNNEL_CFG_MIN_MARKET_CAP_YI",
+        "min_avg_amount_wan": "FUNNEL_CFG_MIN_AVG_AMOUNT_WAN",
+        "ma_short": "FUNNEL_CFG_MA_SHORT",
+        "ma_long": "FUNNEL_CFG_MA_LONG",
+        "ma_hold": "FUNNEL_CFG_MA_HOLD",
+        "top_n_sectors": "FUNNEL_CFG_TOP_N_SECTORS",
+        "spring_support_window": "FUNNEL_CFG_SPRING_SUPPORT_WINDOW",
+        "lps_vol_dry_ratio": "FUNNEL_CFG_LPS_VOL_DRY_RATIO",
+        "evr_vol_ratio": "FUNNEL_CFG_EVR_VOL_RATIO",
+    }
+    for key, env_name in env_map.items():
+        value = payload.get(key)
+        if value not in {None, ""}:
+            os.environ[env_name] = str(value)
+
+
+def _run_funnel_screen(request_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    _apply_funnel_env(payload)
+    from scripts.wyckoff_funnel import run as run_funnel
+
+    ok, symbols_for_report, benchmark_context, details = run_funnel(
+        "",
+        notify=False,
+        return_details=True,
+    )
+    metrics = details.get("metrics", {}) or {}
+    triggers = details.get("triggers", {}) or {}
+    name_map = details.get("name_map", {}) or {}
+    sector_map = details.get("sector_map", {}) or {}
+
+    trigger_groups: dict[str, list[dict[str, Any]]] = {}
+    unique_hit_codes: set[str] = set()
+    for trigger_name, rows in triggers.items():
+        group_rows: list[dict[str, Any]] = []
+        for code, score in rows:
+            code_s = str(code).strip()
+            if code_s:
+                unique_hit_codes.add(code_s)
+            group_rows.append(
+                {
+                    "code": code_s,
+                    "name": str(name_map.get(code_s, code_s)),
+                    "industry": str(sector_map.get(code_s, "") or "未知行业"),
+                    "score": float(score),
+                }
+            )
+        trigger_groups[str(trigger_name)] = group_rows
+
+    return {
+        "request_id": request_id,
+        "job_kind": "funnel_screen",
+        "ok": bool(ok),
+        "benchmark_context": benchmark_context,
+        "metrics": metrics,
+        "summary": {
+            "total_symbols": int(metrics.get("total_symbols", 0) or 0),
+            "layer1": int(metrics.get("layer1", 0) or 0),
+            "layer2": int(metrics.get("layer2", 0) or 0),
+            "layer3": int(metrics.get("layer3", 0) or 0),
+            "l4_unique_hits": int(len(unique_hit_codes)),
+            "selected_for_ai": int(len(details.get("selected_for_ai", []) or [])),
+        },
+        "trigger_groups": trigger_groups,
+        "symbols_for_report": symbols_for_report,
+        "selected_for_ai": details.get("selected_for_ai", []) or [],
+        "trend_selected": details.get("trend_selected", []) or [],
+        "accum_selected": details.get("accum_selected", []) or [],
+        "top_sectors": metrics.get("top_sectors", []) or [],
+        "content_preview": str(details.get("content", "") or "")[:4000],
+    }
+
+
+def _resolve_model_credentials(payload: dict[str, Any]) -> tuple[str, str]:
+    user_id = str(payload.get("user_id", "") or "").strip()
+    api_key = ""
+    model = str(payload.get("model", "") or "").strip()
+    if user_id:
+        from integrations.supabase_portfolio import load_user_settings_admin
+
+        settings = load_user_settings_admin(user_id) or {}
+        api_key = str(settings.get("gemini_api_key", "") or "").strip()
+        if not model:
+            model = str(settings.get("gemini_model", "") or "").strip()
+    if not api_key:
+        api_key = str(os.getenv("GEMINI_API_KEY", "") or "").strip()
+    if not model:
+        model = str(os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite") or "").strip()
+    if not api_key:
+        raise ValueError("未找到可用的 Gemini API Key（用户配置与环境变量均为空）")
+    return api_key, model
+
+
+def _run_batch_ai_report(request_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    symbols_info = payload.get("symbols_info")
+    if not isinstance(symbols_info, list) or not symbols_info:
+        raise ValueError("symbols_info 为空")
+
+    preview_only = bool(payload.get("preview_only"))
+    if preview_only:
+        os.environ["STEP3_SKIP_LLM"] = "1"
+
+    api_key, model = _resolve_model_credentials(payload)
+    benchmark_context = payload.get("benchmark_context", {}) or {}
+
+    from scripts.step3_batch_report import run as run_step3
+
+    ok, reason, report_text = run_step3(
+        symbols_info,
+        webhook_url="",
+        api_key=api_key,
+        model=model,
+        benchmark_context=benchmark_context,
+        notify=False,
+    )
+    return {
+        "request_id": request_id,
+        "job_kind": "batch_ai_report",
+        "ok": bool(ok),
+        "reason": str(reason or ""),
+        "model": model,
+        "preview_only": preview_only,
+        "symbol_count": len(symbols_info),
+        "symbols_info": symbols_info,
+        "benchmark_context": benchmark_context,
+        "report_text": str(report_text or ""),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="GitHub Actions 后台量化作业")
+    parser.add_argument("--job-kind", required=True)
+    parser.add_argument("--request-id", required=True)
+    parser.add_argument("--payload-json", default="")
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args()
+
+    payload = _load_payload(args.payload_json)
+    requested_by_user_id = str(payload.get("user_id", "") or "").strip()
+    base_result: dict[str, Any] = {
+        "request_id": args.request_id,
+        "job_kind": args.job_kind,
+        "requested_by_user_id": requested_by_user_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "success",
+    }
+
+    try:
+        if args.job_kind == "funnel_screen":
+            result = _run_funnel_screen(args.request_id, payload)
+        elif args.job_kind == "batch_ai_report":
+            result = _run_batch_ai_report(args.request_id, payload)
+        else:
+            raise ValueError(f"不支持的 job_kind: {args.job_kind}")
+        base_result.update(result)
+    except Exception as e:
+        base_result.update(
+            {
+                "status": "error",
+                "ok": False,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            }
+        )
+        _write_result(args.output, base_result)
+        print(base_result["traceback"], file=sys.stderr)
+        return 1
+
+    _write_result(args.output, base_result)
+    print(
+        f"[web_background_job] ok kind={args.job_kind} request_id={args.request_id} "
+        f"user_id={requested_by_user_id or '-'}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
