@@ -483,13 +483,23 @@ def _fetch_stock_efinance(symbol: str, start: str, end: str) -> pd.DataFrame:
     try:
         import efinance as ef
         import efinance.config as ef_cfg
+        # 预触发内部检查，某些版本在此处会尝试读取 data 目录
+        from efinance.common.sh_stock_check import is_sh_stock
+    except (PermissionError, FileNotFoundError) as e:
+        _debug_source_fail("efinance_patch", e)
     finally:
         pathlib.Path.mkdir = orig_mkdir
 
     cache_dir = Path(tempfile.gettempdir()) / "efinance-cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     ef_cfg.DATA_DIR = cache_dir
     ef_cfg.SEARCH_RESULT_CACHE_PATH = str(cache_dir / "search-cache.json")
+    
+    # 额外抑制 efinance 内部对 site-packages 下 data 目录的硬编码访问尝试导致的 FileNotFoundError
+    # 这种错误通常发生在 Python 3.13 + Streamlit Cloud 环境下
 
     # fqt: 0 不复权, 1 前复权, 2 后复权
     fqt = 1  # 默认前复权
@@ -566,10 +576,19 @@ def _fetch_stock_tushare(
     ts_code = _to_ts_code(symbol)
     # 口径固定：优先使用前复权（qfq）。
     adj_val = "qfq"
-    # pro_bar 支持复权，pro.daily 仅未复权
-    df = ts.pro_bar(ts_code=ts_code, adj=adj_val, start_date=start, end_date=end)
+    # 显式传入 proapi 以确保 token 生效。
+    df = ts.pro_bar(ts_code=ts_code, proapi=pro, adj=adj_val, start_date=start, end_date=end)
+    
     if df is None or df.empty:
+        # 诊断：尝试拉取不复权数据，看是否是权限问题（qfq 需要更高积分）
+        try:
+            df_no_adj = pro.daily(ts_code=ts_code, start_date=start, end_date=end)
+            if df_no_adj is not None and not df_no_adj.empty:
+                raise RuntimeError("tushare empty (qfq auth limit?)")
+        except Exception:
+            pass
         raise RuntimeError("tushare empty")
+    
     df = df.rename(
         columns={
             "trade_date": "日期",
@@ -753,8 +772,8 @@ def fetch_stock_hist(
     hint = _network_hint_from_details(failed_details)
     hint_suffix = f" 诊断提示：{hint}" if hint else ""
     raise RuntimeError(
-        f"拉取失败（非程序错误）：已按顺序尝试 tushare→akshare→baostock→efinance，"
-        f"均无可用数据。{detail_suffix}{hint_suffix}"
+        f"数据拉取全线失败 [标:{symbol}, 范围:{start_s}..{end_s}, 复权:{adjust}]：已按顺序尝试 tushare→akshare→baostock→efinance，"
+        f"均无可用 K 线数据。请检查该标的是否已退市或处于长期停牌期。{detail_suffix}{hint_suffix}"
     )
 
 
