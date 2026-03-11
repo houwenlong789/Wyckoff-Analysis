@@ -28,24 +28,35 @@ from integrations.data_source import (
 )
 from utils.feishu import send_feishu_notification
 from utils.trading_clock import CN_TZ, resolve_end_calendar_day
-from core.wyckoff_engine import normalize_hist_from_fetch
+from core.wyckoff_engine import fit_ai_candidate_quotas, normalize_hist_from_fetch
 from core.sector_rotation import SECTOR_STATE_LABELS
 
 TRADING_DAYS = 500
 GEMINI_MODEL_FALLBACK = "gemini-2.5-flash-lite"
-STEP3_MAX_AI_INPUT = 0
+STEP3_MAX_AI_INPUT = int(os.getenv("STEP3_MAX_AI_INPUT", "0"))
+STEP3_DEFAULT_CONTEXT_CAP = max(int(os.getenv("STEP3_DEFAULT_CONTEXT_CAP", "8")), 0)
 STEP3_MAX_PER_INDUSTRY = int(os.getenv("STEP3_MAX_PER_INDUSTRY", "5"))
+STEP3_EMPTY_COMPRESSION_FALLBACK_CAP = max(
+    int(os.getenv("STEP3_EMPTY_COMPRESSION_FALLBACK_CAP", "8")),
+    0,
+)
+STEP3_MAX_UPSTREAM_FILL = max(int(os.getenv("STEP3_MAX_UPSTREAM_FILL", "0")), 0)
 STEP3_MAX_OUTPUT_TOKENS = 32768
 DYNAMIC_MAINLINE_BONUS_RATE = 0.15
 DYNAMIC_MAINLINE_TOP_N = 3
 DYNAMIC_MAINLINE_MIN_CLUSTER = 2
-STEP3_ENABLE_COMPRESSION = False
+STEP3_ENABLE_COMPRESSION = os.getenv("STEP3_ENABLE_COMPRESSION", "1").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 STEP3_ENABLE_RAG_VETO = os.getenv("STEP3_ENABLE_RAG_VETO", "1").strip().lower() in {
     "1", "true", "yes", "on"
 }
 STEP3_SKIP_LLM = os.getenv("STEP3_SKIP_LLM", "0").strip().lower() in {
     "1", "true", "yes", "on"
 }
+STEP3_RESPECT_UPSTREAM_PRIORITY = os.getenv(
+    "STEP3_RESPECT_UPSTREAM_PRIORITY", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 
 RECENT_DAYS = 15
@@ -616,6 +627,122 @@ def ultimate_compressor(
     return df
 
 
+def _fallback_candidates_when_compression_empty(
+    candidates_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if candidates_df is None or candidates_df.empty:
+        return pd.DataFrame()
+
+    df = candidates_df.copy()
+    df["wyckoff_score"] = pd.to_numeric(df.get("funnel_score"), errors="coerce")
+    df = df.sort_values(
+        by=["wyckoff_score", "rs_10", "min_vol_ratio_5d"],
+        ascending=[False, False, True],
+        na_position="last",
+    ).reset_index(drop=True)
+    if STEP3_EMPTY_COMPRESSION_FALLBACK_CAP > 0:
+        df = df.head(STEP3_EMPTY_COMPRESSION_FALLBACK_CAP).reset_index(drop=True)
+    return df
+
+
+def _coerce_bool_like(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_step3_context_cap(raw_count: int) -> int:
+    raw_n = max(int(raw_count), 0)
+    if raw_n <= 0:
+        return 0
+    if STEP3_MAX_AI_INPUT > 0:
+        return min(STEP3_MAX_AI_INPUT, raw_n)
+    if STEP3_DEFAULT_CONTEXT_CAP > 0:
+        return min(STEP3_DEFAULT_CONTEXT_CAP, raw_n)
+    return raw_n
+
+
+def _has_upstream_priority_context(candidates_df: pd.DataFrame) -> bool:
+    if not STEP3_RESPECT_UPSTREAM_PRIORITY or candidates_df is None or candidates_df.empty:
+        return False
+    if "priority_score" in candidates_df.columns:
+        if pd.to_numeric(candidates_df["priority_score"], errors="coerce").notna().any():
+            return True
+    if "selection_source" in candidates_df.columns:
+        if candidates_df["selection_source"].astype(str).str.strip().ne("").any():
+            return True
+    return False
+
+
+def _select_upstream_priority_candidates(
+    candidates_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Respect the Funnel's upstream ordering and only do a conservative tail cut here.
+    Step3 should not re-rank already-selected AI candidates into a different order.
+    """
+    if candidates_df is None or candidates_df.empty:
+        return pd.DataFrame()
+
+    df = candidates_df.copy()
+    df["input_order"] = pd.to_numeric(df.get("input_order"), errors="coerce")
+    df["input_order"] = df["input_order"].fillna(pd.Series(range(len(df)), index=df.index)).astype(int)
+    if "selection_is_fill" in df.columns:
+        df["selection_is_fill"] = df["selection_is_fill"].apply(_coerce_bool_like)
+    else:
+        df["selection_is_fill"] = False
+    df["priority_score"] = pd.to_numeric(df.get("priority_score"), errors="coerce")
+    df = df.sort_values(
+        by=["selection_is_fill", "input_order"],
+        ascending=[True, True],
+        kind="stable",
+    ).reset_index(drop=True)
+
+    context_cap = _resolve_step3_context_cap(len(df))
+    if context_cap <= 0 or len(df) <= context_cap:
+        return df
+
+    trend_total = int((df["track"] == "Trend").sum())
+    accum_total = int((df["track"] == "Accum").sum())
+    trend_cap, accum_cap = fit_ai_candidate_quotas(context_cap, trend_total, accum_total)
+
+    core_df = df[~df["selection_is_fill"]].copy()
+    fill_df = df[df["selection_is_fill"]].copy()
+
+    selected_parts: list[pd.DataFrame] = []
+    if trend_cap > 0:
+        selected_parts.append(core_df[core_df["track"] == "Trend"].head(trend_cap))
+    if accum_cap > 0:
+        selected_parts.append(core_df[core_df["track"] == "Accum"].head(accum_cap))
+
+    selected_df = (
+        pd.concat(selected_parts, ignore_index=False)
+        if selected_parts
+        else df.iloc[0:0].copy()
+    )
+    selected_codes = set(selected_df["code"].astype(str).tolist())
+
+    remaining_slots = max(context_cap - len(selected_df), 0)
+    if remaining_slots > 0:
+        core_remainder = core_df[~core_df["code"].astype(str).isin(selected_codes)]
+        if not core_remainder.empty:
+            extra_core = core_remainder.head(remaining_slots)
+            selected_df = pd.concat([selected_df, extra_core], ignore_index=False)
+            selected_codes.update(extra_core["code"].astype(str).tolist())
+            remaining_slots = max(context_cap - len(selected_df), 0)
+
+    if remaining_slots > 0 and STEP3_MAX_UPSTREAM_FILL > 0:
+        fill_remainder = fill_df[~fill_df["code"].astype(str).isin(selected_codes)]
+        if not fill_remainder.empty:
+            fill_take = fill_remainder.head(min(remaining_slots, STEP3_MAX_UPSTREAM_FILL))
+            selected_df = pd.concat([selected_df, fill_take], ignore_index=False)
+
+    selected_df = selected_df.sort_values("input_order", kind="stable").reset_index(drop=True)
+    return selected_df
+
+
 def _format_slice_date(value: object) -> str:
     s = str(value or "")
     return s[5:10] if len(s) >= 10 else s
@@ -980,7 +1107,7 @@ def run(
     failed: list[tuple[str, str]] = []
     candidate_rows: list[dict] = []
     code_to_df: dict[str, pd.DataFrame] = {}
-    for item in items:
+    for item_order, item in enumerate(items):
         code = item["code"]
         name = item.get("name", code)
         tag = item.get("tag", "")
@@ -1056,10 +1183,15 @@ def run(
                 {
                     "code": code,
                     "name": name,
+                    "input_order": item_order,
                     "tag": tag,
                     "track": str(item.get("track", "")).strip(),
                     "stage": str(item.get("stage", "")).strip(),
                     "funnel_score": pd.to_numeric(item.get("score"), errors="coerce"),
+                    "priority_score": pd.to_numeric(item.get("priority_score"), errors="coerce"),
+                    "priority_rank": pd.to_numeric(item.get("priority_rank"), errors="coerce"),
+                    "selection_source": str(item.get("selection_source", "") or "").strip(),
+                    "selection_is_fill": _coerce_bool_like(item.get("selection_is_fill")),
                     "exit_signal": str(item.get("exit_signal", "")).strip(),
                     "exit_price": pd.to_numeric(item.get("exit_price"), errors="coerce"),
                     "exit_reason": str(item.get("exit_reason", "")).strip(),
@@ -1086,45 +1218,83 @@ def run(
 
     candidates_df = pd.DataFrame(candidate_rows)
     candidates_df["code"] = candidates_df["code"].astype(str).str.strip()
+    candidates_df["input_order"] = pd.to_numeric(candidates_df.get("input_order"), errors="coerce")
+    candidates_df["input_order"] = candidates_df["input_order"].fillna(
+        pd.Series(range(len(candidates_df)), index=candidates_df.index)
+    ).astype(int)
     candidates_df["track"] = candidates_df.get("track", "").astype(str).str.strip()
     candidates_df.loc[~candidates_df["track"].isin(["Trend", "Accum"]), "track"] = "Trend"
     candidates_df["policy_tag"] = ""
     selected_df = candidates_df.copy()
     selected_df["wyckoff_score"] = pd.to_numeric(
-        selected_df.get("funnel_score"),
+        selected_df.get("priority_score"),
         errors="coerce",
     )
+    selected_df["wyckoff_score"] = selected_df["wyckoff_score"].where(
+        selected_df["wyckoff_score"].notna(),
+        pd.to_numeric(selected_df.get("funnel_score"), errors="coerce"),
+    )
     selected_df["industry_rank"] = pd.NA
+    effective_context_cap = _resolve_step3_context_cap(len(candidates_df))
 
-    if STEP3_ENABLE_COMPRESSION:
+    if _has_upstream_priority_context(candidates_df):
+        selected_df = _select_upstream_priority_candidates(candidates_df)
+        fill_count = int(selected_df.get("selection_is_fill", pd.Series(dtype=bool)).sum())
+        track_counts = (
+            selected_df["track"].value_counts().to_dict()
+            if "track" in selected_df.columns
+            else {}
+        )
+        print(
+            f"[step3] 尊重上游优先级收口: raw={len(candidates_df)} -> selected={len(selected_df)} "
+            f"(cap={effective_context_cap}, Trend={int(track_counts.get('Trend', 0))}, "
+            f"Accum={int(track_counts.get('Accum', 0))}, fills={fill_count})"
+        )
+    elif STEP3_ENABLE_COMPRESSION:
         compressed_df = ultimate_compressor(
             candidates_df,
             regime=regime,
             bonus_rate=DYNAMIC_MAINLINE_BONUS_RATE,
-            max_total=STEP3_MAX_AI_INPUT,
+            max_total=effective_context_cap,
             max_per_industry=STEP3_MAX_PER_INDUSTRY,
         )
         if compressed_df.empty:
-            print("[step3] 压缩器结果为空，回退为全量候选列表")
+            selected_df = _fallback_candidates_when_compression_empty(candidates_df)
+            print(
+                "[step3] 压缩器结果为空，回退为受控候选列表 "
+                f"(fallback_cap={STEP3_EMPTY_COMPRESSION_FALLBACK_CAP}, selected={len(selected_df)})"
+            )
         else:
             selected_df = compressed_df
         print(
             f"[step3] 候选压缩已启用: raw={len(candidates_df)} -> selected={len(selected_df)} "
-            f"(regime={regime}, max_total={STEP3_MAX_AI_INPUT}, max_per_industry={STEP3_MAX_PER_INDUSTRY})"
+            f"(regime={regime}, max_total={effective_context_cap}, max_per_industry={STEP3_MAX_PER_INDUSTRY})"
         )
     else:
         print(f"[step3] 候选压缩未启用: selected=全量{len(selected_df)}")
 
-    if STEP3_MAX_AI_INPUT > 0 and len(selected_df) > STEP3_MAX_AI_INPUT:
+    if effective_context_cap > 0 and len(selected_df) > effective_context_cap:
         before_n = len(selected_df)
-        selected_df = selected_df.head(STEP3_MAX_AI_INPUT).reset_index(drop=True)
+        selected_df = selected_df.head(effective_context_cap).reset_index(drop=True)
         print(
             f"[step3] 上下文硬上限生效: selected {before_n} -> {len(selected_df)} "
-            f"(STEP3_MAX_AI_INPUT={STEP3_MAX_AI_INPUT})"
+            f"(effective_context_cap={effective_context_cap}, env_STEP3_MAX_AI_INPUT={STEP3_MAX_AI_INPUT}, "
+            f"default_cap={STEP3_DEFAULT_CONTEXT_CAP})"
         )
 
+    selected_df["wyckoff_score"] = pd.to_numeric(
+        selected_df.get("priority_score"),
+        errors="coerce",
+    )
+    selected_df["wyckoff_score"] = selected_df["wyckoff_score"].where(
+        selected_df["wyckoff_score"].notna(),
+        pd.to_numeric(selected_df.get("funnel_score"), errors="coerce"),
+    )
+    if "industry_rank" not in selected_df.columns:
+        selected_df["industry_rank"] = pd.NA
+
     # P2: RAG 防雷（负面新闻关键词 veto）
-    # 注意：RAG 永远在压缩/硬上限之后执行，确保筛查集合最多为 STEP3_MAX_AI_INPUT。
+    # 注意：RAG 永远在压缩/硬上限之后执行，确保筛查集合已被有效上下文 cap 收口。
     rag_veto_lines: list[str] = []
     rag_veto_preview = ""
     if STEP3_ENABLE_RAG_VETO and is_rag_veto_enabled() and not selected_df.empty:
