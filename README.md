@@ -1,10 +1,21 @@
-# A 股选股与行情工具
+# 🏛️ Wyckoff 分析与交易系统
 
-> 每天从全市场多层筛选出高弹性标的，由「Alpha 全栈虚拟投委会」出具**三阵营研报（逻辑破产/储备营地/处于起跳板）**；重计算链路已迁到 GitHub Actions 后台，Streamlit 只负责触发、看状态、读结果。
+> **致用户：本项目从用户体验角度由两部分核心组成，无需全员 Fork 或本地运行即可使用。**
+
+1.  **Streamlit Web 交互中心（即开即用）**  
+    **👉 [点击直接访问线上的 Web 页面](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**  
+    这是本系统的可视化大本营，已在云端部署。你可以在此查看最新的大盘水温、AI 研报结果、单股量化复盘、持仓管理以及回测记录。**大部分日常看盘需求在 Web 页面即可完成，无需自己 Fork 运行。**
+
+2.  **云端漏斗筛选任务 (Wyckoff Funnel)**  
+    这是后台的“计算工厂”，通过 GitHub Actions 定时执行全市场的量化初筛、AI 深度审问、飞书推送及风控任务。
+
+---
 
 用 [akshare](https://github.com/akfamily/akshare) + 自研 Wyckoff 漏斗做量化初筛，交由大模型开展多空博弈深度剖析，最后由 OMS 负责执行约束。适合拒绝无脑黑盒、需“白盒逻辑 + 量化防守 + AI参谋预判”的 A 股散户投资者。
 
-**在线体验：** [https://wyckoff-analysis-youngcanphoenix.streamlit.app/](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)
+> [!TIP]
+> **💡 进阶功能：个人持仓换股工作**  
+> 本项目除公开筛选功能外，还深度支持**个人持仓的动态管理与“AI 换股决策”**（基于实盘持仓的 Tape Reading 与外部猎物替换法则）。由于此功能涉及私人 API Key 配置与资产安全，如需使用或定制此项服务，**请联系开发者获取支持**。
 
 ---
 
