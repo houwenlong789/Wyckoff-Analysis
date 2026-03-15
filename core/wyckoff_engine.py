@@ -103,6 +103,7 @@ class FunnelConfig:
     rps_slope_window: int = 10  # 计算 RPS 斜率的窗口（交易日）
     rps_slope_min: float = 0.5  # RPS 斜率最小值（%/day），用于判断 RPS 是否还在上升
     require_bench_latest_alignment: bool = False
+    momentum_bias_200_max: float = 0.25  # 防止主升通道选出离 200 日线太远的鱼尾老妖股
     # Layer 2 潜伏通道（长强短弱）
     enable_ambush_channel: bool = True
     ambush_rps_fast_max: float = 45.0
@@ -163,7 +164,7 @@ class FunnelConfig:
     lps_lookback: int = 3
     lps_ma: int = 20
     lps_ma_tolerance: float = 0.02
-    lps_vol_dry_ratio: float = 0.5  # 改为 0.5：近期均量 / 参考均量 < 0.5（缩到 50% 以下）
+    lps_vol_dry_ratio: float = 0.4  # 收紧至 40%：极度缩量的最后回踩测试
     lps_vol_ref_window: int = 60
 
     # Layer 4 - Effort vs Result
@@ -183,7 +184,7 @@ class FunnelConfig:
     sos_vol_window: int = 20  # 计算点火爆量时的参考窗口
     sos_breakout_window: int = 20  # 要求突破或接近近 N 日的高点
     sos_breakout_tolerance: float = 0.01  # 改为 0.01：突破容差 1%（从 2% 改为 1%）
-    sos_max_bias_200: float = 40.0  # 防止在极高位将 Buying Climax 误判为 SOS
+    sos_max_bias_200: float = 20.0  # 收紧离 200 日线的距离（防止在高空放量诱多）
     # SOS 动态极值爆量
     sos_vol_quantile_window: int = 60        # 计算量能分位数的滚动窗口
     sos_vol_quantile: float = 0.95           # 要求当日量能突破历史 N 日的 95% 分位数
@@ -277,12 +278,12 @@ def resolve_ai_candidate_policy(
         if override_total_cap < 0
         else max(int(override_total_cap), 0)
     )
-    risk_on_trend = max(int(os.getenv("FUNNEL_AI_RISK_ON_TREND", "8")), 0)
-    risk_on_accum = max(int(os.getenv("FUNNEL_AI_RISK_ON_ACCUM", "4")), 0)
-    risk_off_trend = max(int(os.getenv("FUNNEL_AI_RISK_OFF_TREND", "3")), 0)
-    risk_off_accum = max(int(os.getenv("FUNNEL_AI_RISK_OFF_ACCUM", "6")), 0)
-    neutral_trend = max(int(os.getenv("FUNNEL_AI_NEUTRAL_TREND", "7")), 0)
-    neutral_accum = max(int(os.getenv("FUNNEL_AI_NEUTRAL_ACCUM", "5")), 0)
+    risk_on_trend = max(int(os.getenv("FUNNEL_AI_RISK_ON_TREND", "4")), 0)
+    risk_on_accum = max(int(os.getenv("FUNNEL_AI_RISK_ON_ACCUM", "8")), 0)
+    risk_off_trend = max(int(os.getenv("FUNNEL_AI_RISK_OFF_TREND", "1")), 0)
+    risk_off_accum = max(int(os.getenv("FUNNEL_AI_RISK_OFF_ACCUM", "5")), 0)
+    neutral_trend = max(int(os.getenv("FUNNEL_AI_NEUTRAL_TREND", "3")), 0)
+    neutral_accum = max(int(os.getenv("FUNNEL_AI_NEUTRAL_ACCUM", "7")), 0)
     max_trend_l3_fill = max(int(os.getenv("FUNNEL_AI_MAX_TREND_L3_FILL", "0")), 0)
     max_accum_l3_fill = max(int(os.getenv("FUNNEL_AI_MAX_ACCUM_L3_FILL", "0")), 0)
 
@@ -562,7 +563,12 @@ def layer2_strength_detailed(
                 and rps_slow >= cfg.ambush_rps_slow_min
             )
 
-        momentum_ok = (bullish_alignment or holding_ma20) and momentum_rs_ok and momentum_rps_ok
+        momentum_bias_ok = True
+        if pd.notna(last_ma_long) and float(last_ma_long) > 0 and pd.notna(last_close):
+            bias_200 = (float(last_close) - float(last_ma_long)) / float(last_ma_long)
+            momentum_bias_ok = bias_200 <= getattr(cfg, "momentum_bias_200_max", 0.25)
+
+        momentum_ok = (bullish_alignment or holding_ma20) and momentum_rs_ok and momentum_rps_ok and momentum_bias_ok
 
         ambush_shape_ok = False
         if (

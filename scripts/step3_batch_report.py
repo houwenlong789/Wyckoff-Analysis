@@ -489,6 +489,43 @@ def _extract_ops_codes_from_markdown(
     return ops_codes
 
 
+def extract_operation_pool_codes(
+    report: str,
+    allowed_codes: list[str] | set[str] | tuple[str, ...],
+) -> list[str]:
+    """
+    对外暴露：从 Step3 报告中提取“可操作池/处于起跳板”代码。
+    优先解析 Markdown 章节，若无则回退结构化 JSON 兼容解析。
+    """
+    ordered_allowed = [str(c).strip() for c in allowed_codes if re.fullmatch(r"\d{6}", str(c).strip())]
+    allowed_set = set(ordered_allowed)
+    if not allowed_set:
+        return []
+
+    ops_codes = _extract_ops_codes_from_markdown(report, allowed_set)
+    if not ops_codes:
+        code_name = {c: c for c in allowed_set}
+        structured = _try_parse_structured_report(
+            report=report,
+            allowed_codes=allowed_set,
+            code_name=code_name,
+        )
+        if structured and structured.get("operation_pool"):
+            for item in structured["operation_pool"]:
+                code = str(item.get("code", "")).strip()
+                if code in allowed_set and code not in ops_codes:
+                    ops_codes.append(code)
+
+    # 防御性去重，保持报告中的出现顺序
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for code in ops_codes:
+        if code in allowed_set and code not in seen:
+            seen.add(code)
+            deduped.append(code)
+    return deduped
+
+
 
 
 
