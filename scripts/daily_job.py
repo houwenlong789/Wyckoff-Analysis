@@ -382,6 +382,14 @@ def main() -> int:
     except Exception as e:
         _log(f"实时价格同步失败: {e}", logs_path)
 
+    _log("开始推荐表纠错流程（按推荐日历史收盘回填加入价并重算涨跌幅）...", logs_path)
+    try:
+        from integrations.supabase_recommendation import correct_tracking_initial_prices
+        corrected_n = correct_tracking_initial_prices()
+        _log(f"推荐表纠错完成，共修正 {corrected_n} 条记录", logs_path)
+    except Exception as e:
+        _log(f"推荐表纠错失败: {e}", logs_path)
+
     # 汇总
     total_elapsed = sum(s.get("elapsed_s", 0) for s in summary)
     _log("", logs_path)
