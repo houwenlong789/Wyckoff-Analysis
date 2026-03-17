@@ -21,6 +21,26 @@ from core.single_stock_logic import render_single_stock_page
 from integrations.llm_client import SUPPORTED_PROVIDERS, GEMINI_MODELS
 from utils import extract_symbols_from_text
 
+# 供应商展示名与 session_state 中的 key 后缀对应
+PROVIDER_LABELS = {
+    "gemini": "Gemini",
+    "openai": "OpenAI",
+    "zhipu": "智谱",
+    "minimax": "Minimax",
+    "deepseek": "DeepSeek",
+    "qwen": "Qwen",
+}
+
+
+def _get_provider_api_key_and_model(provider: str) -> tuple[str, str]:
+    """根据当前选中的 provider 从 session_state 取 api_key 与 model。"""
+    key_suffix = provider.lower()
+    api_key = (st.session_state.get(f"{key_suffix}_api_key") or "").strip()
+    model = (st.session_state.get(f"{key_suffix}_model") or "").strip()
+    if not model and provider == "gemini":
+        model = st.session_state.get("gemini_model") or "gemini-3.1-flash-lite-preview"
+    return (api_key, model or "")
+
 setup_page(page_title="AI 分析", page_icon="🤖")
 
 STATE_KEY = "batch_ai_background_job"
@@ -101,27 +121,23 @@ with content_col:
         provider = st.selectbox(
             "API 供应商",
             options=list(SUPPORTED_PROVIDERS),
-            format_func=lambda x: "Gemini" if x == "gemini" else x,
+            format_func=lambda x: PROVIDER_LABELS.get(x, x),
             key="ai_provider_single",
         )
-        default_model = (
-            st.session_state.get("ai_model")
-            or st.session_state.get("gemini_model")
-            or "gemini-3.1-flash-lite-preview"
-        )
+        api_key, default_model = _get_provider_api_key_and_model(provider)
         model = st.text_input(
             "模型",
-            value=str(default_model),
+            value=default_model or (GEMINI_MODELS[0] if provider == "gemini" else ""),
             key="ai_model_single",
             help="单股模式继续走本地轻量分析，不经过后台任务。",
         ).strip()
-        api_key = (st.session_state.get("gemini_api_key") or "").strip()
         if not api_key:
-            st.warning("单股模式需要本地 API Key，请先在设置页录入。")
+            st.warning(f"单股模式需要 {PROVIDER_LABELS.get(provider, provider)} API Key，请先在设置页录入。")
             st.page_link("pages/Settings.py", label="前往设置", icon="⚙️")
             st.stop()
-        st.caption("常用模型示例：" + "、".join(GEMINI_MODELS[:6]))
-        render_single_stock_page(provider, model or str(default_model), api_key)
+        if provider == "gemini":
+            st.caption("常用模型示例：" + "、".join(GEMINI_MODELS[:6]))
+        render_single_stock_page(provider, model or default_model or (GEMINI_MODELS[0] if provider == "gemini" else ""), api_key)
         st.stop()
 
     ready, ready_msg = background_jobs_ready_for_current_user()

@@ -228,38 +228,51 @@ def mark_ai_recommendations(recommend_date: int, ai_codes: list[str]) -> bool:
         print(f"[supabase_recommendation] mark_ai_recommendations failed: {e}")
         return False
 
-def sync_all_tracking_prices() -> int:
+def sync_all_tracking_prices(
+    price_map: dict[str, float] | None = None,
+) -> int:
     """
-    遍历表中所有股票，获取最新实时价格并刷新
-    返回成功更新的数量
+    遍历表中所有股票，用最新价刷新 current_price 与 change_pct。
+    price_map: 可选，code_str -> 最新收盘价。非空时直接使用；未传或为空时拉取全市场快照后更新。
+    返回成功更新的数量。
     """
     if not is_supabase_configured():
+        print("[supabase_recommendation] sync_all_tracking_prices: Supabase 未配置，跳过")
         return 0
-    
+
     try:
-        from integrations.data_source import fetch_stock_spot_snapshot
         client = _get_supabase_admin_client()
-        
-        # 1. 获取所有需要跟踪的股票代码（去重以节省 API 调用）
+
+        # 获取需要跟踪的股票代码（去重）
         resp = client.table(TABLE_RECOMMENDATION_TRACKING).select("code").execute()
         if not resp.data:
+            print("[supabase_recommendation] sync_all_tracking_prices: 推荐表无记录，跳过")
             return 0
-        
+
         unique_codes = sorted(list(set(int(r["code"]) for r in resp.data)))
-        
-        # 2. 批量获取实时价格并构建更新数据
-        # 实际上目前 fetch_stock_spot_snapshot 是一只只取的，后期可优化为批量接口
+
+        # 优先使用 price_map，否则拉取行情
+        use_provided_map = bool(price_map)
+        if not use_provided_map:
+            from integrations.data_source import fetch_stock_spot_snapshot
+            first_code = f"{unique_codes[0]:06d}"
+            fetch_stock_spot_snapshot(first_code, force_refresh=True)
+
         updated_count = 0
         for code_int in unique_codes:
-            code_str = f"{code_int:06d}" # 补齐 6 位以适配行情接口
-            snap = fetch_stock_spot_snapshot(code_str, force_refresh=True)
-            if not snap or snap.get("close") is None:
-                continue
+            code_str = f"{code_int:06d}"
+            if use_provided_map:
+                new_current_price = price_map.get(code_str)
+                if new_current_price is None or new_current_price <= 0:
+                    continue
+                new_current_price = float(new_current_price)
+            else:
+                snap = fetch_stock_spot_snapshot(code_str, force_refresh=False)
+                if not snap or snap.get("close") is None:
+                    continue
+                new_current_price = float(snap["close"])
             
-            new_current_price = float(snap["close"])
-            
-            # 3. 针对该股票的所有推荐记录进行价格和涨跌幅更新
-            # 注意：同一个股票可能在不同日期被推荐过，需要分别计算
+            # 该股票可能有多条推荐记录（不同日期），逐条更新价格与涨跌幅
             rec_resp = client.table(TABLE_RECOMMENDATION_TRACKING).select("*").eq("code", code_int).execute()
             for record in rec_resp.data:
                 initial_price = float(record.get("initial_price") or 0.0)
@@ -291,7 +304,12 @@ def sync_all_tracking_prices() -> int:
                 
                 client.table(TABLE_RECOMMENDATION_TRACKING).update(update_payload).eq("id", record["id"]).execute()
                 updated_count += 1
-                
+
+        if unique_codes and updated_count == 0:
+            print(
+                "[supabase_recommendation] sync_all_tracking_prices: 推荐表有 {} 只股票但 0 条更新，"
+                "可能全市场行情拉取失败或非交易时段".format(len(unique_codes))
+            )
         return updated_count
     except Exception as e:
         print(f"[supabase_recommendation] sync_all_tracking_prices failed: {e}")

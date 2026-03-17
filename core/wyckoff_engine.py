@@ -218,7 +218,7 @@ class FunnelResult(NamedTuple):
     layer3_symbols: list[str]
     top_sectors: list[str]
     triggers: dict[str, list[tuple[str, float]]]
-    # 新增：威科夫阶段细节
+    # 威科夫阶段细节
     stage_map: dict[str, str]  # code -> stage_name（如 "Accumulation A"、"Markup"、"Distribution"）
     markup_symbols: list[str]  # 已进入 Markup 的股票
     exit_signals: dict[str, dict]  # code -> {"signal": "stop_loss|distribution_warning", "price": xxx, "reason": xxx}
@@ -1623,7 +1623,7 @@ def run_funnel(
     )
     triggers = layer4_triggers(l3, prepared_df_map, cfg, channel_map=channel_map)
 
-    # 新增：阶段识别和退出信号
+    # 阶段识别和退出信号
     markup_symbols = detect_markup_stage(l3, prepared_df_map, cfg)
     accum_stage_map = detect_accum_stage(l2, prepared_df_map, cfg)  # 对 L2 做细化分析
 

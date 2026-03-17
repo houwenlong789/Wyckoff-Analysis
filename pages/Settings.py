@@ -39,10 +39,25 @@ with content_col:
             return
 
         settings = {
+            # 通知
             "feishu_webhook": st.session_state.feishu_webhook,
+            "wecom_webhook": st.session_state.wecom_webhook,
+            "dingtalk_webhook": st.session_state.dingtalk_webhook,
+            # 大模型
             "gemini_api_key": st.session_state.gemini_api_key,
-            "tushare_token": st.session_state.tushare_token,
             "gemini_model": st.session_state.gemini_model,
+            "openai_api_key": st.session_state.openai_api_key,
+            "openai_model": st.session_state.openai_model,
+            "zhipu_api_key": st.session_state.zhipu_api_key,
+            "zhipu_model": st.session_state.zhipu_model,
+            "minimax_api_key": st.session_state.minimax_api_key,
+            "minimax_model": st.session_state.minimax_model,
+            "deepseek_api_key": st.session_state.deepseek_api_key,
+            "deepseek_model": st.session_state.deepseek_model,
+            "qwen_api_key": st.session_state.qwen_api_key,
+            "qwen_model": st.session_state.qwen_model,
+            # 其它
+            "tushare_token": st.session_state.tushare_token,
             "tg_bot_token": st.session_state.tg_bot_token,
             "tg_chat_id": st.session_state.tg_chat_id,
         }
@@ -60,11 +75,11 @@ with content_col:
     col1, col2 = st.columns([2, 1])
 
     with col1:
-        # 1. 飞书 Webhook
+        # 1. 通知配置：飞书 / 企微 / 钉钉
         st.subheader("🔔 通知配置")
         with st.container(border=True):
             st.markdown(
-                "配置 **飞书 Webhook** 后，批量下载任务完成后将自动发送通知到您的飞书群。"
+                "配置群机器人的 **Webhook**，定时任务与批量操作完成后可自动推送到对应群。"
             )
 
             new_feishu_webhook = st.text_input(
@@ -72,39 +87,136 @@ with content_col:
                 value=st.session_state.feishu_webhook,
                 type="password",
                 placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/...",
-                help="如需获取 Webhook URL，请查看 [飞书官方教程](https://open.feishu.cn/community/articles/7271149634339422210)。",
+                help="飞书自定义机器人 Webhook，详见飞书官方文档。",
             )
 
-            if st.button("💾 保存 Webhook 配置", key="save_webhook"):
-                if new_feishu_webhook != st.session_state.feishu_webhook:
-                    st.session_state.feishu_webhook = new_feishu_webhook
+            new_wecom_webhook = st.text_input(
+                "企业微信 Webhook URL",
+                value=st.session_state.wecom_webhook,
+                type="password",
+                placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...",
+                help="企业微信群机器人 Webhook，可选。",
+            )
+
+            new_dingtalk_webhook = st.text_input(
+                "钉钉 Webhook URL",
+                value=st.session_state.dingtalk_webhook,
+                type="password",
+                placeholder="https://oapi.dingtalk.com/robot/send?access_token=...",
+                help="钉钉群机器人 Webhook，可选。",
+            )
+
+            if st.button("💾 保存通知配置", key="save_webhook"):
+                st.session_state.feishu_webhook = new_feishu_webhook
+                st.session_state.wecom_webhook = new_wecom_webhook
+                st.session_state.dingtalk_webhook = new_dingtalk_webhook
                 on_save_settings()
 
         st.divider()
 
-        # 2. Gemini API
+        # 2. 大模型配置：Gemini / OpenAI / 智谱 / Minimax / DeepSeek / Qwen
         st.subheader("🧠 AI 配置")
         with st.container(border=True):
-            st.markdown("配置 **Gemini API Key** 以启用智能诊股、研报摘要等高级功能。")
+            st.markdown("配置各家大模型的 API Key 与默认模型，后续在任务/研报中按需切换使用。")
 
+            st.markdown("**Gemini (Google)**")
             new_gemini_key = st.text_input(
                 "Gemini API Key",
                 value=st.session_state.gemini_api_key,
                 type="password",
                 placeholder="AIzaSy...",
-                help="获取 Key: [Google AI Studio](https://aistudio.google.com/api-keys)",
+                help="获取 Key: Google AI Studio。",
             )
-
             new_gemini_model = st.text_input(
-                "Gemini 模型",
+                "Gemini 默认模型",
                 value=st.session_state.gemini_model,
                 placeholder="gemini-3.1-flash-lite-preview",
-                help="如 gemini-3.1-flash-lite-preview、gemini-2.5-flash 等",
+                help="例如：gemini-3.1-flash-lite-preview、gemini-2.5-flash 等。",
+            )
+
+            st.markdown("---")
+            st.markdown("**OpenAI / 兼容 OpenAI 协议的厂商**")
+            new_openai_key = st.text_input(
+                "OpenAI API Key",
+                value=st.session_state.openai_api_key,
+                type="password",
+                placeholder="sk-...",
+            )
+            new_openai_model = st.text_input(
+                "OpenAI 默认模型",
+                value=st.session_state.openai_model,
+                placeholder="gpt-4.1-mini",
+            )
+
+            st.markdown("---")
+            st.markdown("**智谱 AI (GLM)**")
+            new_zhipu_key = st.text_input(
+                "智谱 API Key",
+                value=st.session_state.zhipu_api_key,
+                type="password",
+                placeholder="xxxxx",
+            )
+            new_zhipu_model = st.text_input(
+                "智谱默认模型",
+                value=st.session_state.zhipu_model,
+                placeholder="glm-4-air",
+            )
+
+            st.markdown("---")
+            st.markdown("**Minimax**")
+            new_minimax_key = st.text_input(
+                "Minimax API Key",
+                value=st.session_state.minimax_api_key,
+                type="password",
+                placeholder="xxxxx",
+            )
+            new_minimax_model = st.text_input(
+                "Minimax 默认模型",
+                value=st.session_state.minimax_model,
+                placeholder="abab6.5-chat",
+            )
+
+            st.markdown("---")
+            st.markdown("**DeepSeek**")
+            new_deepseek_key = st.text_input(
+                "DeepSeek API Key",
+                value=st.session_state.deepseek_api_key,
+                type="password",
+                placeholder="sk-...",
+            )
+            new_deepseek_model = st.text_input(
+                "DeepSeek 默认模型",
+                value=st.session_state.deepseek_model,
+                placeholder="deepseek-chat",
+            )
+
+            st.markdown("---")
+            st.markdown("**Qwen (通义千问)**")
+            new_qwen_key = st.text_input(
+                "Qwen API Key",
+                value=st.session_state.qwen_api_key,
+                type="password",
+                placeholder="sk-...",
+            )
+            new_qwen_model = st.text_input(
+                "Qwen 默认模型",
+                value=st.session_state.qwen_model,
+                placeholder="qwen-max",
             )
 
             if st.button("💾 保存 AI 配置", key="save_ai"):
                 st.session_state.gemini_api_key = new_gemini_key
                 st.session_state.gemini_model = new_gemini_model
+                st.session_state.openai_api_key = new_openai_key
+                st.session_state.openai_model = new_openai_model
+                st.session_state.zhipu_api_key = new_zhipu_key
+                st.session_state.zhipu_model = new_zhipu_model
+                st.session_state.minimax_api_key = new_minimax_key
+                st.session_state.minimax_model = new_minimax_model
+                st.session_state.deepseek_api_key = new_deepseek_key
+                st.session_state.deepseek_model = new_deepseek_model
+                st.session_state.qwen_api_key = new_qwen_key
+                st.session_state.qwen_model = new_qwen_model
                 on_save_settings()
 
         st.divider()

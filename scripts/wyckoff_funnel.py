@@ -1248,7 +1248,7 @@ def run_funnel_job(
     # L4 需要 l2_df_map，这里直接用 all_df_map 即可，因为 key 都在里面
     triggers = layer4_triggers(l3_passed, all_df_map, cfg)
 
-    # 新增：Markup 阶段、Accumulation ABC 细化、Exit 信号
+    # Markup 阶段、Accumulation ABC 细化、Exit 信号
     markup_symbols = detect_markup_stage(l3_passed, all_df_map, cfg)
     accum_stage_map = detect_accum_stage(l2_passed, all_df_map, cfg)
     exit_signals = layer5_exit_signals(l2_passed + markup_symbols, all_df_map, accum_stage_map, cfg)
@@ -1305,7 +1305,7 @@ def run_funnel_job(
         "by_trigger": {k: len(v) for k, v in triggers.items()},
         "benchmark_context": benchmark_context,
         "latest_close_map": latest_close_map,
-        # 新增：阶段识别和退出信号
+        # 阶段识别和退出信号
         "markup_symbols": markup_symbols,
         "accum_stage_map": accum_stage_map,
         "exit_signals": exit_signals,
@@ -1350,6 +1350,8 @@ def run(
     name_map = _stock_name_map()
     sector_map = fetch_sector_map()
     latest_close_map = metrics.get("latest_close_map", {}) or {}
+    if latest_close_map:
+        benchmark_context["latest_close_map"] = latest_close_map
 
     code_to_reasons: dict[str, list[str]] = {}
     code_to_best_score: dict[str, float] = {}

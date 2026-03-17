@@ -27,6 +27,7 @@ from integrations.data_source import (
     fetch_stock_spot_snapshot,
 )
 from utils.feishu import send_feishu_notification
+from utils.notify import send_wecom_notification, send_dingtalk_notification
 from utils.trading_clock import CN_TZ, resolve_end_calendar_day
 from core.wyckoff_engine import fit_ai_candidate_quotas, normalize_hist_from_fetch
 from core.sector_rotation import SECTOR_STATE_LABELS
@@ -152,6 +153,9 @@ def _send_input_preview(
     model: str,
     system_prompt: str,
     previews: list[dict],
+    *,
+    wecom_webhook: str = "",
+    dingtalk_webhook: str = "",
 ) -> tuple[bool, str]:
     """
     预演模式：不调用模型，仅展示将发送给模型的输入内容。
@@ -189,7 +193,11 @@ def _send_input_preview(
         "\n".join(blocks).rstrip() + "\n"
     )
     title = f"🧪 模型输入预演 {date.today().strftime('%Y-%m-%d')}"
-    sent = send_feishu_notification(webhook_url, title, report)
+    sent = send_feishu_notification(webhook_url, title, report) if webhook_url else True
+    if wecom_webhook:
+        send_wecom_notification(wecom_webhook, title, report)
+    if dingtalk_webhook:
+        send_dingtalk_notification(dingtalk_webhook, title, report)
     if not sent:
         print("[step3] 预演报告飞书推送失败")
         return (False, report)
@@ -219,6 +227,8 @@ def _repair_report_structure(
     model: str,
     api_key: str,
     selected_codes: list[str],
+    *,
+    provider: str = "gemini",
 ) -> str:
     """
     当模型未给出可识别的分层结构时，做一次结构修复重写。
@@ -249,7 +259,7 @@ def _repair_report_structure(
     )
     try:
         fixed = call_llm(
-            provider="gemini",
+            provider=provider,
             model=model,
             api_key=api_key,
             system_prompt=repair_system,
@@ -1001,6 +1011,7 @@ def _call_track_report(
     api_key: str,
     selected_codes: list[str],
     selected_df: pd.DataFrame,
+    provider: str = "gemini",
 ) -> tuple[bool, str, str]:
     report = ""
     used_model = ""
@@ -1011,7 +1022,7 @@ def _call_track_report(
     for m in models_to_try:
         try:
             report = call_llm(
-                provider="gemini",
+                provider=provider,
                 model=m,
                 api_key=api_key,
                 system_prompt=system_prompt,
@@ -1033,6 +1044,7 @@ def _call_track_report(
             model=used_model or model,
             api_key=api_key,
             selected_codes=selected_codes,
+            provider=provider,
         )
     if not _has_required_sections(report):
         print(f"[step3] {track} 轨结构修复后仍缺少关键章节，追加系统兜底分层")
@@ -1206,9 +1218,12 @@ def run(
     benchmark_context: dict | None = None,
     *,
     notify: bool = True,
+    provider: str = "gemini",
+    wecom_webhook: str = "",
+    dingtalk_webhook: str = "",
 ) -> tuple[bool, str, str]:
     """
-    拉取 OHLCV → 第五步特征工程 → AI 研报 → 飞书发送。
+    拉取 OHLCV → 第五步特征工程 → AI 研报 → 飞书/企微/钉钉发送。
     symbols_info: list[{"code", "name", "tag"}] 或 list[str]（向后兼容）。
     """
     if not symbols_info:
@@ -1497,7 +1512,11 @@ def run(
             model_banner = f"🤖 模型: {model}"
             content = f"{model_banner}\n\n{report}"
             title = f"📄 批量研报 {date.today().strftime('%Y-%m-%d')}"
-            sent = send_feishu_notification(webhook_url, title, content)
+            sent = send_feishu_notification(webhook_url, title, content) if webhook_url else True
+            if wecom_webhook:
+                send_wecom_notification(wecom_webhook, title, content)
+            if dingtalk_webhook:
+                send_dingtalk_notification(dingtalk_webhook, title, content)
             if not sent:
                 return (False, "feishu_failed", report)
         return (True, "ok", report)
@@ -1613,6 +1632,8 @@ def run(
                     model=model,
                     system_prompt=WYCKOFF_FUNNEL_SYSTEM_PROMPT,
                     previews=preview_requests,
+                    wecom_webhook=wecom_webhook,
+                    dingtalk_webhook=dingtalk_webhook,
                 )
                 if not ok:
                     return (False, "feishu_failed", preview_report)
@@ -1636,6 +1657,7 @@ def run(
             api_key=api_key,
             selected_codes=selected_codes,
             selected_df=selected_df,
+            provider=provider,
         )
         if not ok:
             return (False, "llm_failed", "")
@@ -1681,7 +1703,11 @@ def run(
 
         title = f"📄 批量研报 {date.today().strftime('%Y-%m-%d')}"
         if notify:
-            sent = send_feishu_notification(webhook_url, title, content)
+            sent = send_feishu_notification(webhook_url, title, content) if webhook_url else True
+            if wecom_webhook:
+                send_wecom_notification(wecom_webhook, title, content)
+            if dingtalk_webhook:
+                send_dingtalk_notification(dingtalk_webhook, title, content)
             if not sent:
                 print("[step3] 飞书推送失败")
                 return (False, "feishu_failed", report)
@@ -1768,6 +1794,7 @@ def run(
             api_key=api_key,
             selected_codes=selected_codes_by_track.get(track, []),
             selected_df=df_by_track.get(track, selected_df.iloc[0:0].copy()),
+            provider=provider,
         )
         if not ok:
             return (False, "llm_failed", "")
@@ -1827,7 +1854,11 @@ def run(
 
     title = f"📄 批量研报 {date.today().strftime('%Y-%m-%d')}"
     if notify:
-        sent = send_feishu_notification(webhook_url, title, content)
+        sent = send_feishu_notification(webhook_url, title, content) if webhook_url else True
+        if wecom_webhook:
+            send_wecom_notification(wecom_webhook, title, content)
+        if dingtalk_webhook:
+            send_dingtalk_notification(dingtalk_webhook, title, content)
         if not sent:
             print("[step3] 飞书推送失败")
             return (False, "feishu_failed", report)

@@ -34,6 +34,12 @@ def init_session_state() -> None:
     _set_default("feishu_webhook", "")
     if st.session_state.feishu_webhook is None:
         st.session_state.feishu_webhook = ""
+    _set_default("wecom_webhook", "")
+    if st.session_state.get("wecom_webhook") is None:
+        st.session_state.wecom_webhook = ""
+    _set_default("dingtalk_webhook", "")
+    if st.session_state.get("dingtalk_webhook") is None:
+        st.session_state.dingtalk_webhook = ""
 
     _set_default("gemini_api_key", "")
     if st.session_state.gemini_api_key is None:
@@ -46,6 +52,13 @@ def init_session_state() -> None:
     _set_default("gemini_model", "gemini-3.1-flash-lite-preview")
     if st.session_state.gemini_model is None:
         st.session_state.gemini_model = "gemini-3.1-flash-lite-preview"
+    for key in ("openai_api_key", "openai_model", "zhipu_api_key", "zhipu_model",
+                "minimax_api_key", "minimax_model", "deepseek_api_key", "deepseek_model",
+                "qwen_api_key", "qwen_model"):
+        _set_default(key, "" if "model" not in key else "")
+    for k in ("openai_model", "zhipu_model", "minimax_model", "deepseek_model", "qwen_model"):
+        if st.session_state.get(k) is None:
+            st.session_state[k] = ""
 
     _set_default("tg_bot_token", "")
     if st.session_state.tg_bot_token is None:

@@ -247,7 +247,6 @@ def render_single_stock_page(provider, model, api_key):
 
 def _run_analysis(symbol, image_file, provider, model, api_key):
     """执行分析流程"""
-    # 1. 准备数据
     end_calendar = date.today() - timedelta(days=1)
     try:
         window = _resolve_trading_window(end_calendar, TRADING_DAYS_OHLCV)
@@ -269,7 +268,7 @@ def _run_analysis(symbol, image_file, provider, model, api_key):
         except Exception:
             name = symbol
 
-        # 新增：计算该股票的威科夫阶段信息
+        # 计算该股票的威科夫阶段信息
         from core.wyckoff_engine import (
             FunnelConfig,
             detect_markup_stage,
@@ -335,7 +334,6 @@ def _run_analysis(symbol, image_file, provider, model, api_key):
             images.append(img)
             user_msg += "\n\n【用户已上传今日盘面截图，请结合分析】"
 
-        # 2. 调用 LLM
         response_text = call_llm(
             provider=provider,
             model=model,
@@ -343,31 +341,27 @@ def _run_analysis(symbol, image_file, provider, model, api_key):
             system_prompt=final_system_prompt,
             user_message=user_msg,
             images=images,
-            timeout=180, # 增加超时时间，因为任务复杂
+            timeout=180,
         )
-
-        # 3. 展示分析结果
         loading.empty()
 
-        # 分离代码和文本
         code_block = extract_python_code(response_text)
-
-        # 展示文本部分（去除代码块后，或者直接展示全部）
-        # 为了美观，我们可以尝试把代码块折叠，或者只展示非代码部分
-        # 这里简单起见，直接展示 Markdown
         st.markdown("### 📝 威科夫大师研报")
         st.markdown(response_text)
 
-        # --- 新增飞书推送 ---
-        if st.session_state.feishu_webhook:
-            try:
-                from utils.feishu import send_feishu_notification
-                send_feishu_notification(st.session_state.feishu_webhook, f"AI 深度研报 (单股 - {symbol})", response_text)
-            except Exception as e:
-                traceback.print_exc()
-                st.toast(f"飞书推送失败: {e}", icon="⚠️")
+        try:
+            from utils.notify import send_all_webhooks
+            send_all_webhooks(
+                st.session_state.get("feishu_webhook") or "",
+                st.session_state.get("wecom_webhook") or "",
+                st.session_state.get("dingtalk_webhook") or "",
+                f"AI 深度研报 (单股 - {symbol})",
+                response_text,
+            )
+        except Exception as e:
+            traceback.print_exc()
+            st.toast(f"通知推送失败: {e}", icon="⚠️")
 
-        # 4. 执行绘图代码
         if code_block:
             st.markdown("### 📊 结构标注图")
             if not ALLOW_LLM_PLOT_EXEC:

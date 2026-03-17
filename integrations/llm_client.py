@@ -8,8 +8,16 @@ from __future__ import annotations
 import time
 from typing import Optional
 
-# 首期仅实现 Gemini；后续可增加 openai
-SUPPORTED_PROVIDERS = ("gemini",)
+# 多厂商：Gemini + OpenAI 兼容（OpenAI/智谱/Minimax/DeepSeek/Qwen）
+SUPPORTED_PROVIDERS = ("gemini", "openai", "zhipu", "minimax", "deepseek", "qwen")
+# OpenAI 兼容接口的默认 base_url（可被调用方 base_url 覆盖）
+OPENAI_COMPATIBLE_BASE_URLS = {
+    "openai": "https://api.openai.com/v1",
+    "zhipu": "https://open.bigmodel.cn/api/paas/v4",
+    "minimax": "https://api.minimax.chat/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+}
 GEMINI_MODELS = (
     "gemini-3.1-flash-lite-preview",
     "gemini-2.5-flash-lite",
@@ -77,8 +85,61 @@ def call_llm(
             timeout=timeout,
             max_output_tokens=max_output_tokens,
         )
-    # 后续可加: elif provider == "openai": return _call_openai(...)
+    if provider in OPENAI_COMPATIBLE_BASE_URLS:
+        base = (base_url or OPENAI_COMPATIBLE_BASE_URLS.get(provider, "") or "").rstrip("/")
+        if not base:
+            raise ValueError(f"未配置 {provider} 的 base_url")
+        return _call_openai_compatible(
+            base_url=base,
+            api_key=api_key.strip(),
+            model=model,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            timeout=timeout,
+            max_output_tokens=max_output_tokens,
+        )
     raise ValueError(f"未实现的供应商: {provider}")
+
+
+def _call_openai_compatible(
+    base_url: str,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_message: str,
+    timeout: int,
+    max_output_tokens: Optional[int],
+) -> str:
+    """通过 OpenAI 兼容的 /chat/completions 接口调用（OpenAI/智谱/DeepSeek/Qwen 等）。"""
+    import requests
+
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    max_tokens = int(max_output_tokens) if max_output_tokens is not None else 8192
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "max_tokens": max(256, max_tokens),
+        "temperature": 0.4,
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenAI 兼容接口 HTTP {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("OpenAI 兼容接口返回无 choices")
+    msg = choices[0].get("message") or {}
+    text = (msg.get("content") or "").strip()
+    if not text:
+        raise RuntimeError("OpenAI 兼容接口返回内容为空")
+    return text
 
 
 def _call_gemini(

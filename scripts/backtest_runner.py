@@ -87,7 +87,7 @@ def _build_universe(board: str, sample_size: int) -> tuple[list[str], dict[str, 
         for x in items
         if str(x.get("code", "")).strip()
     }
-    # 先过滤 ST，再采样（可复现）
+    # 过滤 ST 后采样（可复现）
     symbols = [
         s
         for s in _normalize_symbols(list(name_map.keys()))

@@ -3,7 +3,9 @@
 定时任务主入口：Wyckoff Funnel → 批量研报
 
 配置来源：仅读取环境变量（GitHub Secrets），与 Streamlit 用户配置（Supabase）完全独立。
-环境变量：FEISHU_WEBHOOK_URL, GEMINI_API_KEY, GEMINI_MODEL,
+环境变量：FEISHU_WEBHOOK_URL, WECOM_WEBHOOK_URL(可选), DINGTALK_WEBHOOK_URL(可选),
+DEFAULT_LLM_PROVIDER(可选，默认 gemini), GEMINI_API_KEY, GEMINI_MODEL,
+OPENAI_API_KEY, OPENAI_MODEL(可选), 以及其它厂商 *_API_KEY/*_MODEL,
 SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY(可选), SUPABASE_USER_ID,
 TG_BOT_TOKEN, TG_CHAT_ID, MY_PORTFOLIO_STATE(可选兜底)
 """
@@ -127,8 +129,12 @@ def main() -> int:
     args = parser.parse_args()
 
     webhook = os.getenv("FEISHU_WEBHOOK_URL", "").strip()
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview").strip() or "gemini-3.1-flash-lite-preview"
+    wecom_webhook = os.getenv("WECOM_WEBHOOK_URL", "").strip()
+    dingtalk_webhook = os.getenv("DINGTALK_WEBHOOK_URL", "").strip()
+    provider = os.getenv("DEFAULT_LLM_PROVIDER", "gemini").strip().lower() or "gemini"
+    api_key = (os.getenv(f"{provider.upper()}_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
+    model_env_key = f"{provider.upper()}_MODEL"
+    model = (os.getenv(model_env_key) or os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")).strip() or "gemini-3.1-flash-lite-preview"
     step3_skip_llm = os.getenv("STEP3_SKIP_LLM", "").strip().lower() in {"1", "true", "yes", "on"}
     skip_step4 = os.getenv("DAILY_JOB_SKIP_STEP4", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -141,10 +147,10 @@ def main() -> int:
     missing = []
     if not webhook:
         missing.append("FEISHU_WEBHOOK_URL")
-    # 仅当需要调用模型时强制要求 GEMINI_API_KEY
+    # 仅当需要调用模型时强制要求对应厂商 API Key
     require_api_key = (not step3_skip_llm) or (not skip_step4)
     if require_api_key and not api_key:
-        missing.append("GEMINI_API_KEY")
+        missing.append(f"{provider.upper()}_API_KEY 或 GEMINI_API_KEY")
     if missing:
         _log(f"配置缺失: {', '.join(missing)}", logs_path)
         return 1
@@ -194,8 +200,9 @@ def main() -> int:
         has_blocking_failure = True
     elif benchmark_context:
         _persist_benchmark_context(benchmark_context, logs_path)
-        
-    # 新增：存入推荐跟踪表
+    price_map_from_funnel = (benchmark_context or {}).get("latest_close_map") or {}
+
+    # 存入推荐跟踪表
     if step2_ok and symbols_info:
         try:
             recommend_trade_date_int = int(_latest_trade_date_str().replace("-", ""))
@@ -215,7 +222,11 @@ def main() -> int:
         t0 = datetime.now(TZ)
         try:
             step3_ok, step3_reason, step3_report_text = run_step3(
-                symbols_info, webhook, api_key, model, benchmark_context=benchmark_context
+                symbols_info, webhook, api_key, model,
+                benchmark_context=benchmark_context,
+                provider=provider,
+                wecom_webhook=wecom_webhook,
+                dingtalk_webhook=dingtalk_webhook,
             )
             step3_err = None if step3_ok else STEP3_REASON_MAP.get(step3_reason, step3_reason)
         except Exception as e:
@@ -266,11 +277,11 @@ def main() -> int:
         summary.append({"step": "批量研报", "ok": True, "err": None, "elapsed_s": 0, "output": "skipped (no symbols)"})
         _log("阶段 2 批量研报: 跳过（无筛选结果）", logs_path)
 
-    # 在完成推荐与 AI 标记后，刷新推荐表中的实时价格与涨跌幅
+    # 在完成推荐与 AI 标记后，刷新推荐表中的实时价格与涨跌幅（复用 Step2 日线最后一笔收盘，不再拉行情）
     if recommend_trade_date_int is not None:
         try:
             from integrations.supabase_recommendation import sync_all_tracking_prices
-            updated_rows = sync_all_tracking_prices()
+            updated_rows = sync_all_tracking_prices(price_map=price_map_from_funnel)
             _log(f"推荐记录价格同步: updated_rows={updated_rows}", logs_path)
         except Exception as e:
             _log(f"推荐记录价格同步失败: {e}", logs_path)
@@ -364,10 +375,9 @@ def main() -> int:
                 logs_path,
             )
 
-    # 新增：定时任务最后，同步所有跟踪股票的实时价格
     _log("开始同步所有推荐记录的实时价格...", logs_path)
     try:
-        updated_n = sync_all_tracking_prices()
+        updated_n = sync_all_tracking_prices(price_map=price_map_from_funnel)
         _log(f"实时价格同步完成，共更新 {updated_n} 条记录", logs_path)
     except Exception as e:
         _log(f"实时价格同步失败: {e}", logs_path)

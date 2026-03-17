@@ -80,7 +80,7 @@ STEP4_CHASE_GAP_PCT_MAX = max(float(os.getenv("STEP4_CHASE_GAP_PCT_MAX", "5.5"))
 STEP4_CHASE_ATR_MULT_MIN = max(float(os.getenv("STEP4_CHASE_ATR_MULT_MIN", "0.8")), 0.1)
 STEP4_CHASE_ATR_MULT_MAX = max(float(os.getenv("STEP4_CHASE_ATR_MULT_MAX", "2.4")), STEP4_CHASE_ATR_MULT_MIN)
 
-# --- 新增：OMS 防追高与滑点保护配置 ---
+# --- OMS 防追高与滑点保护配置 ---
 STEP4_MAX_GAP_UP_PCT = float(os.getenv("STEP4_MAX_GAP_UP_PCT", "3.0"))          # 最大允许跳空/追高幅度(%)
 STEP4_MAX_GAP_UP_ATR_MULT = float(os.getenv("STEP4_MAX_GAP_UP_ATR_MULT", "1.5")) # 最大允许追高 ATR 倍数
 STEP4_MAX_NEW_BUYS_RISK_ON = max(int(os.getenv("STEP4_MAX_NEW_BUYS_RISK_ON", "2")), 0)
@@ -777,7 +777,7 @@ class WyckoffOrderEngine:
                 )
 
         # =========================================================
-        # 🛡️ 新增：防跳空、防追高物理拦截 (Anti-Chase Protection)
+        # 防跳空、防追高物理拦截 (Anti-Chase Protection)
         # 优化后：记录参数到 ExecutionTicket 以供明天交易作为 limit_price 参考。不再拒绝订单。
         # =========================================================
         max_entry_price = None

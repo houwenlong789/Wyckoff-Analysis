@@ -25,7 +25,6 @@ from integrations.fetch_a_share_csv import (
     _stock_name_from_code,
 )
 from utils import extract_symbols_from_text, safe_filename_part, stock_sector_em
-from utils.feishu import send_feishu_notification
 from core.download_history import add_download_history
 from app.auth_component import logout
 from app.layout import is_data_source_failure_message, setup_page, show_user_error
@@ -529,8 +528,11 @@ with content_col:
                             data=None,
                         )
                         st.session_state["last_home_batch_key"] = current_batch_key
-                    # Send Feishu notification
-                    if st.session_state.feishu_webhook:
+                    # 通知：飞书 + 企微 + 钉钉（任一配置则发送）
+                    feishu = st.session_state.get("feishu_webhook") or ""
+                    wecom = st.session_state.get("wecom_webhook") or ""
+                    dingtalk = st.session_state.get("dingtalk_webhook") or ""
+                    if feishu or wecom or dingtalk:
                         success_count = len([r for r in results if r["status"] == "ok"])
                         failed_count = len(results) - success_count
                         notify_title = (
@@ -552,11 +554,9 @@ with content_col:
                                 ]
                             )
                             notify_text += f"\\n\\n**失败详情**:\\n{failed_details}"
-
-                        send_feishu_notification(
-                            st.session_state.feishu_webhook, notify_title, notify_text
-                        )
-                        st.toast("✅ 飞书通知已发送", icon="🔔")
+                        from utils.notify import send_all_webhooks
+                        send_all_webhooks(feishu, wecom, dingtalk, notify_title, notify_text)
+                        st.toast("✅ 通知已发送", icon="🔔")
 
                 finally:
                     loading.empty()

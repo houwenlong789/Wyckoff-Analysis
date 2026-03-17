@@ -10,11 +10,25 @@ def reset_user_settings_state() -> None:
     重置当前会话中的用户敏感配置，防止跨账号残留。
     """
     st.session_state.feishu_webhook = ""
+    st.session_state.wecom_webhook = ""
+    st.session_state.dingtalk_webhook = ""
     st.session_state.gemini_api_key = ""
     st.session_state.tushare_token = ""
     st.session_state.gemini_model = "gemini-3.1-flash-lite-preview"
     st.session_state.tg_bot_token = ""
     st.session_state.tg_chat_id = ""
+
+    # 多厂商大模型配置（按需使用）
+    st.session_state.openai_api_key = ""
+    st.session_state.openai_model = ""
+    st.session_state.zhipu_api_key = ""
+    st.session_state.zhipu_model = ""
+    st.session_state.minimax_api_key = ""
+    st.session_state.minimax_model = ""
+    st.session_state.deepseek_api_key = ""
+    st.session_state.deepseek_model = ""
+    st.session_state.qwen_api_key = ""
+    st.session_state.qwen_model = ""
 
 
 def _get_supabase_client_base() -> Client:
@@ -86,11 +100,29 @@ def load_user_settings(user_id: str):
 
         if response.data and len(response.data) > 0:
             settings = response.data[0]
-            # 仅当 session_state 为空时才覆盖，或者强制覆盖
+            # 通知类
             st.session_state.feishu_webhook = settings.get("feishu_webhook") or ""
+            st.session_state.wecom_webhook = settings.get("wecom_webhook") or ""
+            st.session_state.dingtalk_webhook = settings.get("dingtalk_webhook") or ""
+
+            # 大模型配置
             st.session_state.gemini_api_key = settings.get("gemini_api_key") or ""
+            st.session_state.gemini_model = (
+                settings.get("gemini_model") or "gemini-3.1-flash-lite-preview"
+            )
+            st.session_state.openai_api_key = settings.get("openai_api_key") or ""
+            st.session_state.openai_model = settings.get("openai_model") or ""
+            st.session_state.zhipu_api_key = settings.get("zhipu_api_key") or ""
+            st.session_state.zhipu_model = settings.get("zhipu_model") or ""
+            st.session_state.minimax_api_key = settings.get("minimax_api_key") or ""
+            st.session_state.minimax_model = settings.get("minimax_model") or ""
+            st.session_state.deepseek_api_key = settings.get("deepseek_api_key") or ""
+            st.session_state.deepseek_model = settings.get("deepseek_model") or ""
+            st.session_state.qwen_api_key = settings.get("qwen_api_key") or ""
+            st.session_state.qwen_model = settings.get("qwen_model") or ""
+
+            # 其它
             st.session_state.tushare_token = settings.get("tushare_token") or ""
-            st.session_state.gemini_model = settings.get("gemini_model") or "gemini-3.1-flash-lite-preview"
             st.session_state.tg_bot_token = settings.get("tg_bot_token") or ""
             st.session_state.tg_chat_id = settings.get("tg_chat_id") or ""
             return True
