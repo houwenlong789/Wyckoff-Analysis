@@ -212,6 +212,86 @@ def _run_plot_code_safely(code_block: str, df_hist: pd.DataFrame):
         raise ValueError("create_plot(df) 未返回有效图表对象")
     return fig
 
+
+def _build_safe_structure_plot(df_hist: pd.DataFrame, symbol: str, name: str):
+    """
+    在禁用 LLM 代码执行时，使用固定模板输出一张可读结构图。
+    仅依赖历史行情数据，不执行任何模型生成代码。
+    """
+    if df_hist is None or df_hist.empty:
+        raise ValueError("历史数据为空，无法生成结构图")
+
+    df_plot = df_hist.copy()
+    if "date" not in df_plot.columns:
+        raise ValueError("缺少 date 列")
+    if "close" not in df_plot.columns:
+        raise ValueError("缺少 close 列")
+
+    df_plot["date"] = pd.to_datetime(df_plot["date"], errors="coerce")
+    df_plot["close"] = pd.to_numeric(df_plot["close"], errors="coerce")
+    if "open" in df_plot.columns:
+        df_plot["open"] = pd.to_numeric(df_plot["open"], errors="coerce")
+    if "volume" in df_plot.columns:
+        df_plot["volume"] = pd.to_numeric(df_plot["volume"], errors="coerce")
+    else:
+        df_plot["volume"] = 0.0
+
+    df_plot = df_plot.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+    if df_plot.empty:
+        raise ValueError("历史数据为空，无法生成结构图")
+
+    # 仅展示最近 240 根，避免图形过于拥挤。
+    if len(df_plot) > 240:
+        df_plot = df_plot.tail(240).reset_index(drop=True)
+
+    df_plot["MA50"] = df_plot["close"].rolling(50).mean()
+    df_plot["MA200"] = df_plot["close"].rolling(200).mean()
+
+    fig, (ax_price, ax_vol) = plt.subplots(
+        2,
+        1,
+        figsize=(12, 7),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3.0, 1.0]},
+    )
+
+    ax_price.plot(df_plot["date"], df_plot["close"], color="#303643", linewidth=1.6, label="Close")
+    ax_price.plot(df_plot["date"], df_plot["MA50"], color="#d9480f", linewidth=1.3, label="MA50")
+    ax_price.plot(df_plot["date"], df_plot["MA200"], color="#1d4ed8", linewidth=1.3, label="MA200")
+
+    latest = float(df_plot["close"].iloc[-1])
+    ax_price.axhline(latest, color="#6b7280", linestyle="--", linewidth=0.9, alpha=0.8)
+    ax_price.text(
+        df_plot["date"].iloc[-1],
+        latest,
+        f" {latest:.2f}",
+        va="bottom",
+        ha="left",
+        color="#374151",
+        fontsize=9,
+    )
+
+    title_name = f"{symbol} {name}".strip()
+    ax_price.set_title(f"Wyckoff Structure Snapshot | {title_name}", fontsize=12, pad=10)
+    ax_price.grid(alpha=0.22, linewidth=0.6)
+    ax_price.legend(loc="upper left", fontsize=9, frameon=False)
+    ax_price.set_ylabel("Price")
+
+    if "open" in df_plot.columns and df_plot["open"].notna().any():
+        vol_colors = [
+            "#d14343" if c >= o else "#1f8f55"
+            for c, o in zip(df_plot["close"], df_plot["open"])
+        ]
+    else:
+        vol_colors = "#9ca3af"
+    ax_vol.bar(df_plot["date"], df_plot["volume"], color=vol_colors, width=1.0, alpha=0.85)
+    ax_vol.set_ylabel("Vol")
+    ax_vol.grid(alpha=0.16, linewidth=0.5)
+
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    return fig
+
 def render_single_stock_page(provider, model, api_key, *, base_url: str = ""):
     """渲染单股分析页面"""
     st.markdown("### 🔍 威科夫单股分析 (大师模式)")
@@ -366,11 +446,14 @@ def _run_analysis(symbol, image_file, provider, model, api_key, *, base_url: str
         if code_block:
             st.markdown("### 📊 结构标注图")
             if not ALLOW_LLM_PLOT_EXEC:
-                st.warning(
-                    "已禁用自动执行模型生成代码。"
-                    "如需启用，请设置环境变量 ALLOW_LLM_PLOT_EXEC=1。"
-                )
-                st.expander("查看生成代码").code(code_block, language="python")
+                st.info("安全模式已启用：当前展示系统自动生成的结构图（未执行模型代码）。")
+                with st.spinner("正在生成结构图..."):
+                    try:
+                        fig = _build_safe_structure_plot(df_hist, symbol, name)
+                        st.pyplot(fig)
+                    except Exception as e:
+                        st.error(f"结构图生成失败：{e}")
+                        st.expander("错误详情").text(traceback.format_exc())
                 return
             with st.spinner("正在绘制图表..."):
                 try:
