@@ -17,5 +17,9 @@ py-mini-racer>=0.6.0
 matplotlib>=3.8.0
 pillow>=10.0.0
 
+# ── agent framework ──
+openai-agents>=0.1.0
+litellm>=1.40.0
+
 # ── dev / test ──
 pytest>=7.0

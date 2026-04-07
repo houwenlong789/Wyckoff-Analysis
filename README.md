@@ -11,7 +11,7 @@
 
 ---
 
-用 [akshare](https://github.com/akfamily/akshare) + 自研 Wyckoff 漏斗做量化初筛，交由大模型开展多空博弈深度剖析，最后由 OMS 负责执行约束。适合拒绝无脑黑盒、需“白盒逻辑 + 量化防守 + AI参谋预判”的 A 股散户投资者。
+用 [tushare](https://tushare.pro/) + 自研 Wyckoff 漏斗做量化初筛，交由大模型开展多空博弈深度剖析，最后由 OMS 负责执行约束。适合拒绝无脑黑盒、需“白盒逻辑 + 量化防守 + AI参谋预判”的 A 股散户投资者。
 
 > [!TIP]
 > **💡 进阶功能：个人持仓换股工作**  
@@ -273,6 +273,86 @@ Step4 完全由 GitHub Actions Secrets 驱动：读取 `SUPABASE_USER_ID` 定位
 
 ---
 
+## 🤖 Agent 架构
+
+系统采用多 Agent 协作架构，基于 **OpenAI Agents SDK + LiteLLM** 构建。6 个专职 Agent 分工协作，其中 4 个确定性 Agent 负责数据计算，2 个 LLM Agent 负责需要自然语言判断的深度分析。
+
+```
+                     ┌─────────────────────┐
+                     │  OrchestratorAgent   │ ← pipeline 编排 + retry + checkpoint
+                     │      (确定性)         │
+                     └──────────┬──────────┘
+                                │
+          ┌─────────────────────┼─────────────────────┐
+          ▼                     ▼                     ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│  ScreenerAgent   │ │MarketContextAgent│ │  NotifierAgent   │
+│    (确定性)       │ │    (确定性)       │ │    (确定性)       │
+│                  │ │                  │ │                  │
+│ 4层 Wyckoff 漏斗 │ │ 大盘水温 + regime │ │ 飞书/企微/钉钉/TG │
+│ 4500只 → ~30只   │ │ RISK_ON/OFF/CRASH│ │ pipeline 汇总通知 │
+└────────┬─────────┘ └──────────────────┘ └──────────────────┘
+         │
+         ▼
+┌──────────────────┐     ┌──────────────────┐
+│AnalystAgent  🧠  │────▶│StrategyAgent 🧠  │
+│    (LLM 驱动)     │     │   (LLM 驱动)      │
+│                  │     │                  │
+│ 三阵营研报生成    │     │ OMS 持仓决策      │
+│ 逻辑破产/储备/起跳 │     │ EXIT/HOLD/PROBE   │
+└──────────────────┘     └──────────────────┘
+```
+
+### Agent 分工
+
+| Agent | 类型 | 职责 | 包装的核心模块 |
+|-------|------|------|---------------|
+| **OrchestratorAgent** | 确定性 | pipeline 编排、stage 重试、checkpoint | 新增 |
+| **ScreenerAgent** | 确定性 | 4 层 Wyckoff 漏斗筛选 | `wyckoff_engine.py` 77KB |
+| **MarketContextAgent** | 确定性 | 大盘 regime 计算（RISK_ON/NEUTRAL/RISK_OFF/CRASH） | `wyckoff_funnel.py` benchmark 部分 |
+| **WyckoffAnalystAgent** | 🧠 LLM | 三阵营深度研报（逻辑破产 / 储备营地 / 起跳板） | `step3_batch_report.py` + `prompts.py` |
+| **StrategyAgent** | 🧠 LLM | 持仓去留决策 JSON（EXIT/TRIM/HOLD/PROBE/ATTACK） | `step4_rebalancer.py` + OMS 引擎 |
+| **NotifierAgent** | 确定性 | 多渠道通知分发 | 飞书/企微/钉钉/Telegram |
+
+### LLM Provider 支持（via LiteLLM）
+
+通过 LiteLLM 统一适配层，一套代码支持任意 LLM provider：
+
+| Provider | 状态 | 说明 |
+|----------|------|------|
+| Gemini | ✅ 主力 | 默认使用 `gemini-3.1-flash-lite-preview` |
+| OpenAI | ✅ | GPT-4o / GPT-4o-mini |
+| DeepSeek | ✅ | DeepSeek-Chat |
+| 通义千问 (Qwen) | ✅ | DashScope OpenAI-compatible |
+| Kimi (Moonshot) | ✅ | moonshot-v1 |
+| 智谱 (Zhipu) | ✅ | GLM-4 |
+| 火山引擎 (Volcengine) | ✅ | Doubao/ARK |
+| Minimax | ✅ | abab 系列 |
+
+### Pipeline 执行流程
+
+```
+触发 (GH Actions cron / Web / CLI)
+  │
+  ├─ [1] ScreenerAgent ──── 拉取 4500 只 A 股 OHLCV → 4 层漏斗 → ~30 只候选
+  │      同时产出 benchmark_context (大盘指数 + 量价)
+  │
+  ├─ [2] MarketContextAgent ── 标准化 regime (RISK_ON / NEUTRAL / RISK_OFF / CRASH)
+  │
+  ├─ [3] WyckoffAnalystAgent 🧠 ── LLM 三阵营审判 → Markdown 研报 + 起跳板代码
+  │      │  └─ RAG 防雷 (Tavily 新闻检索) → 剔除负面舆情股
+  │      │
+  │      ▼
+  ├─ [4] StrategyAgent 🧠 ── LLM 持仓 + 新标的决策 → JSON → OMS 风控引擎
+  │      └─ 输出: EXIT / TRIM / HOLD / PROBE / ATTACK 指令
+  │
+  └─ [5] NotifierAgent ──── 飞书 + 企微 + 钉钉 + Telegram 多渠道推送
+```
+
+每个 stage 执行后自动 checkpoint，失败时按 stage 重试（默认 2 次），不必从头重跑。
+
+---
+
 ## 附录
 
 ### 目录结构
@@ -283,40 +363,51 @@ Step4 完全由 GitHub Actions Secrets 驱动：读取 `SUPABASE_USER_ID` 定位
 ├── app/                    # UI 组件（layout/auth/navigation）
 │   ├── background_jobs.py  # Streamlit 侧后台任务状态管理
 │   └── ...
+├── agents/                 # 🤖 Agent 层（OpenAI Agents SDK + LiteLLM）
+│   ├── contracts.py        # Agent 间数据契约（dataclass）
+│   ├── llm_adapter.py      # LiteLLM 万能 provider 适配
+│   ├── orchestrator.py     # OrchestratorAgent — pipeline 编排
+│   ├── screener.py         # ScreenerAgent — 4 层漏斗筛选
+│   ├── market_context.py   # MarketContextAgent — 大盘 regime
+│   ├── analyst.py          # WyckoffAnalystAgent — LLM 三阵营研报
+│   ├── strategist.py       # StrategyAgent — LLM OMS 决策
+│   └── notifier.py         # NotifierAgent — 多渠道通知
 ├── core/                   # 核心策略与领域逻辑
 │   ├── wyckoff_engine.py   # Wyckoff 多层漏斗引擎（六通道L2 + Markup L2.5）
-│   ├── wyckoff_single_prompt.py  # 单股分析 Prompt
-│   ├── single_stock_logic.py    # 单股分析页面逻辑
-│   ├── download_history.py      # 下载历史记录
-│   ├── stock_cache.py            # 股票数据缓存
-│   └── constants.py              # 常量定义
+│   ├── prompts.py          # AI 提示词（投委会 / 漏斗 / 私人决断）
+│   ├── sector_rotation.py  # 板块轮动分析
+│   ├── holding_diagnostic.py # 持仓诊断
+│   ├── stock_cache.py      # 股票数据缓存
+│   └── constants.py        # 常量定义
 ├── integrations/           # 数据源/LLM/Supabase 适配层
-│   ├── data_source.py      # 统一数据源（自动降级）
-│   ├── fetch_a_share_csv.py  # CSV 导出模块
-│   ├── github_actions.py  # GitHub Actions 触发与结果查询
-│   ├── llm_client.py      # LLM 客户端
-│   ├── ai_prompts.py      # AI 提示词（Alpha 投委会）
-│   ├── supabase_client.py # Supabase 云端同步
-│   ├── supabase_portfolio.py # Supabase 策略持仓同步
-│   ├── rag_veto.py        # RAG 防雷模块
-│   └── feishu.py          # 飞书推送
+│   ├── data_source.py      # 统一数据源（tushare → akshare → baostock → efinance）
+│   ├── llm_client.py       # LLM 客户端（原生多 provider）
+│   ├── stock_hist_repository.py # Supabase 缓存 + gap-fill
+│   ├── supabase_client.py  # Supabase 云端同步
+│   ├── supabase_portfolio.py # 策略持仓同步
+│   ├── supabase_recommendation.py # 推荐跟踪
+│   ├── rag_veto.py         # RAG 防雷模块
+│   └── github_actions.py   # GitHub Actions 触发与结果查询
 ├── pages/                  # Streamlit 页面
-│   ├── AIAnalysis.py      # AI 分析（单股本地，批量后台）
+│   ├── AIAnalysis.py       # AI 分析（单股本地，批量后台）
 │   ├── WyckoffScreeners.py # Wyckoff Funnel 后台筛选页
-│   ├── Portfolio.py       # 持仓管理
-│   ├── CustomExport.py    # 自定义导出
-│   ├── DownloadHistory.py # 下载历史
-│   ├── Settings.py        # 设置
-│   └── Changelog.py       # 版本更新日志
+│   ├── Portfolio.py        # 持仓管理
+│   ├── RecommendationTracking.py # 推荐跟踪
+│   ├── CustomExport.py     # 自定义导出
+│   ├── Settings.py         # 设置
+│   └── Changelog.py        # 版本更新日志
 ├── scripts/
-│   ├── wyckoff_funnel.py  # 定时选股任务
+│   ├── run_pipeline.py     # 🆕 Agent Pipeline CLI 入口
+│   ├── daily_job.py        # 日终流水线（legacy）
+│   ├── wyckoff_funnel.py   # 定时选股任务
 │   ├── step3_batch_report.py  # AI 研报
-│   ├── web_background_job.py  # Web 后台任务执行入口
 │   ├── step4_rebalancer.py    # 私人决断
+│   ├── web_background_job.py  # Web 后台任务执行入口
 │   ├── premarket_risk_job.py  # 盘前风控预警
-│   ├── daily_job.py      # 日终流水线
-│   ├── benchmark_funnel_fetch.py  # 取数性能基准测试
 │   └── backtest_runner.py  # 日线轻量回测
+├── tests/
+│   ├── agents/             # Agent 层测试
+│   └── ...                 # 现有单元测试
 ├── requirements.txt
 └── .env.example
 ```
