@@ -233,7 +233,7 @@ with content_col:
             stock_options = []
             if enable_stock_search:
                 loading = show_page_loading(
-                    title="加载中...", subtitle="正在加载股票列表"
+                    title="思考中...", subtitle="正在加载股票列表"
                 )
                 try:
                     all_stocks = load_stock_list()
@@ -373,7 +373,7 @@ with content_col:
                 results_ph = st.empty()
 
                 loading = show_page_loading(
-                    title="加载中...",
+                    title="思考中...",
                     subtitle=f"正在批量生成（{len(symbols)} 个）",
                 )
                 try:
@@ -539,7 +539,7 @@ with content_col:
                 st.stop()
 
             loading = show_page_loading(
-                title="加载中...",
+                title="思考中...",
                 subtitle=f"正在获取 {st.session_state.current_symbol} 的数据",
             )
             try:

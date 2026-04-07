@@ -28,9 +28,9 @@ with content_col:
         cleanup_export_artifacts()
         st.session_state.custom_export_cleanup_last_ts = now_ts
 
-    # 首次进入页面时复用现有 Loading 组件（与页面其他操作保持一致）
+    # 首次进入页面时复用现有 Thinking 组件（与页面其他操作保持一致）
     if not st.session_state.get("_custom_export_entered", False):
-        loading = show_page_loading(title="加载中...", subtitle="正在准备页面内容")
+        loading = show_page_loading(title="思考中...", subtitle="正在准备页面内容")
         time.sleep(0.2)
         loading.empty()
         st.session_state["_custom_export_entered"] = True
@@ -175,7 +175,7 @@ with content_col:
 
     if run:
         try:
-            loading = show_page_loading(title="加载中...", subtitle="正在获取数据")
+            loading = show_page_loading(title="思考中...", subtitle="正在获取数据")
             try:
                 if source["id"] == "macro_china_cpi_monthly":
                     df = source["fn"]()

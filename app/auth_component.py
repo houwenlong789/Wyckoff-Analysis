@@ -135,7 +135,7 @@ def login_form():
 <div style="text-align: center; margin-bottom: 2rem;">
     <h1>🔐</h1>
     <h2>欢迎回来</h2>
-    <p style="color: #666;">请登录以继续使用 Akshare 智能投研平台</p>
+    <p style="color: #666;">请登录以继续使用 Wyckoff 智能投研平台</p>
 </div>
             """,
             unsafe_allow_html=True,
@@ -165,7 +165,7 @@ def login_form():
                     else:
                         try:
                             loading = show_page_loading(
-                                title="加载中...", subtitle="正在登录"
+                                title="思考中...", subtitle="正在登录"
                             )
                             try:
                                 response = supabase.auth.sign_in_with_password(
@@ -236,7 +236,7 @@ def login_form():
                     else:
                         try:
                             loading = show_page_loading(
-                                title="加载中...", subtitle="正在注册"
+                                title="思考中...", subtitle="正在注册"
                             )
                             try:
                                 supabase.auth.sign_up(

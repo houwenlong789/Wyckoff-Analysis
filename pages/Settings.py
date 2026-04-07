@@ -13,7 +13,7 @@ content_col = show_right_nav()
 with content_col:
 
     st.title("⚙️ 设置 (Settings)")
-    st.markdown("配置您的 API Key 和通知服务，让 Akshare 更加智能。")
+    st.markdown("配置您的 API Key 和通知服务，让 Wyckoff 智能投研更加强大。")
 
     # 获取当前用户 ID
     user = st.session_state.get("user") or {}
@@ -102,7 +102,7 @@ with content_col:
             "tg_chat_id": st.session_state.tg_chat_id,
         }
 
-        loading = show_page_loading(title="加载中...", subtitle="正在保存到云端")
+        loading = show_page_loading(title="思考中...", subtitle="正在保存到云端")
         try:
             if save_user_settings(user_id, settings):
                 st.toast("✅ 配置已保存到云端", icon="☁️")
