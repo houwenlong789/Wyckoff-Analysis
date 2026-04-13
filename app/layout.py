@@ -3,7 +3,7 @@ import html
 import streamlit as st
 
 from app.auth_component import check_auth, login_form
-from core.token_storage import restore_tokens_from_storage
+from core.token_storage import restore_tokens_from_storage, persist_tokens_to_storage, ensure_query_params_synced
 from integrations.supabase_market_signal import compose_market_banner, load_latest_market_signal_daily
 from integrations.llm_client import DEFAULT_GEMINI_MODEL, OPENAI_COMPATIBLE_BASE_URLS
 
@@ -96,26 +96,22 @@ def init_session_state() -> None:
     if st.session_state.tg_chat_id is None:
         st.session_state.tg_chat_id = ""
 
-    # 从 localStorage 恢复 token（刷新页面后登录态保持）
-    # st_javascript 是异步的：首次渲染返回 0，第二次 rerun 才拿到真值。
-    # 因此最多尝试 2 次（_token_restore_pass 从 0→1→2），第 1 次触发 rerun 等 JS 执行。
+    # 从服务端缓存恢复 token（刷新页面后登录态保持）
+    # 原理：token 存在 st.cache_resource（进程级内存），session_key 存在 URL query_params。
+    # F5 刷新时 query_params 保留 → 用 session_key 查缓存 → 恢复 token。全同步，无需 rerun。
     access = st.session_state.get("access_token") or ""
     refresh = st.session_state.get("refresh_token") or ""
-    restore_pass = int(st.session_state.get("_token_restore_pass", 0))
-    if (not access or not refresh) and restore_pass < 2:
+    if not access or not refresh:
         try:
             restored_access, restored_refresh = restore_tokens_from_storage()
             if restored_access and restored_refresh:
                 st.session_state.access_token = restored_access
                 st.session_state.refresh_token = restored_refresh
-                st.session_state["_token_restore_pass"] = 2  # 成功，不再重试
-            else:
-                st.session_state["_token_restore_pass"] = restore_pass + 1
-                if restore_pass == 0:
-                    # 第一次拿到 0 占位符，触发 rerun 等待 JS 返回真实值
-                    st.rerun()
         except Exception:
-            st.session_state["_token_restore_pass"] = 2  # 出错不再重试
+            pass
+
+    # 确保 URL query_params 中带有 session_key（跨页面导航时保持）
+    ensure_query_params_synced()
 
 
 def _inject_base_ui_css() -> None:
