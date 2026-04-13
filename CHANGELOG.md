@@ -20,6 +20,10 @@ v3.0 是一次从架构到交互的全面重构。打开首页，你面对的就
 - **代码大幅瘦身**：删除 12 个不再使用的旧文件，代码结构更干净。
 - **移除多余依赖**：`openai-agents` 依赖已删除。
 
+### Bug 修复
+
+- **修复 F5 刷新丢失登录态**：将 token 持久化方案从 `st_javascript` + `localStorage` 迁移到 `st.cache_resource`（服务端进程级缓存）+ `st.query_params`（URL 参数）双通道，彻底规避 iframe 沙箱对 `document.cookie` / `localStorage` 的限制，刷新页面后登录态自动恢复。
+
 ### 安全加固
 
 - **登出安全**：切换账号后自动重建对话会话，杜绝跨账号数据串用。
