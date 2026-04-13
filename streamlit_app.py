@@ -336,31 +336,30 @@ with content_col:
                 with st.chat_message(msg["role"], avatar=avatar):
                     st.markdown(msg["content"])
 
-        # ── 用户输入（新对话在发送按钮左侧） ──
+        # ── 用户输入 ──
         st.markdown('<div class="compose-row">', unsafe_allow_html=True)
-        with st.form("chat_compose_form", clear_on_submit=False):
-            compose_left, compose_mid, compose_right = st.columns([1.25, 7.2, 1.2])
-            # 将发送按钮定义在最前，保证按 Enter 时优先触发发送而不是新对话
-            with compose_right:
-                send_clicked = st.form_submit_button(
-                    "发送",
-                    type="primary",
-                    use_container_width=True,
-                )
-            with compose_left:
-                new_chat_clicked = st.form_submit_button(
-                    "🆕 新对话",
-                    use_container_width=True,
-                )
-            with compose_mid:
-                # 新对话时通过切换 key 清空输入框（Streamlit 不允许直接写 widget 绑定的 session_state）
-                _draft_key = f"_chat_draft_{st.session_state.get('_draft_gen', 0)}"
-                draft_input = st.text_input(
-                    "输入消息",
-                    key=_draft_key,
-                    label_visibility="collapsed",
-                    placeholder="问我关于股票的任何问题...",
-                )
+        compose_left, compose_mid, compose_right = st.columns([1.25, 7.2, 1.2])
+        with compose_left:
+            new_chat_clicked = st.button(
+                "🆕 新对话",
+                use_container_width=True,
+            )
+        # form 内只保留一个 submit_button，确保 Enter 键能可靠触发发送
+        with compose_mid:
+            with st.form("chat_compose_form", clear_on_submit=True):
+                _form_cols = st.columns([8, 1])
+                with _form_cols[0]:
+                    draft_input = st.text_input(
+                        "输入消息",
+                        label_visibility="collapsed",
+                        placeholder="问我关于股票的任何问题...",
+                    )
+                with _form_cols[1]:
+                    send_clicked = st.form_submit_button(
+                        "发送",
+                        type="primary",
+                        use_container_width=True,
+                    )
         st.markdown("</div>", unsafe_allow_html=True)
 
         if new_chat_clicked:
@@ -368,10 +367,9 @@ with content_col:
             if mgr:
                 mgr.new_session()
             st.session_state["chat_messages"] = []
-            st.session_state["_draft_gen"] = st.session_state.get("_draft_gen", 0) + 1
             st.rerun()
 
-        # 直接使用本次表单返回值，避免 Enter 提交时被 session_state 清空导致消息丢失
+        # form 提交（Enter 或点击发送）时读取输入
         prompt = str(draft_input or "").strip() if send_clicked else ""
         if prompt:
 
@@ -471,6 +469,5 @@ with content_col:
                             "role": "assistant",
                             "content": final_response,
                         })
-                    st.session_state["_draft_gen"] = st.session_state.get("_draft_gen", 0) + 1
 
             st.rerun()
