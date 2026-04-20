@@ -184,16 +184,18 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        # 退出时静默：关闭第三方连接 + 抑制 daemon 线程的垃圾输出
-        import io as _io
+        # 退出时静默：关闭第三方连接 + OS 级重定向抑制 daemon 线程垃圾输出
         try:
             import baostock as bs
             bs.logout()
         except Exception:
             pass
+        # os.dup2 在 OS 文件描述符层面重定向，不受 Python GC 影响
         try:
-            sys.stdout = _io.StringIO()
-            sys.stderr = _io.StringIO()
+            _devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(_devnull, 1)  # stdout fd
+            os.dup2(_devnull, 2)  # stderr fd
+            os.close(_devnull)
         except Exception:
             pass
 
