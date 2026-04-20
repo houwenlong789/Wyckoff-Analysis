@@ -47,44 +47,6 @@ class StatusBar(Static):
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
-class SpinnerBar(Static):
-    """思考中动态转圈指示器。"""
-
-    DEFAULT_CSS = """
-    SpinnerBar {
-        dock: bottom;
-        height: 1;
-        margin: 0 1;
-        color: $text-muted;
-    }
-    SpinnerBar.hidden { display: none; }
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__("", **kwargs)
-        self._idx = 0
-        self._label = ""
-        self._timer = None
-
-    def start(self, label: str = "思考中") -> None:
-        self._label = label
-        self._idx = 0
-        self.update(f"  {_SPINNER[0]} {label}")
-        self.remove_class("hidden")
-        if self._timer is None:
-            self._timer = self.set_interval(0.08, self._tick)
-
-    def stop(self) -> None:
-        if self._timer is not None:
-            self._timer.stop()
-            self._timer = None
-        self.add_class("hidden")
-
-    def _tick(self) -> None:
-        self._idx = (self._idx + 1) % len(_SPINNER)
-        self.update(f"  {_SPINNER[self._idx]} {self._label}")
-
-
 # ---------------------------------------------------------------------------
 # 交互式输入状态机（/login, /model）
 # ---------------------------------------------------------------------------
@@ -159,7 +121,6 @@ class WyckoffTUI(App):
         yield StatusBar(self._build_status_text(), id="status-bar")
         yield ChatLog(id="chat-log", highlight=True, markup=True, wrap=True)
         yield Input(placeholder="问我关于股票的任何问题... (/help 查看命令)", id="chat-input")
-        yield SpinnerBar(id="spinner", classes="hidden")
 
     def on_mount(self) -> None:
         log = self.query_one("#chat-log", ChatLog)
@@ -192,6 +153,28 @@ class WyckoffTUI(App):
 
     def _update_status(self) -> None:
         self.query_one("#status-bar", StatusBar).update(self._build_status_text())
+
+    # ----- Spinner（ChatLog 底部边框） -----
+
+    def _start_spinner(self, label: str = "思考中") -> None:
+        self._spinner_label = label
+        self._spinner_idx = 0
+        log = self.query_one("#chat-log", ChatLog)
+        log.border_subtitle = f"{_SPINNER[0]} {label}"
+        if not hasattr(self, "_spinner_timer") or self._spinner_timer is None:
+            self._spinner_timer = self.set_interval(0.08, self._tick_spinner)
+
+    def _stop_spinner(self) -> None:
+        if hasattr(self, "_spinner_timer") and self._spinner_timer is not None:
+            self._spinner_timer.stop()
+            self._spinner_timer = None
+        self.query_one("#chat-log", ChatLog).border_subtitle = ""
+
+    def _tick_spinner(self) -> None:
+        self._spinner_idx = (self._spinner_idx + 1) % len(_SPINNER)
+        self.query_one("#chat-log", ChatLog).border_subtitle = (
+            f"{_SPINNER[self._spinner_idx]} {self._spinner_label}"
+        )
 
     # ----- 输入处理 -----
 
@@ -231,7 +214,7 @@ class WyckoffTUI(App):
         log.write(Text(""))
         log.write(Text.from_markup(f"[bold cyan]❯[/bold cyan] {text}"))
         self._messages.append({"role": "user", "content": text})
-        self.query_one("#spinner", SpinnerBar).start("思考中")
+        self._start_spinner("思考中")
         self._run_agent()
 
     # ----- 斜杠命令 -----
@@ -453,10 +436,10 @@ class WyckoffTUI(App):
             self.call_from_thread(log.scroll_end, animate=False)
 
         def _spinner_start(label="思考中"):
-            self.call_from_thread(self.query_one("#spinner", SpinnerBar).start, label)
+            self.call_from_thread(self._start_spinner, label)
 
         def _spinner_stop():
-            self.call_from_thread(self.query_one("#spinner", SpinnerBar).stop)
+            self.call_from_thread(self._stop_spinner)
 
         total_input = 0
         total_output = 0
