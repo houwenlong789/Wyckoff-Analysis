@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-# Copyright (c) 2024-2026 youngcan. All Rights Reserved.
-# 本代码仅供个人学习研究使用，未经授权不得用于商业目的。
-# 商业授权请联系作者支付授权费用。
-
 """
 Wyckoff Funnel 定时任务：5 层漏斗筛选 → 多渠道推送
 

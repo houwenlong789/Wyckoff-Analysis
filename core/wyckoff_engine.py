@@ -1,8 +1,4 @@
 # -*- coding: utf-8 -*-
-# Copyright (c) 2024-2026 youngcan. All Rights Reserved.
-# 本代码仅供个人学习研究使用，未经授权不得用于商业目的。
-# 商业授权请联系作者支付授权费用。
-
 """
 Wyckoff Funnel 5 层漏斗筛选引擎
 
@@ -56,9 +52,7 @@ def _latest_trade_date(df: pd.DataFrame) -> object | None:
     if df is None or df.empty or "date" not in df.columns:
         return None
     s = pd.to_datetime(df["date"], errors="coerce").dropna()
-    if s.empty:
-        return None
-    return s.iloc[-1].date()
+    return s.iloc[-1].date() if not s.empty else None
 
 
 
@@ -758,15 +752,6 @@ def layer2_strength_detailed(
 
 
 
-def layer2_strength(
-    symbols: list[str],
-    df_map: dict[str, pd.DataFrame],
-    bench_df: pd.DataFrame | None,
-    cfg: FunnelConfig,
-) -> list[str]:
-    passed, _ = layer2_strength_detailed(symbols, df_map, bench_df, cfg)
-    return passed
-
 
 
 
@@ -1011,7 +996,6 @@ def _detect_spring(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
     if vol_avg <= 0 or last["volume"] < vol_avg * cfg.spring_vol_ratio:
         return None
     
-    # 加入放量确认：收回时的成交量 > 下探时的成交量
     prev_vol = float(prev["volume"]) if pd.notna(prev["volume"]) else 0
     last_vol = float(last["volume"]) if pd.notna(last["volume"]) else 0
     if prev_vol > 0 and last_vol / prev_vol < cfg.spring_vol_expand_ratio:
@@ -1045,7 +1029,6 @@ def _detect_lps(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
         return None
 
     recent_max_vol = recent["volume"].max()
-    # 修正：参考期应剥离当前考察期（recent）
     ref_window_df = df_s.tail(cfg.lps_vol_ref_window + cfg.lps_lookback).iloc[:-cfg.lps_lookback]
     ref_max_vol = ref_window_df["volume"].max() if not ref_window_df.empty else 0
     if ref_max_vol <= 0:

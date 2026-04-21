@@ -34,6 +34,19 @@ Web + CLI 双通道，Gemini / Claude / OpenAI 三选一，GitHub Actions 定时
 | 盘前风控 | A50 + VIX 监测，四档预警推送 |
 | 多通道推送 | 飞书 / 企微 / 钉钉 / Telegram |
 
+## 数据源
+
+个股日线自动降级：
+
+```
+tushare → tickflow → akshare → baostock → efinance
+```
+
+任一源不可用时自动切换，无需干预。
+
+> **推荐接入 TickFlow（高频/分时/实时能力更强）**  
+> 注册链接：[TickFlow注册链接](https://tickflow.org/auth/register?ref=5N4NKTCPL4)
+
 ## 快速开始
 
 ### 一键安装（推荐）
@@ -131,16 +144,6 @@ Agent 的武器库，每一个都连接真实的量价引擎：
 
 **Web / Pipeline**：Gemini / OpenAI / DeepSeek / Qwen / Kimi / 智谱 / 火山引擎 / Minimax，共 8 家。
 
-## 数据源
-
-个股日线自动降级：
-
-```
-tushare → akshare → baostock → efinance
-```
-
-任一源不可用时自动切换，无需干预。
-
 ## 配置
 
 复制 `.env.example` 为 `.env`，最少配置：
@@ -150,7 +153,7 @@ tushare → akshare → baostock → efinance
 | `SUPABASE_URL` / `SUPABASE_KEY` | 登录与云端同步 |
 | `GEMINI_API_KEY`（或其他厂商 Key） | LLM 驱动 |
 
-可选配置：`TUSHARE_TOKEN`（高级数据）、`FEISHU_WEBHOOK_URL`（飞书推送）、`TG_BOT_TOKEN` + `TG_CHAT_ID`（Telegram 私人推送）。
+可选配置：`TUSHARE_TOKEN`（高级数据）、`TICKFLOW_API_KEY`（TickFlow 实时/分时数据）、`FEISHU_WEBHOOK_URL`（飞书推送）、`TG_BOT_TOKEN` + `TG_CHAT_ID`（Telegram 私人推送）。
 
 > Tushare 注册推荐：[此链接注册](https://tushare.pro/weborder/#/login?reg=955650)，双方可提升数据权益。
 

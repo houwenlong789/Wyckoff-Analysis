@@ -4,7 +4,7 @@
 # 商业授权请联系作者支付授权费用。
 
 """
-统一数据源：个股日线 tushare 优先（qfq）→ akshare→baostock→efinance；大盘 tushare 直连
+统一数据源：个股日线 tushare 优先（qfq）→ tickflow → akshare→baostock→efinance；大盘 tushare 直连
 
 输出格式与 akshare 兼容：日期, 开盘, 最高, 最低, 收盘, 成交量, 成交额, 涨跌幅, 换手率, 振幅
 """
@@ -19,7 +19,7 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Literal
@@ -54,6 +54,9 @@ _AKSHARE_RETRY_SLEEP_SECONDS = float(os.getenv("AKSHARE_RETRY_SLEEP_SECONDS", "0
 _BAOSTOCK_CONSEC_FAILS = 0
 _BAOSTOCK_CIRCUIT_OPEN = False
 _BAOSTOCK_CIRCUIT_NOTE = ""
+_TICKFLOW_CLIENT = None
+_TICKFLOW_CLIENT_READY = False
+_TICKFLOW_DAILY_MAX_COUNT = max(int(os.getenv("TICKFLOW_DAILY_MAX_COUNT", "10000")), 64)
 
 
 def _debug_source_fail(source: str, err: Exception) -> None:
@@ -159,6 +162,26 @@ def _index_to_ts_code(code: str) -> str:
     if s.startswith(("000", "880", "899")):
         return f"{s}.SH"
     return f"{s}.SZ"
+
+
+def _get_tickflow_client():
+    """懒加载 TickFlow client（缺 key 时返回 None）。"""
+    global _TICKFLOW_CLIENT, _TICKFLOW_CLIENT_READY
+    if _TICKFLOW_CLIENT_READY:
+        return _TICKFLOW_CLIENT
+    _TICKFLOW_CLIENT_READY = True
+    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not api_key:
+        _TICKFLOW_CLIENT = None
+        return None
+    try:
+        from integrations.tickflow_client import TickFlowClient
+
+        _TICKFLOW_CLIENT = TickFlowClient(api_key=api_key)
+    except Exception as e:
+        _debug_source_fail("tickflow(client_init)", e)
+        _TICKFLOW_CLIENT = None
+    return _TICKFLOW_CLIENT
 
 
 def _tag_source(df: pd.DataFrame, source: str) -> pd.DataFrame:
@@ -630,6 +653,102 @@ def _fetch_stock_tushare(
     ].copy()
 
 
+def _fetch_stock_tickflow(
+    symbol: str, start: str, end: str, adjust: str
+) -> pd.DataFrame:
+    """
+    TickFlow 日线回退（tushare 不可用时）。
+    输出列与主链路保持一致：日期, 开盘, 最高, 最低, 收盘, 成交量, 成交额, 涨跌幅, 换手率, 振幅
+    """
+    client = _get_tickflow_client()
+    if client is None:
+        raise RuntimeError("TICKFLOW_API_KEY 未配置")
+
+    try:
+        start_d = datetime.strptime(start, "%Y%m%d").date()
+        end_d = datetime.strptime(end, "%Y%m%d").date()
+    except Exception as e:
+        raise RuntimeError(f"tickflow date parse failed: {start}..{end}") from e
+    if end_d < start_d:
+        raise RuntimeError(f"tickflow invalid range: {start}..{end}")
+
+    cn_tz = timezone(timedelta(hours=8))
+    start_dt = datetime.combine(start_d, datetime.min.time(), tzinfo=cn_tz)
+    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time(), tzinfo=cn_tz) - timedelta(
+        milliseconds=1
+    )
+    start_ms = int(start_dt.timestamp() * 1000)
+    end_ms = int(end_dt.timestamp() * 1000)
+
+    day_span = (end_d - start_d).days + 1
+    count = min(max(day_span * 2 + 16, 64), _TICKFLOW_DAILY_MAX_COUNT)
+    adjust_norm = str(adjust or "").strip().lower()
+    adjust_map = {
+        "": "none",
+        "none": "none",
+        "qfq": "forward",
+        "forward": "forward",
+        "hfq": "backward",
+        "backward": "backward",
+    }
+    tick_adjust = adjust_map.get(adjust_norm, "forward")
+
+    df = client.get_klines(
+        symbol=symbol,
+        period="1d",
+        count=count,
+        intraday=False,
+        start_time_ms=start_ms,
+        end_time_ms=end_ms,
+        adjust=tick_adjust,
+    )
+    if df is None or df.empty:
+        raise RuntimeError("tickflow empty")
+
+    start_iso = start_d.isoformat()
+    end_iso = end_d.isoformat()
+    out = df[(df["date"] >= start_iso) & (df["date"] <= end_iso)].copy()
+    if out.empty:
+        raise RuntimeError("tickflow empty in range")
+
+    close = pd.to_numeric(out.get("close"), errors="coerce")
+    prev_close = pd.to_numeric(out.get("prev_close"), errors="coerce")
+    prev_ref = prev_close.where(prev_close > 0)
+    if prev_ref.notna().sum() == 0:
+        prev_ref = close.shift(1)
+    pct = (close / prev_ref - 1.0) * 100.0
+    amp = (pd.to_numeric(out.get("high"), errors="coerce") - pd.to_numeric(out.get("low"), errors="coerce")) / prev_ref * 100.0
+
+    result = pd.DataFrame(
+        {
+            "日期": out["date"],
+            "开盘": pd.to_numeric(out.get("open"), errors="coerce"),
+            "最高": pd.to_numeric(out.get("high"), errors="coerce"),
+            "最低": pd.to_numeric(out.get("low"), errors="coerce"),
+            "收盘": close,
+            "成交量": pd.to_numeric(out.get("volume"), errors="coerce"),
+            "成交额": pd.to_numeric(out.get("amount"), errors="coerce"),
+            "涨跌幅": pct,
+            "换手率": pd.NA,
+            "振幅": amp,
+        }
+    )
+    return result[
+        [
+            "日期",
+            "开盘",
+            "最高",
+            "最低",
+            "收盘",
+            "成交量",
+            "成交额",
+            "涨跌幅",
+            "换手率",
+            "振幅",
+        ]
+    ].copy()
+
+
 def fetch_stock_hist(
     symbol: str,
     start: str | date,
@@ -637,8 +756,9 @@ def fetch_stock_hist(
     adjust: Literal["", "qfq", "hfq"] = "qfq",
 ) -> pd.DataFrame:
     """
-    个股日线：tushare 优先（固定 qfq），失败时回退 akshare/baostock/efinance。
+    个股日线：tushare 优先（固定 qfq），失败时回退 tickflow/akshare/baostock/efinance。
     可用环境变量按需禁用数据源：
+    - DATA_SOURCE_DISABLE_TICKFLOW=1
     - DATA_SOURCE_DISABLE_AKSHARE=1
     - DATA_SOURCE_DISABLE_BAOSTOCK=1
     - DATA_SOURCE_DISABLE_EFINANCE=1
@@ -679,6 +799,12 @@ def fetch_stock_hist(
         "yes",
         "on",
     }
+    disable_tickflow = os.getenv("DATA_SOURCE_DISABLE_TICKFLOW", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     disable_baostock = os.getenv("DATA_SOURCE_DISABLE_BAOSTOCK", "").strip().lower() in {
         "1",
         "true",
@@ -692,7 +818,25 @@ def fetch_stock_hist(
         "on",
     }
 
-    # 2. akshare
+    # 2. tickflow（tushare 不可用时的高质量回退）
+    if disable_tickflow:
+        failed_sources.append("tickflow(disabled)")
+        failed_details.append("tickflow=disabled_by_env")
+    elif not os.getenv("TICKFLOW_API_KEY", "").strip():
+        failed_sources.append("tickflow(unconfigured)")
+        failed_details.append("tickflow=api_key_missing")
+    else:
+        try:
+            return _tag_source(
+                _fetch_stock_tickflow(symbol, start_s, end_s, adjust),
+                "tickflow",
+            )
+        except Exception as e:
+            _debug_source_fail("tickflow", e)
+            failed_sources.append("tickflow")
+            failed_details.append(f"tickflow={_compact_error(e)}")
+
+    # 3. akshare
     if disable_akshare:
         failed_sources.append("akshare(disabled)")
         failed_details.append("akshare=disabled_by_env")
@@ -719,7 +863,7 @@ def fetch_stock_hist(
                 failed_details.append(f"akshare={_compact_error(e)}")
                 break
 
-    # 3. baostock (仅前复权)
+    # 4. baostock (仅前复权)
     baostock_circuit_open, baostock_circuit_note = _baostock_circuit_state()
     if disable_baostock:
         failed_sources.append("baostock(disabled)")
@@ -750,7 +894,7 @@ def fetch_stock_hist(
             failed_sources.append("baostock")
             failed_details.append(f"baostock={_compact_error(e)}")
 
-    # 4. efinance (仅前复权)
+    # 5. efinance (仅前复权)
     if disable_efinance:
         failed_sources.append("efinance(disabled)")
         failed_details.append("efinance=disabled_by_env")
@@ -774,7 +918,7 @@ def fetch_stock_hist(
     hint = _network_hint_from_details(failed_details)
     hint_suffix = f" 诊断提示：{hint}" if hint else ""
     raise RuntimeError(
-        f"数据拉取全线失败 [标:{symbol}, 范围:{start_s}..{end_s}, 复权:{adjust}]：已按顺序尝试 tushare→akshare→baostock→efinance，"
+        f"数据拉取全线失败 [标:{symbol}, 范围:{start_s}..{end_s}, 复权:{adjust}]：已按顺序尝试 tushare→tickflow→akshare→baostock→efinance，"
         f"均无可用 K 线数据。请检查该标的是否已退市或处于长期停牌期。{detail_suffix}{hint_suffix}"
     )
 

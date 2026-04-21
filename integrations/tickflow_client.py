@@ -19,6 +19,7 @@ TICKFLOW_RETRY_BACKOFF_SECONDS = max(float(os.getenv("TICKFLOW_RETRY_BACKOFF_SEC
 
 _PERIOD_SET = {"1m", "5m", "10m", "15m", "30m", "60m", "1d", "1w", "1M", "1Q", "1Y"}
 _CN_TZ = "Asia/Shanghai"
+_ADJUST_SET = {"none", "forward", "backward"}
 
 
 def normalize_cn_symbol(raw: str) -> str:
@@ -58,11 +59,12 @@ def parse_ohlcv_payload(payload: dict[str, Any]) -> pd.DataFrame:
             "high": _arr("high"),
             "low": _arr("low"),
             "close": _arr("close"),
+            "prev_close": _arr("prev_close"),
             "volume": _arr("volume"),
             "amount": _arr("amount"),
         }
     )
-    for col in ("open", "high", "low", "close", "volume", "amount"):
+    for col in ("open", "high", "low", "close", "prev_close", "volume", "amount"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     dt = pd.to_datetime(df["timestamp"], unit="ms", utc=True, errors="coerce")
     df["datetime"] = dt.dt.tz_convert(_CN_TZ)
@@ -124,18 +126,31 @@ class TickFlowClient:
         period: str = "1d",
         count: int = 300,
         intraday: bool = False,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        adjust: str | None = None,
     ) -> pd.DataFrame:
         p = str(period or "1d").strip()
         if p not in _PERIOD_SET:
             raise ValueError(f"不支持的 period: {p}")
         endpoint = "/v1/klines/intraday" if intraday else "/v1/klines"
+        params: dict[str, Any] = {
+            "symbol": normalize_cn_symbol(symbol),
+            "period": p,
+            "count": max(int(count), 1),
+        }
+        if start_time_ms is not None:
+            params["start_time"] = int(start_time_ms)
+        if end_time_ms is not None:
+            params["end_time"] = int(end_time_ms)
+        if not intraday and adjust is not None:
+            adj = str(adjust or "").strip().lower()
+            if adj not in _ADJUST_SET:
+                raise ValueError(f"不支持的 adjust: {adjust}")
+            params["adjust"] = adj
         payload = self._request(
             endpoint,
-            params={
-                "symbol": normalize_cn_symbol(symbol),
-                "period": p,
-                "count": max(int(count), 1),
-            },
+            params=params,
         )
         return parse_ohlcv_payload(payload)
 
