@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -52,6 +53,14 @@ DEFAULT_EXIT_MODE = "sltp"
 DEFAULT_STOP_LOSS_PCT = -7.0   # 网格优化最佳：SL7/TP18（夏普1.928 > SL6/TP15的1.679 > SL8/TP20的1.466）
 DEFAULT_TAKE_PROFIT_PCT = 18.0
 DEFAULT_TRAILING_STOP_PCT = 0.0  # 0 = 不启用移动止盈；如 -5.0 表示从最高点回撤 5% 卖出
+DEFAULT_TRAILING_ACTIVATE_PCT = 0.0  # 移动止盈激活门槛(%)，如 10.0 表示浮盈 ≥10% 后才启用移动止盈
+
+# ── ATR 模式常量（对齐实盘 step4_rebalancer） ──
+DEFAULT_ATR_PERIOD = 14
+DEFAULT_ATR_MULTIPLIER = 2.0         # 实盘 STEP4_ATR_MULTIPLIER = 2.0
+DEFAULT_ATR_HARD_STOP_PCT = -9.0     # 极限止损地板(%)，实盘 STEP4_BUY_HARD_STOP_PCT = 9.0
+DEFAULT_ATR_MAX_HOLD_DAYS = 120      # ATR 模式下最大持有天数（安全网）
+
 DEFAULT_USE_CURRENT_META = False
 DEFAULT_BUY_FRICTION_PCT = float(os.getenv("BACKTEST_BUY_FRICTION_PCT", "0.5"))
 DEFAULT_SELL_FRICTION_PCT = float(os.getenv("BACKTEST_SELL_FRICTION_PCT", "0.5"))
@@ -509,6 +518,29 @@ def _build_daily_ohlc_lookup(
     return out
 
 
+def _calc_atr_from_ohlc(
+    sorted_dates: list[date],
+    day_ohlc: dict[date, tuple[float, float, float, float]],
+    as_of: date,
+    period: int = 14,
+) -> float | None:
+    """从预排序日期列表 + OHLC lookup 计算截止 as_of 的 ATR（SMA of TR）。
+
+    复用 step4_rebalancer._calc_atr 的逻辑（SMA，非 Wilder EMA）。
+    sorted_dates 由调用方一次性排序并传入以避免重复排序。
+    """
+    right = bisect.bisect_right(sorted_dates, as_of)
+    if right < period + 1:
+        return None
+    window = sorted_dates[right - period - 1 : right]
+    trs: list[float] = []
+    for i in range(1, len(window)):
+        _, h, l, _ = day_ohlc[window[i]]
+        _, _, _, prev_c = day_ohlc[window[i - 1]]
+        trs.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
+    return sum(trs) / len(trs) if trs else None
+
+
 def run_backtest(
     start_dt: date,
     end_dt: date,
@@ -523,12 +555,16 @@ def run_backtest(
     stop_loss_pct: float = DEFAULT_STOP_LOSS_PCT,
     take_profit_pct: float = DEFAULT_TAKE_PROFIT_PCT,
     trailing_stop_pct: float = DEFAULT_TRAILING_STOP_PCT,
+    trailing_activate_pct: float = DEFAULT_TRAILING_ACTIVATE_PCT,
     sltp_priority: str = "stop_first",
     use_current_meta: bool = DEFAULT_USE_CURRENT_META,
     buy_friction_pct: float = DEFAULT_BUY_FRICTION_PCT,
     sell_friction_pct: float = DEFAULT_SELL_FRICTION_PCT,
     regime_filter: bool = False,
     pending_mode: str = "both",
+    atr_period: int = DEFAULT_ATR_PERIOD,
+    atr_multiplier: float = DEFAULT_ATR_MULTIPLIER,
+    atr_hard_stop_pct: float = DEFAULT_ATR_HARD_STOP_PCT,
 ) -> tuple[pd.DataFrame, dict]:
     if pending_mode not in {"off", "only", "both"}:
         raise ValueError("pending_mode 必须是 off / only / both")
@@ -536,12 +572,14 @@ def run_backtest(
         raise ValueError("end 必须晚于 start")
     if hold_days < 1:
         raise ValueError("hold_days 必须 >= 1")
-    if exit_mode not in {"close_only", "sltp"}:
-        raise ValueError("exit_mode 必须是 close_only 或 sltp")
+    if exit_mode not in {"close_only", "sltp", "atr"}:
+        raise ValueError("exit_mode 必须是 close_only、sltp 或 atr")
     if sltp_priority not in {"stop_first", "take_first"}:
         raise ValueError("sltp_priority 必须是 stop_first 或 take_first")
     if trailing_stop_pct > 0:
         raise ValueError("trailing_stop_pct 必须 <= 0（如 -5.0 表示从最高点回撤 5%），0 表示不启用")
+    if trailing_activate_pct < 0:
+        raise ValueError("trailing_activate_pct 必须 >= 0（如 10.0 表示浮盈 10% 后激活），0 表示立即启用")
     if stop_loss_pct > 0:
         raise ValueError("stop_loss_pct 必须 <= 0，0 表示不设止损")
     if take_profit_pct < 0:
@@ -780,15 +818,21 @@ def run_backtest(
             except ValueError:
                 # actual_entry_date 不在基准交易日列表中（极端情况：个股复牌日不在大盘交易日内）
                 actual_entry_idx = idx + 1  # fallback 到原始逻辑
-            actual_exit_idx = actual_entry_idx + hold_days
+            # ATR 模式使用更长的持有窗口（安全网），其余模式用 hold_days
+            effective_max_hold = DEFAULT_ATR_MAX_HOLD_DAYS if exit_mode == "atr" else hold_days
+            actual_exit_idx = actual_entry_idx + effective_max_hold
             if actual_exit_idx >= len(trade_dates):
-                continue  # 剩余交易日不足以覆盖完整持有期
+                if exit_mode == "atr":
+                    actual_exit_idx = len(trade_dates) - 1  # ATR 模式截断到可用范围
+                else:
+                    continue  # sltp/close_only 模式：剩余交易日不足以覆盖完整持有期
             actual_exit_anchor = trade_dates[actual_exit_idx]
 
             if exit_mode == "close_only":
                 # 兼容旧口径：持有 N 个市场交易日后按 anchor 日（或其后首个可得日）收盘离场。
                 exit_close, exit_date = _close_on_or_after(full_df, actual_exit_anchor)
-            else:
+
+            elif exit_mode == "sltp":
                 # sltp 口径：仅在实际入场日到退出锚点日的市场交易日窗口内检查触发。
                 exit_close = None
                 exit_date = None
@@ -809,6 +853,8 @@ def run_backtest(
                     else None
                 )
                 use_trailing = trailing_stop_pct < 0
+                trailing_activated = trailing_activate_pct <= 0  # 门槛 ≤0 表示立即激活
+                activate_price = entry_close * (1.0 + trailing_activate_pct / 100.0) if not trailing_activated else 0.0
                 peak_high = entry_close  # 持仓期间最高价，用于移动止盈
 
                 for mkt_day in market_window:
@@ -817,13 +863,15 @@ def run_backtest(
                         continue
                     open_px, high, low, _ = candle
 
-                    # 更新持仓期间最高价（用当日最高价）
-                    peak_high = max(peak_high, high)
+                    # 激活门槛：浮盈达到 trailing_activate_pct 后才启用移动止盈
+                    if use_trailing and not trailing_activated and high >= activate_price:
+                        trailing_activated = True
 
-                    # 移动止盈线 = 最高价 × (1 + trailing_stop_pct/100)
+                    # 移动止盈线基于昨日 peak_high 计算（避免同根K线悖论：
+                    # 当日最高价刷新 peak 的同时当日最低价触发回撤，逻辑自相矛盾）
                     trailing_price = (
                         peak_high * (1.0 + trailing_stop_pct / 100.0)
-                        if use_trailing
+                        if use_trailing and trailing_activated
                         else None
                     )
 
@@ -839,20 +887,16 @@ def run_backtest(
                         if px is None:
                             continue
                         if kind == "sl" and low <= px:
-                            # 若开盘已跳空跌破止损，只能按开盘附近成交；否则按止损价成交。
                             exit_close = px if open_px >= px else open_px
                             exit_date = mkt_day
                             hit = True
                             break
                         if kind == "trail" and low <= px:
-                            # 移动止盈触发（从最高点回撤超限）
-                            # 跳空逻辑同止损：开盘已低于 trailing_price 时按开盘成交
                             exit_close = px if open_px >= px else open_px
                             exit_date = mkt_day
                             hit = True
                             break
                         if kind == "tp" and high >= px:
-                            # 若开盘已跳空高开越过止盈，按开盘附近成交；否则按止盈价成交。
                             exit_close = px if open_px <= px else open_px
                             exit_date = mkt_day
                             hit = True
@@ -860,8 +904,83 @@ def run_backtest(
                     if hit:
                         break
 
+                    # 检查完毕后再更新 peak_high（放在 break 之后确保不影响当日判定）
+                    peak_high = max(peak_high, high)
+
                 if exit_close is None:
                     # 未触发则按窗口最后一天(含)及之前最近可得收盘离场，不延长持仓天数。
+                    exit_close, exit_date = _close_on_or_before(
+                        full_df,
+                        actual_exit_anchor,
+                        lower_exclusive=signal_date,
+                    )
+
+            elif exit_mode == "atr":
+                # ATR 模式：对齐实盘 step4_rebalancer 的 ATR 动态止损 + trailing。
+                # 无固定止盈，无固定持有期限制（仅有安全网 DEFAULT_ATR_MAX_HOLD_DAYS）。
+                exit_close = None
+                exit_date = None
+                market_window = trade_dates[actual_entry_idx : actual_exit_idx + 1]
+                day_ohlc = ohlc_lookup_cache.get(code)
+                if day_ohlc is None:
+                    day_ohlc = _build_daily_ohlc_lookup(full_df)
+                    ohlc_lookup_cache[code] = day_ohlc
+
+                # 预排序日期列表（给 _calc_atr_from_ohlc 用，避免每根 K 线重复排序）
+                sorted_ohlc_dates = sorted(day_ohlc.keys())
+
+                atr_stop: float | None = None  # ATR 动态止损（ratchet up only）
+                hard_floor = entry_close * (1.0 + atr_hard_stop_pct / 100.0)  # 极限止损地板
+                use_trailing = trailing_stop_pct < 0
+                trailing_activated = trailing_activate_pct <= 0
+                activate_price = entry_close * (1.0 + trailing_activate_pct / 100.0) if not trailing_activated else 0.0
+                peak_high = entry_close
+
+                for mkt_day in market_window:
+                    candle = day_ohlc.get(mkt_day)
+                    if candle is None:
+                        continue
+                    open_px, high, low, close_px = candle
+
+                    # 1. 计算当日 ATR，更新 ATR 止损（ratchet up only）
+                    atr_val = _calc_atr_from_ohlc(sorted_ohlc_dates, day_ohlc, mkt_day, atr_period)
+                    if atr_val and atr_val > 0:
+                        new_atr_stop = close_px - atr_multiplier * atr_val
+                        if atr_stop is None:
+                            atr_stop = new_atr_stop
+                        else:
+                            atr_stop = max(atr_stop, new_atr_stop)  # ratchet up
+
+                    # 2. 有效止损 = max(ATR 动态止损, 极限地板)
+                    effective_stop = max(atr_stop or hard_floor, hard_floor)
+
+                    # 3. 移动止盈（激活门槛 + 百分比回撤）
+                    if use_trailing and not trailing_activated and high >= activate_price:
+                        trailing_activated = True
+                    trailing_price = (
+                        peak_high * (1.0 + trailing_stop_pct / 100.0)
+                        if use_trailing and trailing_activated
+                        else None
+                    )
+
+                    # 4. 检查触发：ATR 止损 → trailing（无固定止盈）
+                    hit = False
+                    if low <= effective_stop:
+                        exit_close = effective_stop if open_px >= effective_stop else open_px
+                        exit_date = mkt_day
+                        hit = True
+                    elif trailing_price is not None and low <= trailing_price:
+                        exit_close = trailing_price if open_px >= trailing_price else open_px
+                        exit_date = mkt_day
+                        hit = True
+
+                    if hit:
+                        break
+
+                    peak_high = max(peak_high, high)
+
+                if exit_close is None:
+                    # 安全网到期：按窗口最后一天收盘离场
                     exit_close, exit_date = _close_on_or_before(
                         full_df,
                         actual_exit_anchor,
@@ -918,6 +1037,10 @@ def run_backtest(
         "stop_loss_pct": stop_loss_pct,
         "take_profit_pct": take_profit_pct,
         "trailing_stop_pct": trailing_stop_pct,
+        "trailing_activate_pct": trailing_activate_pct,
+        "atr_period": atr_period if exit_mode == "atr" else None,
+        "atr_multiplier": atr_multiplier if exit_mode == "atr" else None,
+        "atr_hard_stop_pct": atr_hard_stop_pct if exit_mode == "atr" else None,
         "sltp_priority": sltp_priority,
         "use_current_meta": bool(use_current_meta),
         "buy_friction_pct": float(buy_friction_pct),
@@ -955,7 +1078,7 @@ def run_backtest(
                 "portfolio_trading_days": pm.get("portfolio_trading_days"),
                 "portfolio_avg_positions": pm.get("portfolio_avg_positions"),
                 "_nav_df": nav_df,
-                "stratified": _calc_stratified_stats(trades_df),
+                "stratified": _calc_stratified_stats(trades_df, hold_days=hold_days),
             }
         )
     else:
@@ -1096,7 +1219,7 @@ def _calc_information_ratio(
     return float(ann_excess / ann_te)
 
 
-def _calc_stratified_stats(trades_df: pd.DataFrame) -> dict[str, dict]:
+def _calc_stratified_stats(trades_df: pd.DataFrame, hold_days: int = DEFAULT_HOLD_DAYS) -> dict[str, dict]:
     """
     按 track (Trend/Accum) 和 regime 分层统计。
     返回 {"by_track": {"Trend": {...}, "Accum": {...}},
@@ -1118,8 +1241,8 @@ def _calc_stratified_stats(trades_df: pd.DataFrame) -> dict[str, dict]:
             "avg_ret_pct": float(ret.mean()),
             "median_ret_pct": float(ret.median()),
             "max_drawdown_pct": _calc_max_drawdown_pct(ret),
-            "sharpe_ratio": _calc_sharpe_ratio(ret),
-            "calmar_ratio": _calc_calmar_ratio(ret),
+            "sharpe_ratio": _calc_sharpe_ratio(ret, hold_days=hold_days),
+            "calmar_ratio": _calc_calmar_ratio(ret, hold_days=hold_days),
             "var95_ret_pct": var95,
             "cvar95_ret_pct": cvar95,
             "max_consecutive_losses": _calc_max_consecutive_losses(ret),
@@ -1478,9 +1601,20 @@ def _build_summary_md(summary: dict) -> str:
             f"- 评估交易日: {summary.get('eval_days')}",
             f"- 触发交易日: {summary.get('signal_days')}",
             f"- 离场模式: {summary.get('exit_mode')}",
-            f"- 止损线: {_fmt_metric(summary.get('stop_loss_pct'), 1)}%",
-            f"- 止盈线: {_fmt_metric(summary.get('take_profit_pct'), 1)}%",
-            f"- 移动止盈: {_fmt_metric(summary.get('trailing_stop_pct'), 1)}%（从最高点回撤）" if summary.get('trailing_stop_pct', 0) < 0 else "- 移动止盈: 关闭",
+            *(
+                [
+                    f"- ATR 周期: {summary.get('atr_period')}",
+                    f"- ATR 乘数: {summary.get('atr_multiplier')}",
+                    f"- ATR 极限止损: {_fmt_metric(summary.get('atr_hard_stop_pct'), 1)}%",
+                    f"- 最大持有天数: {DEFAULT_ATR_MAX_HOLD_DAYS}（安全网）",
+                ]
+                if summary.get("exit_mode") == "atr"
+                else [
+                    f"- 止损线: {_fmt_metric(summary.get('stop_loss_pct'), 1)}%",
+                    f"- 止盈线: {_fmt_metric(summary.get('take_profit_pct'), 1)}%",
+                ]
+            ),
+            f"- 移动止盈: {_fmt_metric(summary.get('trailing_stop_pct'), 1)}%（从最高点回撤，浮盈≥{_fmt_metric(summary.get('trailing_activate_pct'), 1)}%后激活）" if summary.get('trailing_stop_pct', 0) < 0 else "- 移动止盈: 关闭",
             f"- 日内触发优先级: {summary.get('sltp_priority')}",
             f"- 买入摩擦成本: {_fmt_metric(summary.get('buy_friction_pct'), 3)}%",
             f"- 卖出摩擦成本: {_fmt_metric(summary.get('sell_friction_pct'), 3)}%",
@@ -1562,8 +1696,10 @@ def _build_summary_md(summary: dict) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Wyckoff Funnel 日线轻量回测器")
-    parser.add_argument("--start", required=True, help="起始日期: YYYY-MM-DD 或 YYYYMMDD")
-    parser.add_argument("--end", required=True, help="结束日期: YYYY-MM-DD 或 YYYYMMDD")
+    _default_end = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+    _default_start = (date.today() - timedelta(days=548)).strftime("%Y-%m-%d")  # ~18 个月
+    parser.add_argument("--start", default=_default_start, help=f"起始日期 (default: {_default_start}，约18个月前)")
+    parser.add_argument("--end", default=_default_end, help=f"结束日期 (default: {_default_end}，T-1)")
     parser.add_argument(
         "--hold-days",
         type=int,
@@ -1592,9 +1728,9 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=8, help="历史拉取并发数")
     parser.add_argument(
         "--exit-mode",
-        choices=["close_only", "sltp"],
+        choices=["close_only", "sltp", "atr"],
         default=DEFAULT_EXIT_MODE,
-        help=f"离场模式：close_only=仅按持有天数收盘离场；sltp=启用日内止盈止损 (default: {DEFAULT_EXIT_MODE})",
+        help=f"离场模式：close_only=收盘离场；sltp=固定止盈止损；atr=ATR动态止损(对齐实盘) (default: {DEFAULT_EXIT_MODE})",
     )
     parser.add_argument(
         "--stop-loss",
@@ -1613,6 +1749,30 @@ def main() -> int:
         type=float,
         default=DEFAULT_TRAILING_STOP_PCT,
         help=f"移动止盈(%%), 如 -5.0 表示从最高点回撤 5%% 卖出. 0 表示不启用 (default: {DEFAULT_TRAILING_STOP_PCT})",
+    )
+    parser.add_argument(
+        "--trailing-activate",
+        type=float,
+        default=DEFAULT_TRAILING_ACTIVATE_PCT,
+        help=f"移动止盈激活门槛(%%), 浮盈达到此值后才启用移动止盈. 0 表示立即启用 (default: {DEFAULT_TRAILING_ACTIVATE_PCT})",
+    )
+    parser.add_argument(
+        "--atr-period",
+        type=int,
+        default=DEFAULT_ATR_PERIOD,
+        help=f"ATR 周期（仅 atr 模式生效） (default: {DEFAULT_ATR_PERIOD})",
+    )
+    parser.add_argument(
+        "--atr-multiplier",
+        type=float,
+        default=DEFAULT_ATR_MULTIPLIER,
+        help=f"ATR 乘数（仅 atr 模式生效，实盘=2.0） (default: {DEFAULT_ATR_MULTIPLIER})",
+    )
+    parser.add_argument(
+        "--atr-hard-stop",
+        type=float,
+        default=DEFAULT_ATR_HARD_STOP_PCT,
+        help=f"ATR 模式极限止损地板(%%)（仅 atr 模式生效） (default: {DEFAULT_ATR_HARD_STOP_PCT})",
     )
     parser.add_argument(
         "--sltp-priority",
@@ -1699,12 +1859,16 @@ def main() -> int:
                 stop_loss_pct=args.stop_loss,
                 take_profit_pct=args.take_profit,
                 trailing_stop_pct=args.trailing_stop,
+                trailing_activate_pct=args.trailing_activate,
                 sltp_priority=args.sltp_priority,
                 use_current_meta=args.use_current_meta,
                 buy_friction_pct=args.buy_friction_pct,
                 sell_friction_pct=args.sell_friction_pct,
                 regime_filter=args.regime_filter,
                 pending_mode=args.pending_mode,
+                atr_period=args.atr_period,
+                atr_multiplier=args.atr_multiplier,
+                atr_hard_stop_pct=args.atr_hard_stop,
             )
         except Exception as exc:
             last_error = exc

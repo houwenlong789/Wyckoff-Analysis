@@ -1,9 +1,9 @@
-name: Tail Buy 14:20
+name: Tail Buy 14:10
 
 on:
   schedule:
-    # UTC 06:20 Mon-Fri = 北京时间 14:20
-    - cron: "20 6 * * 1-5"
+    # UTC 06:10 Mon-Fri = 北京时间 14:10
+    - cron: "10 6 * * 1-5"
   workflow_dispatch:
 
 concurrency:
@@ -31,6 +31,12 @@ jobs:
       TAIL_BUY_FETCH_CONCURRENCY: "8"
       TAIL_BUY_LLM_CONCURRENCY: "4"
       TAIL_BUY_TASK_TIMEOUT_MIN: "25"
+      TAIL_BUY_INTRADAY_LIMIT_PER_MIN: "30"
+      TAIL_BUY_MAX_OVER_LIMIT_SYMBOLS: "5"
+      TAIL_BUY_FORCE_OVER_LIMIT: "1"
+      TAIL_BUY_TICKFLOW_MAX_RETRIES: "1"
+      TAIL_BUY_USE_BATCH_INTRADAY: "1"
+      TAIL_BUY_INTRADAY_BATCH_SIZE: "200"
 
     steps:
       - uses: actions/checkout@v4
@@ -94,4 +100,3 @@ jobs:
           except Exception as e:
             print('warning: 失败通知发送异常:', e)
           "
-

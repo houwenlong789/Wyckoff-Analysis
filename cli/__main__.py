@@ -116,7 +116,15 @@ def _cmd_update(_args):
         cmd = [sys.executable, "-m", "pip", "install", "--upgrade", pkg]
     try:
         subprocess.check_call(cmd)
-        print("\n✓ 升级完成！请重新运行 wyckoff。")
+        url = "https://wyckoff-analysis-youngcanphoenix.streamlit.app/"
+        try:
+            subprocess.run(["pbcopy"], input=url.encode(), check=True)
+        except FileNotFoundError:
+            try:
+                subprocess.run(["xclip", "-selection", "clipboard"], input=url.encode(), check=True)
+            except FileNotFoundError:
+                pass
+        print(f"\n✓ 升级完成！请重新运行 wyckoff。\n  Web 版已复制到剪切板: {url}")
     except subprocess.CalledProcessError as e:
         print(f"\n✗ 升级失败: {e}")
         sys.exit(1)

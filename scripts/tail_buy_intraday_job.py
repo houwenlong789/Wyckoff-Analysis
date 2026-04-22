@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-尾盘买入扫描任务（周一到周五 14:20）：
+尾盘买入扫描任务（周一到周五 14:10）：
 - 输入：signal_pending（前一交易日 + pending/confirmed）
 - 判定：规则全量 + LLM TopN 二判
 - 输出：飞书 + Telegram 推送（不写交易表）
@@ -41,6 +41,7 @@ from utils.notify import send_to_telegram
 from utils.trading_clock import resolve_end_calendar_day
 
 TZ = ZoneInfo("Asia/Shanghai")
+TICKFLOW_UPGRADE_HINT = "触发数据源限制，升级数据源：https://tickflow.org/auth/register?ref=5N4NKTCPL4"
 
 
 def _now() -> datetime:
@@ -62,6 +63,43 @@ def _log(msg: str, logs_path: str | None = None) -> None:
 
 def _remaining_seconds(deadline_at: datetime) -> float:
     return (deadline_at - _now()).total_seconds()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _plan_intraday_scan_budget(
+    total_candidates: int,
+    *,
+    limit_per_min: int,
+    max_over_limit_symbols: int,
+    force_over_limit: bool,
+) -> tuple[int, int]:
+    """
+    规划本轮分时扫描数量。
+    - 超限股票数始终被限制在 <= 5
+    - 当 force_over_limit=True 且候选足够时，尽量打到 (limit + over_limit)
+    返回 (to_scan, planned_over_limit_symbols)
+    """
+    total = max(int(total_candidates), 0)
+    limit = max(int(limit_per_min), 1)
+    over = max(min(int(max_over_limit_symbols), 5), 0)
+    if total <= limit:
+        return total, 0
+    if force_over_limit and over > 0:
+        to_scan = min(total, limit + over)
+        return to_scan, max(to_scan - limit, 0)
+    to_scan = min(total, limit)
+    return to_scan, 0
+
+
+def _chunked(seq: list[TailBuyCandidate], chunk_size: int) -> list[list[TailBuyCandidate]]:
+    size = max(int(chunk_size), 1)
+    return [seq[i : i + size] for i in range(0, len(seq), size)]
 
 
 def _resolve_trade_dates(logs_path: str | None = None) -> tuple[str, str]:
@@ -136,7 +174,7 @@ def _scan_one_symbol(
     try:
         df_1m = client.get_intraday(symbol, period="1m", count=5000)
     except Exception as e:
-        candidate.fetch_error = f"TickFlow分钟数据拉取失败: {e}（购买: https://tickflow.org/auth/register?ref=5N4NKTCPL4）"
+        candidate.fetch_error = f"TickFlow分钟数据拉取失败: {e}（{TICKFLOW_UPGRADE_HINT}）"
         candidate.rule_reasons = [candidate.fetch_error]
         return candidate
     if df_1m is None or df_1m.empty:
@@ -221,6 +259,75 @@ def _run_rule_scan(
         _log(f"规则扫描: 因 deadline 提前跳过 {skipped_due_deadline} 只", logs_path)
     _log(
         f"规则扫描完成: total={len(scanned)}, ok={ok_cnt}, fail={fail_cnt}, workers={max_workers}",
+        logs_path,
+    )
+    return scanned
+
+
+def _run_rule_scan_batch(
+    candidates: list[TailBuyCandidate],
+    *,
+    tickflow_client: TickFlowClient,
+    style: str,
+    batch_size: int,
+    deadline_at: datetime,
+    logs_path: str | None = None,
+) -> list[TailBuyCandidate]:
+    """
+    优先批量拉取分时，显著降低请求次数，尽量避免单标的限流。
+    """
+    if not candidates:
+        return []
+
+    chunks = _chunked(candidates, max(min(int(batch_size), 200), 1))
+    scanned: list[TailBuyCandidate] = []
+    skipped_due_deadline = 0
+    batch_fail_symbols = 0
+
+    for chunk in chunks:
+        if _remaining_seconds(deadline_at) <= 5:
+            skipped_due_deadline += len(chunk)
+            for item in chunk:
+                item.fetch_error = "超出任务时限，未执行分时扫描"
+                item.rule_reasons = [item.fetch_error]
+                scanned.append(item)
+            continue
+
+        symbols = [normalize_cn_symbol(item.code) for item in chunk]
+        try:
+            data_map = tickflow_client.get_intraday_batch(symbols, period="1m", count=5000)
+        except Exception as e:
+            reason = f"TickFlow批量分时拉取失败: {e}（{TICKFLOW_UPGRADE_HINT}）"
+            batch_fail_symbols += len(chunk)
+            for item in chunk:
+                item.fetch_error = reason
+                item.rule_reasons = [reason]
+                scanned.append(item)
+            continue
+
+        for item in chunk:
+            sym = normalize_cn_symbol(item.code)
+            df_1m = data_map.get(sym)
+            if df_1m is None or df_1m.empty:
+                item.fetch_error = "TickFlow返回空分时"
+                item.rule_reasons = [item.fetch_error]
+                scanned.append(item)
+                continue
+            try:
+                scanned.append(evaluate_rule_decision(item, df_1m, style=style))
+            except Exception as e:
+                item.fetch_error = f"规则评分失败: {e}"
+                item.rule_reasons = [item.fetch_error]
+                scanned.append(item)
+
+    scanned.sort(key=lambda x: (-x.rule_score, x.code))
+    ok_cnt = sum(1 for x in scanned if not x.fetch_error)
+    fail_cnt = len(scanned) - ok_cnt
+    if skipped_due_deadline:
+        _log(f"规则扫描(batch): 因 deadline 提前跳过 {skipped_due_deadline} 只", logs_path)
+    _log(
+        f"规则扫描(batch)完成: total={len(scanned)}, ok={ok_cnt}, fail={fail_cnt}, "
+        f"batch_size={max(min(int(batch_size), 200), 1)}, batch_fail_symbols={batch_fail_symbols}",
         logs_path,
     )
     return scanned
@@ -447,12 +554,24 @@ def main() -> int:
     fetch_concurrency = max(int(os.getenv("TAIL_BUY_FETCH_CONCURRENCY", "8")), 1)
     llm_concurrency = max(int(os.getenv("TAIL_BUY_LLM_CONCURRENCY", "4")), 1)
     max_llm_symbols = max(int(args.max_llm_symbols or 20), 0)
+    intraday_limit_per_min = max(int(os.getenv("TAIL_BUY_INTRADAY_LIMIT_PER_MIN", "30")), 1)
+    max_over_limit_symbols = max(
+        min(int(os.getenv("TAIL_BUY_MAX_OVER_LIMIT_SYMBOLS", "5")), 5),
+        0,
+    )
+    force_over_limit = _env_flag("TAIL_BUY_FORCE_OVER_LIMIT", True)
+    tickflow_task_retries = max(int(os.getenv("TAIL_BUY_TICKFLOW_MAX_RETRIES", "1")), 1)
+    use_batch_intraday = _env_flag("TAIL_BUY_USE_BATCH_INTRADAY", True)
+    intraday_batch_size = max(min(int(os.getenv("TAIL_BUY_INTRADAY_BATCH_SIZE", "200")), 200), 1)
 
     _log("开始尾盘买入扫描任务", logs_path)
     _log(
         f"config: provider={provider}, model={model}, style={style}, "
         f"fetch_concurrency={fetch_concurrency}, llm_concurrency={llm_concurrency}, "
-        f"max_llm_symbols={max_llm_symbols}, deadline={deadline_min}m",
+        f"max_llm_symbols={max_llm_symbols}, deadline={deadline_min}m, "
+        f"intraday_limit={intraday_limit_per_min}/min, max_over_limit={max_over_limit_symbols}, "
+        f"force_over_limit={force_over_limit}, tickflow_retries={tickflow_task_retries}, "
+        f"use_batch_intraday={use_batch_intraday}, intraday_batch_size={intraday_batch_size}",
         logs_path,
     )
     _log(
@@ -461,7 +580,7 @@ def main() -> int:
     )
 
     if not tickflow_api_key:
-        _log("缺少 TICKFLOW_API_KEY，尾盘买入扫描需要分钟级数据，请购买 TickFlow: https://tickflow.org/auth/register?ref=5N4NKTCPL4", logs_path)
+        _log(f"缺少 TICKFLOW_API_KEY，尾盘买入扫描需要分钟级数据。{TICKFLOW_UPGRADE_HINT}", logs_path)
         return 1
     if not feishu_webhook or not tg_bot_token or not tg_chat_id:
         _log("双通道推送未完整配置（需 FEISHU_WEBHOOK_URL + TG_BOT_TOKEN + TG_CHAT_ID）", logs_path)
@@ -499,15 +618,66 @@ def main() -> int:
         _log(f"无候选结束: feishu_ok={feishu_ok}, tg_ok={tg_ok}", logs_path)
         return 0 if (feishu_ok and tg_ok) else 1
 
-    tickflow_client = TickFlowClient(api_key=tickflow_api_key)
-    scored = _run_rule_scan(
-        pending_candidates,
-        tickflow_client=tickflow_client,
-        style=style,
-        fetch_concurrency=fetch_concurrency,
-        deadline_at=deadline_at,
-        logs_path=logs_path,
+    tickflow_client = TickFlowClient(
+        api_key=tickflow_api_key,
+        max_retries=tickflow_task_retries,
     )
+    scored: list[TailBuyCandidate] = []
+
+    if use_batch_intraday:
+        _log(
+            f"规则扫描模式: batch（batch_size={intraday_batch_size}, candidates={len(pending_candidates)}）",
+            logs_path,
+        )
+        scored = _run_rule_scan_batch(
+            pending_candidates,
+            tickflow_client=tickflow_client,
+            style=style,
+            batch_size=intraday_batch_size,
+            deadline_at=deadline_at,
+            logs_path=logs_path,
+        )
+        hard_batch_fail = sum(
+            1 for x in scored if "TickFlow批量分时拉取失败" in str(x.fetch_error or "")
+        )
+        if scored and hard_batch_fail >= len(scored):
+            _log("批量接口全部失败，降级到单标的限流模式。", logs_path)
+            scored = []
+
+    if not scored:
+        to_scan_count, planned_over_limit = _plan_intraday_scan_budget(
+            len(pending_candidates),
+            limit_per_min=intraday_limit_per_min,
+            max_over_limit_symbols=max_over_limit_symbols,
+            force_over_limit=force_over_limit,
+        )
+        to_scan = pending_candidates[:to_scan_count]
+        deferred = pending_candidates[to_scan_count:]
+        _log(
+            f"分时扫描预算(single): total={len(pending_candidates)}, to_scan={len(to_scan)}, "
+            f"deferred={len(deferred)}, limit={intraday_limit_per_min}/min, "
+            f"planned_over_limit={planned_over_limit}",
+            logs_path,
+        )
+        if deferred:
+            defer_reason = (
+                f"限流保护：本轮仅扫描前 {len(to_scan)} 只（TickFlow预算 {intraday_limit_per_min}/min，"
+                f"超限缓冲 <= {max_over_limit_symbols} 只）"
+            )
+            for item in deferred:
+                item.fetch_error = defer_reason
+                item.rule_reasons = [defer_reason]
+
+        scored_scanned = _run_rule_scan(
+            to_scan,
+            tickflow_client=tickflow_client,
+            style=style,
+            fetch_concurrency=fetch_concurrency,
+            deadline_at=deadline_at,
+            logs_path=logs_path,
+        )
+        scored = scored_scanned + deferred
+        scored.sort(key=lambda x: (-x.rule_score, x.code))
 
     llm_map, llm_total, llm_success, llm_route_stats = _run_llm_overlay(
         scored,

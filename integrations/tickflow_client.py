@@ -157,6 +157,47 @@ class TickFlowClient:
     def get_intraday(self, symbol: str, *, period: str = "1m", count: int = 500) -> pd.DataFrame:
         return self.get_klines(symbol, period=period, count=count, intraday=True)
 
+    def get_intraday_batch(
+        self,
+        symbols: list[str],
+        *,
+        period: str = "1m",
+        count: int = 500,
+    ) -> dict[str, pd.DataFrame]:
+        """
+        批量查询当日分时 K 线。
+        接口: GET /v1/klines/intraday/batch
+        返回: { "000001.SZ": DataFrame, ... }
+        """
+        p = str(period or "1m").strip()
+        if p not in _PERIOD_SET:
+            raise ValueError(f"不支持的 period: {p}")
+        clean = [normalize_cn_symbol(x) for x in symbols if str(x or "").strip()]
+        clean = sorted(set(x for x in clean if x))
+        if not clean:
+            return {}
+
+        payload = self._request(
+            "/v1/klines/intraday/batch",
+            params={
+                "symbols": ",".join(clean),
+                "period": p,
+                "count": max(int(count), 1),
+            },
+        )
+        raw = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(raw, dict):
+            return {}
+
+        out: dict[str, pd.DataFrame] = {}
+        for sym, kline_payload in raw.items():
+            symbol = normalize_cn_symbol(str(sym or "").strip())
+            if not symbol or not isinstance(kline_payload, dict):
+                continue
+            df = parse_ohlcv_payload({"data": kline_payload})
+            out[symbol] = df
+        return out
+
     def get_quotes(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
         clean = [normalize_cn_symbol(x) for x in symbols if str(x or "").strip()]
         clean = [x for x in clean if x]
