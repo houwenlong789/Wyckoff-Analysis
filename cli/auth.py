@@ -53,6 +53,7 @@ def _create_client():
 def login(email: str, password: str) -> dict[str, Any]:
     """
     用邮箱密码登录 Supabase，返回用户信息。
+    同时将凭证持久化到 wyckoff.json，token 过期时可自动重登。
 
     Returns: {"user_id": str, "email": str, "access_token": str, "refresh_token": str}
     Raises: Exception on auth failure
@@ -67,18 +68,37 @@ def login(email: str, password: str) -> dict[str, Any]:
         "refresh_token": resp.session.refresh_token,
     }
     _save_session(data)
+    # 持久化凭证到 wyckoff.json，用于 token 过期后自动重登
+    save_config_key("email", email)
+    save_config_key("password", password)
     return data
+
+
+def _auto_relogin() -> dict[str, Any] | None:
+    """尝试用 wyckoff.json 中保存的凭证自动重登。"""
+    cfg = _load_config()
+    email = str(cfg.get("email", "") or "").strip()
+    password = str(cfg.get("password", "") or "").strip()
+    if not email or not password:
+        return None
+    try:
+        return login(email, password)
+    except Exception:
+        logger.debug("Auto re-login failed", exc_info=True)
+        return None
 
 
 def restore_session() -> dict[str, Any] | None:
     """
     从 ~/.wyckoff/session.json 恢复登录态。
+    token 过期时自动用保存的凭证重登。
 
     Returns: 同 login() 的返回值，或 None（无 session / token 过期）。
     """
     data = _load_session()
     if not data or not data.get("access_token") or not data.get("refresh_token"):
-        return None
+        # 无 session 文件，尝试自动登录
+        return _auto_relogin()
 
     try:
         client = _create_client()
@@ -87,7 +107,7 @@ def restore_session() -> dict[str, Any] | None:
 
         if not user_resp or not user_resp.user:
             _clear_session()
-            return None
+            return _auto_relogin()
 
         # token 可能被 refresh，更新本地缓存
         session = client.auth.get_session()
@@ -103,7 +123,7 @@ def restore_session() -> dict[str, Any] | None:
         # 仅在 token 确认无效时清除；网络异常保留本地 session
         if "invalid" in err or "expired" in err or "revoked" in err:
             _clear_session()
-            return None
+            return _auto_relogin()
         # 网络问题：保留 session，用本地缓存的 token 继续
         return data
 

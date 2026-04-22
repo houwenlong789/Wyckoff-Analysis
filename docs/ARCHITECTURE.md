@@ -35,7 +35,8 @@
              ┌─────────────┐
              │ Data Sources│
              │             │
-             │ tushare  ★  │
+             │ tickflow ★  │
+             │ tushare     │
              │ akshare     │
              │ baostock    │
              │ efinance    │
@@ -272,7 +273,7 @@ cron (周日-周四 18:25 北京)
 ## 数据源
 
 ```
-tushare(★) → akshare → baostock → efinance   （行情 OHLCV，四级降级）
+tickflow(★) → tushare → akshare → baostock → efinance   （行情 OHLCV，五级降级）
 tushare → akshare + 本地 24h 缓存              （股票列表，代码⇄名字映射）
 ```
 

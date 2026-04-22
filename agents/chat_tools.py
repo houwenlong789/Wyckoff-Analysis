@@ -90,7 +90,7 @@ def _get_user_id(tool_context: ToolContext | None = None) -> str:
 
 def _get_credential(tool_context: ToolContext | None, key: str, env_fallback: str = "") -> str:
     """
-    获取用户凭据：Supabase → 环境变量 → 空串。
+    获取用户凭据：Supabase → wyckoff.json → 环境变量 → 空串。
 
     Args:
         tool_context: ADK 注入的上下文（含 user_id）
@@ -103,6 +103,14 @@ def _get_credential(tool_context: ToolContext | None, key: str, env_fallback: st
         val = str(creds.get(key, "") or "").strip()
         if val:
             return val
+    # 第二层：wyckoff.json 本地配置
+    try:
+        from cli.auth import load_config
+        local_val = str(load_config().get(key, "") or "").strip()
+        if local_val:
+            return local_val
+    except Exception:
+        pass
     # 兜底：环境变量（适用于本地开发 / 未登录场景）
     if env_fallback:
         return os.getenv(env_fallback, "").strip()
@@ -861,14 +869,16 @@ _user_client_cache: dict[str, Any] = {}  # user_id → Client
 
 
 def _get_user_client(tool_context: ToolContext | None):
-    """获取或复用 user client。首次创建时消费 RT 并回写新 token，后续复用。"""
+    """获取或复用 user client。token 变化时重建 client。"""
     if tool_context is None:
         return None
     at = (tool_context.state.get("access_token") or "")
     if not at:
         return None
     user_id = _get_user_id(tool_context)
-    cached = _user_client_cache.get(user_id)
+    # token 变化（如重新登录）时需重建 client
+    cache_key = f"{user_id}:{at[:16]}"
+    cached = _user_client_cache.get(cache_key)
     if cached is not None:
         return cached
     rt = (tool_context.state.get("refresh_token") or "")
@@ -880,7 +890,7 @@ def _get_user_client(tool_context: ToolContext | None):
         tool_context.state["access_token"] = new_at
     if new_rt:
         tool_context.state["refresh_token"] = new_rt
-    _user_client_cache[user_id] = client
+    _user_client_cache[cache_key] = client
     return client
 
 

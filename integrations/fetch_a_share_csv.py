@@ -350,7 +350,7 @@ def get_stocks_by_board(board_name: str = "all") -> list[dict[str, str]]:
 
 
 def _fetch_hist(symbol: str, window: TradingWindow, adjust: str) -> pd.DataFrame:
-    """个股日线：tushare 优先（qfq），失败再回退其它数据源"""
+    """个股日线：tickflow 优先（qfq），失败再回退其它数据源"""
     from integrations.stock_hist_repository import get_stock_hist
 
     context = "auto"

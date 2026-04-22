@@ -119,6 +119,7 @@ class _InputState:
     NONE = "none"
     LOGIN_EMAIL = "login_email"
     LOGIN_PASSWORD = "login_password"
+    CONFIG_KEY = "config_key"
     MODEL_ID = "model_id"
     MODEL_PROVIDER = "model_provider"
     MODEL_KEY = "model_key"
@@ -364,6 +365,7 @@ class WyckoffTUI(App):
             log.write(Text.from_markup(
                 "\n[bold]可用命令[/bold]\n"
                 "  /model   — 切换模型（list/add/rm/default）\n"
+                "  /config  — 数据源配置（tushare_token, tickflow_api_key）\n"
                 "  /login   — 登录\n"
                 "  /logout  — 退出登录\n"
                 "  /token   — Token 用量\n"
@@ -391,6 +393,16 @@ class WyckoffTUI(App):
             self._start_login()
         elif cmd == "/logout":
             self._do_logout()
+        elif cmd == "/config":
+            parts = raw.strip().split(maxsplit=2)
+            if len(parts) == 1:
+                self._show_config()
+            elif parts[1] == "set" and len(parts) >= 3:
+                self._start_config_set(parts[2])
+            else:
+                log.write(Text.from_markup(
+                    "[dim]/config 用法: /config (查看) | /config set tushare_token | /config set tickflow_api_key[/dim]"
+                ))
         elif cmd == "/model":
             parts = raw.strip().split()
             if len(parts) == 1:
@@ -409,6 +421,43 @@ class WyckoffTUI(App):
                 ))
         else:
             log.write(Text.from_markup(f"[red]未知命令: {raw}[/red]，/help 查看"))
+
+    # ----- /config 交互 -----
+
+    _CONFIG_KEYS = {
+        "tushare_token": ("Tushare Token", "TUSHARE_TOKEN", "https://tushare.pro 注册获取"),
+        "tickflow_api_key": ("TickFlow API Key", "TICKFLOW_API_KEY", "https://tickflow.org 注册获取"),
+    }
+
+    def _show_config(self) -> None:
+        log = self.query_one("#chat-log", ChatLog)
+        from cli.auth import load_config
+        cfg = load_config()
+        log.write(Text.from_markup("\n[bold]数据源配置[/bold]"))
+        for key, (label, _, hint) in self._CONFIG_KEYS.items():
+            val = str(cfg.get(key, "") or "").strip()
+            if val:
+                masked = val[:4] + "****" + val[-4:] if len(val) > 8 else "****"
+                log.write(Text.from_markup(f"  {label}: [green]{masked}[/green]"))
+            else:
+                log.write(Text.from_markup(f"  {label}: [dim]未配置[/dim] — {hint}"))
+        log.write(Text.from_markup("\n[dim]使用 /config set tushare_token 或 /config set tickflow_api_key 配置[/dim]"))
+
+    def _start_config_set(self, key: str) -> None:
+        log = self.query_one("#chat-log", ChatLog)
+        inp = self.query_one("#chat-input", Input)
+        key = key.strip().lower()
+        if key not in self._CONFIG_KEYS:
+            log.write(Text.from_markup(f"[red]不支持的配置项: {key}[/red]，可选: {', '.join(self._CONFIG_KEYS)}"))
+            return
+        label, _, hint = self._CONFIG_KEYS[key]
+        log.write(Text.from_markup(f"\n[bold]配置 {label}[/bold]"))
+        log.write(Text.from_markup(f"  {hint}"))
+        log.write(Text.from_markup("  输入值（留空取消）："))
+        inp.placeholder = f"{label}..."
+        inp.password = True
+        self._input_mode = _InputState.CONFIG_KEY
+        self._input_buf = {"config_key": key}
 
     # ----- /login 交互 -----
 
@@ -576,7 +625,20 @@ class WyckoffTUI(App):
             inp.placeholder = "问我关于股票的任何问题... (/help 查看命令)"
             return
 
-        if mode == _InputState.LOGIN_EMAIL:
+        if mode == _InputState.CONFIG_KEY:
+            inp.password = False
+            key = self._input_buf["config_key"]
+            label, env_key, _ = self._CONFIG_KEYS[key]
+            from cli.auth import save_config_key
+            save_config_key(key, text)
+            import os
+            os.environ[env_key] = text
+            log.write(Text.from_markup(f"  [green]✓ {label} 已保存[/green]"))
+            self._input_mode = _InputState.NONE
+            inp.placeholder = "问我关于股票的任何问题... (/help 查看命令)"
+            return
+
+        elif mode == _InputState.LOGIN_EMAIL:
             self._input_buf["email"] = text
             log.write(Text.from_markup(f"  邮箱: {text}"))
             log.write(Text.from_markup("  输入密码："))

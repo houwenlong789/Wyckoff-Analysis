@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""data_source 中 tickflow fallback 链路测试。"""
+"""data_source 中 tickflow 优先链路测试。"""
 from __future__ import annotations
 
 import pandas as pd
@@ -34,12 +34,17 @@ def _disable_other_fallbacks(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DATA_SOURCE_DISABLE_TICKFLOW", raising=False)
 
 
-def test_fetch_stock_hist_falls_back_to_tickflow_when_tushare_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_stock_hist_prefers_tickflow_when_both_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     _disable_other_fallbacks(monkeypatch)
     monkeypatch.setenv("TICKFLOW_API_KEY", "dummy")
     monkeypatch.setattr(ds, "_TICKFLOW_CLIENT", None)
     monkeypatch.setattr(ds, "_TICKFLOW_CLIENT_READY", False)
-    monkeypatch.setattr("integrations.tushare_client.get_pro", lambda: None)
+    monkeypatch.setattr("integrations.tushare_client.get_pro", lambda: object())
+
+    def _raise_tushare_if_called(*args, **kwargs):
+        raise RuntimeError("should_not_call")
+
+    monkeypatch.setattr(ds, "_fetch_stock_tushare", _raise_tushare_if_called)
     monkeypatch.setattr(ds, "_fetch_stock_tickflow", lambda *args, **kwargs: _sample_cn_hist())
 
     out = ds.fetch_stock_hist("600519", "2026-04-10", "2026-04-18", adjust="qfq")
@@ -48,22 +53,22 @@ def test_fetch_stock_hist_falls_back_to_tickflow_when_tushare_missing(monkeypatc
     assert out.iloc[0]["日期"] == "2026-04-18"
 
 
-def test_fetch_stock_hist_falls_back_to_tickflow_when_tushare_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fetch_stock_hist_falls_back_to_tushare_when_tickflow_failed(monkeypatch: pytest.MonkeyPatch) -> None:
     _disable_other_fallbacks(monkeypatch)
     monkeypatch.setenv("TICKFLOW_API_KEY", "dummy")
     monkeypatch.setattr(ds, "_TICKFLOW_CLIENT", None)
     monkeypatch.setattr(ds, "_TICKFLOW_CLIENT_READY", False)
     monkeypatch.setattr("integrations.tushare_client.get_pro", lambda: object())
 
-    def _raise_tushare(*args, **kwargs):
-        raise RuntimeError("tushare timeout")
+    def _raise_tickflow(*args, **kwargs):
+        raise RuntimeError("tickflow timeout")
 
-    monkeypatch.setattr(ds, "_fetch_stock_tushare", _raise_tushare)
-    monkeypatch.setattr(ds, "_fetch_stock_tickflow", lambda *args, **kwargs: _sample_cn_hist())
+    monkeypatch.setattr(ds, "_fetch_stock_tickflow", _raise_tickflow)
+    monkeypatch.setattr(ds, "_fetch_stock_tushare", lambda *args, **kwargs: _sample_cn_hist())
 
     out = ds.fetch_stock_hist("000001", "2026-04-10", "2026-04-18", adjust="qfq")
     assert not out.empty
-    assert out.attrs.get("source") == "tickflow"
+    assert out.attrs.get("source") == "tushare"
 
 
 def test_fetch_stock_hist_error_message_contains_tickflow_chain(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -75,4 +80,4 @@ def test_fetch_stock_hist_error_message_contains_tickflow_chain(monkeypatch: pyt
 
     with pytest.raises(RuntimeError) as exc:
         ds.fetch_stock_hist("000001", "2026-04-10", "2026-04-18", adjust="qfq")
-    assert "tushare→tickflow→akshare→baostock→efinance" in str(exc.value)
+    assert "tickflow→tushare→akshare→baostock→efinance" in str(exc.value)

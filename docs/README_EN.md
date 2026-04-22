@@ -136,7 +136,7 @@ Built-in GitHub Actions cron jobs:
 Daily bar auto-fallback chain:
 
 ```
-tushare → akshare → baostock → efinance
+tickflow → tushare → akshare → baostock → efinance
 ```
 
 When any source is unavailable the system silently falls back to the next — zero intervention required.
@@ -150,7 +150,7 @@ Copy `.env.example` to `.env`. Minimum required:
 | `SUPABASE_URL` / `SUPABASE_KEY` | Auth and cloud sync |
 | `GEMINI_API_KEY` (or another provider's key) | Powers the LLM |
 
-Optional: `TUSHARE_TOKEN` (premium data), `FEISHU_WEBHOOK_URL` (Feishu push), `TG_BOT_TOKEN` + `TG_CHAT_ID` (Telegram push).
+Optional: `TICKFLOW_API_KEY` (TickFlow real-time/intraday), `TUSHARE_TOKEN` (premium data), `FEISHU_WEBHOOK_URL` (Feishu push), `TG_BOT_TOKEN` + `TG_CHAT_ID` (Telegram push).
 
 See the [Architecture doc](ARCHITECTURE.md) for the full config reference and GitHub Actions Secrets setup.
 

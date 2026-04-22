@@ -8,6 +8,7 @@
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
 [![Streamlit](https://img.shields.io/badge/demo-Streamlit-FF4B4B.svg)](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)
+[![Homepage](https://img.shields.io/badge/homepage-Wyckoff%20Homepage-0ea5e9.svg)](https://youngcan-wang.github.io/wyckoff-homepage/)
 
 [English](docs/README_EN.md) | [日本語](docs/README_JA.md) | [Español](docs/README_ES.md) | [한국어](docs/README_KO.md) | [架构文档](docs/ARCHITECTURE.md)
 
@@ -18,6 +19,8 @@
 用自然语言和一位威科夫大师对话。他能调动 10 个量价工具，自主串联多步推理，给出"打还是不打"的结论。
 
 Web + CLI 双通道，Gemini / Claude / OpenAI 三选一，GitHub Actions 定时全自动。
+
+项目主页：**[youngcan-wang.github.io/wyckoff-homepage](https://youngcan-wang.github.io/wyckoff-homepage/)**
 
 ## 功能一览
 
@@ -39,7 +42,7 @@ Web + CLI 双通道，Gemini / Claude / OpenAI 三选一，GitHub Actions 定时
 个股日线自动降级：
 
 ```
-tushare → tickflow → akshare → baostock → efinance
+tickflow → tushare → akshare → baostock → efinance
 ```
 
 任一源不可用时自动切换，无需干预。
@@ -97,6 +100,8 @@ streamlit run streamlit_app.py
 
 在线体验：**[wyckoff-analysis-youngcanphoenix.streamlit.app](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**
 
+项目主页：**[youngcan-wang.github.io/wyckoff-homepage](https://youngcan-wang.github.io/wyckoff-homepage/)**
+
 ## 10 个工具
 
 Agent 的武器库，每一个都连接真实的量价引擎：
@@ -153,7 +158,7 @@ Agent 的武器库，每一个都连接真实的量价引擎：
 | `SUPABASE_URL` / `SUPABASE_KEY` | 登录与云端同步 |
 | `GEMINI_API_KEY`（或其他厂商 Key） | LLM 驱动 |
 
-可选配置：`TUSHARE_TOKEN`（高级数据）、`TICKFLOW_API_KEY`（TickFlow 实时/分时数据）、`FEISHU_WEBHOOK_URL`（飞书推送）、`TG_BOT_TOKEN` + `TG_CHAT_ID`（Telegram 私人推送）。
+可选配置：`TICKFLOW_API_KEY`（TickFlow 实时/分时数据，日线主链路优先）、`TUSHARE_TOKEN`（高级数据次优先回退）、`FEISHU_WEBHOOK_URL`（飞书推送）、`TG_BOT_TOKEN` + `TG_CHAT_ID`（Telegram 私人推送）。
 
 > Tushare 注册推荐：[此链接注册](https://tushare.pro/weborder/#/login?reg=955650)，双方可提升数据权益。
 

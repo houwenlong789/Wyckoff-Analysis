@@ -337,7 +337,7 @@ with content_col:
         # 3. 数据源
         st.subheader("📊 数据源配置")
         with st.container(border=True):
-            st.markdown("**Tushare Token**（可选）用于行情、市值等。不配置时优先用 akshare/baostock/efinance，三者均失败时才需 Tushare。")
+            st.markdown("**Tushare Token**（可选）用于高级补充数据。日线主链路默认优先 TickFlow，不可用时再回退 Tushare/akshare/baostock/efinance。")
             new_tushare = st.text_input(
                 "Tushare Token",
                 value=st.session_state.tushare_token,

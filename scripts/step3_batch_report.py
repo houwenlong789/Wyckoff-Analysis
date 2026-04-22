@@ -9,6 +9,7 @@ import os
 import re
 import sys
 from datetime import date, datetime
+from typing import Any
 
 import pandas as pd
 
@@ -102,11 +103,11 @@ STEP3_SKIP_LLM = os.getenv("STEP3_SKIP_LLM", "0").strip().lower() in {
 STEP3_RESPECT_UPSTREAM_PRIORITY = os.getenv(
     "STEP3_RESPECT_UPSTREAM_PRIORITY", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
-STEP3_SEND_COMPLIANCE_COPY = os.getenv(
-    "STEP3_SEND_COMPLIANCE_COPY", "1"
+STEP3_SEND_COMPLIANCE_BRIEF = os.getenv(
+    "STEP3_SEND_COMPLIANCE_BRIEF", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
-STEP3_COMPLIANCE_WATCHLIST_MAX = max(
-    int(os.getenv("STEP3_COMPLIANCE_WATCHLIST_MAX", "8")),
+STEP3_COMPLIANCE_FOCUS_LIMIT = max(
+    int(os.getenv("STEP3_COMPLIANCE_FOCUS_LIMIT", "5")),
     1,
 )
 
@@ -543,163 +544,108 @@ def _strip_report_title(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _extract_markdown_section(content: str, header_contains: str) -> list[str]:
-    """抽取 markdown 二级标题下的文本，遇到下一个二级标题或分隔线即停止。"""
-    lines = str(content or "").splitlines()
-    picked: list[str] = []
-    in_section = False
-    for raw in lines:
-        line = raw.rstrip("\n")
-        stripped = line.strip()
-        if stripped.startswith("## "):
-            if in_section:
-                break
-            in_section = header_contains in stripped
-            continue
-        if in_section:
-            if stripped == "---":
-                break
-            picked.append(line)
-    return picked
+def _fmt_pct(v: Any) -> str:
+    num = pd.to_numeric(v, errors="coerce")
+    if pd.isna(num):
+        return "待更新"
+    x = float(num)
+    sign = "+" if x >= 0 else ""
+    return f"{sign}{x:.2f}%"
 
 
-def _extract_market_temperature(content: str) -> str:
-    for raw in str(content or "").splitlines():
-        if "大盘水温与资金偏好" not in raw:
-            continue
-        _, _, tail = raw.partition("：")
-        val = (tail or raw).strip()
-        if val:
-            return val
-    return ""
+def _build_compliance_brief(
+    *,
+    benchmark_context: dict,
+    selected_df: pd.DataFrame,
+    ops_codes: list[str],
+    code_name: dict[str, str],
+) -> str:
+    regime = str((benchmark_context or {}).get("regime", "NEUTRAL") or "NEUTRAL").strip().upper()
+    main_today_pct = _fmt_pct((benchmark_context or {}).get("main_today_pct"))
+    recent3_cum_pct = _fmt_pct((benchmark_context or {}).get("recent3_cum_pct"))
+    breadth = (benchmark_context or {}).get("breadth", {}) or {}
+    breadth_ratio = _fmt_pct(breadth.get("ratio_pct"))
+    vol_state = str((benchmark_context or {}).get("main_volume_state", "") or "").strip() or "待更新"
 
+    sec_df = selected_df.copy() if isinstance(selected_df, pd.DataFrame) else pd.DataFrame()
+    if not sec_df.empty:
+        sec_df["industry"] = sec_df.get("industry", "").astype(str).str.strip()
+        sec_df = sec_df[sec_df["industry"] != ""]
+        score_series = pd.to_numeric(sec_df.get("priority_score"), errors="coerce")
+        score_series = score_series.where(score_series.notna(), pd.to_numeric(sec_df.get("funnel_score"), errors="coerce"))
+        sec_df["score"] = score_series.fillna(0.0)
 
-def _extract_rag_digest(content: str) -> list[str]:
-    """提取 RAG 防雷摘要中的关键数字，控制 B 版篇幅。"""
-    lines = _extract_markdown_section(content, "RAG 防雷执行摘要")
-    if not lines:
-        return []
-    allow_prefixes = (
-        "- 扫描股票:",
-        "- 外部检索成功:",
-        "- 有效相关新闻:",
-        "- veto 剔除:",
-        "- 执行状态:",
-        "- 原因:",
-    )
-    picked: list[str] = []
-    for raw in lines:
-        s = raw.strip()
-        if not s:
-            continue
-        if s.startswith(allow_prefixes):
-            picked.append(s[2:].strip() if s.startswith("- ") else s)
-    return picked[:4]
+    strong_lines: list[str] = []
+    if not sec_df.empty:
+        grouped = (
+            sec_df.groupby("industry", as_index=False)
+            .agg(cnt=("code", "count"), score=("score", "mean"))
+            .sort_values(["cnt", "score"], ascending=[False, False])
+            .head(3)
+        )
+        for _, row in grouped.iterrows():
+            strong_lines.append(f"- {str(row['industry'])}（样本{int(row['cnt'])}）")
 
-
-def _extract_watchlist_preview(content: str, limit: int) -> list[str]:
-    lines = _extract_markdown_section(content, "处于起跳板速览")
-    items: list[str] = []
-    seen: set[str] = set()
-    for raw in lines:
-        s = raw.strip()
-        if not s.startswith("- "):
-            continue
-        payload = s[2:].strip()
-        if not payload or payload == "无" or payload in seen:
-            continue
-        seen.add(payload)
-        items.append(payload)
-        if len(items) >= limit:
+    focus_codes: list[str] = []
+    for c in ops_codes:
+        cc = str(c).strip()
+        if cc and cc not in focus_codes:
+            focus_codes.append(cc)
+        if len(focus_codes) >= STEP3_COMPLIANCE_FOCUS_LIMIT:
             break
-    return items
+    if len(focus_codes) < STEP3_COMPLIANCE_FOCUS_LIMIT and not sec_df.empty:
+        ranked = sec_df.sort_values("score", ascending=False)
+        for code in ranked["code"].astype(str).tolist():
+            cc = code.strip()
+            if cc and cc not in focus_codes:
+                focus_codes.append(cc)
+            if len(focus_codes) >= STEP3_COMPLIANCE_FOCUS_LIMIT:
+                break
 
+    focus_lines = [f"- {c} {code_name.get(c, c)}" for c in focus_codes]
 
-def _collect_camp_counts(content: str) -> tuple[int, int, int]:
-    """按三阵营统计去重后的股票代码数量。"""
-    buckets: dict[str, set[str]] = {
-        "invalidated": set(),
-        "building": set(),
-        "springboard": set(),
-    }
-    active_bucket: str | None = None
-    for raw in str(content or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if "逻辑破产" in line:
-            active_bucket = "invalidated"
-            continue
-        if "储备营地" in line:
-            active_bucket = "building"
-            continue
-        if "处于起跳板" in line:
-            active_bucket = "springboard"
-            continue
-        if line.startswith("## "):
-            active_bucket = None
-            continue
-        if not active_bucket:
-            continue
-        for code in re.findall(r"\b\d{6}\b", line):
-            buckets[active_bucket].add(code)
-    return (
-        len(buckets["invalidated"]),
-        len(buckets["building"]),
-        len(buckets["springboard"]),
-    )
-
-
-def _to_compliance_copy(content: str) -> str:
-    """
-    生成一份可对外传播的 B 版合规简报：
-    - 不复刻完整长文；
-    - 仅保留关键统计 + 少量观察名单 + 合规声明。
-    """
-    text = str(content or "")
-    invalidated_n, building_n, springboard_n = _collect_camp_counts(text)
-    market_note = _extract_market_temperature(text)
-    rag_digest = _extract_rag_digest(text)
-    watchlist = _extract_watchlist_preview(text, STEP3_COMPLIANCE_WATCHLIST_MAX)
-
-    out_lines: list[str] = [
-        "## 📌 B版合规简报（精简）",
-        f"- 日期: {date.today().strftime('%Y-%m-%d')}",
-        "- 定位: 仅用于市场研究与投资者教育，不构成个股推荐或交易指令。",
-        "- 详细技术细节与完整论证请参考 A 版内部报告。",
+    out: list[str] = [
+        "## 📌 今日市场观察简报（合规版）",
+        "",
+        "⚠️ **重要提示：以下内容由大模型自动生成，仅用于市场研究交流，不构成任何投资建议；股市有风险，投资需谨慎。**",
+        "",
+        "### 一、今日大盘数据",
         (
-            f"- 三阵营统计: 逻辑破产 {invalidated_n} | "
-            f"储备营地 {building_n} | 起跳板观察 {springboard_n}"
+            f"- 市场状态: {regime} | 当日涨跌: {main_today_pct} | "
+            f"近3日累计: {recent3_cum_pct} | 市场广度: {breadth_ratio} | 量能状态: {vol_state}"
         ),
+        "- 说明: 上述为客观量价观察，不构成交易建议。",
+        "",
+        "### 二、AI分析强势板块",
     ]
-    if market_note:
-        out_lines.append(f"- 市场观察: {market_note}")
-    if rag_digest:
-        out_lines.append(f"- 防雷摘要: {'；'.join(rag_digest)}")
-
-    out_lines.append("")
-    out_lines.append(f"## 👀 起跳板观察名单（最多{STEP3_COMPLIANCE_WATCHLIST_MAX}只）")
-    if watchlist:
-        for item in watchlist:
-            out_lines.append(f"- {item}")
+    if strong_lines:
+        out.extend(strong_lines)
     else:
-        out_lines.append("- 无")
+        out.append("- 暂无明显强势板块（样本不足或分化明显）")
 
-    out_lines.extend(
+    out.extend(
         [
             "",
-            "## 🧾 A/B/C 判定口径（简）",
-            "- A：出现缩量测试/拒绝下跌，说明抛压在收敛。",
-            "- B：出现放量突破并站稳关键位，说明需求占优。",
-            "- C：关键支撑位多次测试有效，说明结构未破坏。",
-            "",
-            "## ⚖️ 合规声明",
-            "- 本文不含买卖点、仓位建议、收益承诺及代客操作安排。",
-            "- 不提供代客理财、代客下单、收益分成等服务。",
-            "- 市场有风险，投资决策请独立判断并自行承担风险。",
+            "### 三、今日值得关注（研究观察）",
         ]
     )
-    return "\n".join(out_lines).strip()
+    if focus_lines:
+        out.extend(focus_lines)
+    else:
+        out.append("- 今日暂无明确观察标的")
+
+    out.extend(
+        [
+            "",
+            "### 合规声明",
+            "- 以下内容为大模型自动生成结果，仅供参考。",
+            "- 本简报仅用于市场研究与信息交流，不构成个股推荐或买卖建议。",
+            "- 不承诺收益，不涉及代客理财或代客下单。",
+            "- **股市有风险，投资需谨慎。**",
+            "- 投资决策请独立判断并自行承担风险。",
+        ]
+    )
+    return "\n".join(out).strip() + "\n"
 
 
 def _call_track_report(
@@ -1141,11 +1087,21 @@ def run(
             title = f"📄 批量研报 {date.today().strftime('%Y-%m-%d')}"
             if not _notify_all(title, content):
                 return (False, "feishu_failed", report)
-            if STEP3_SEND_COMPLIANCE_COPY:
-                compliance_title = f"📄 批量研报 B版（合规版） {date.today().strftime('%Y-%m-%d')}"
-                compliance_content = "【B版简版报告】\n\n" + _to_compliance_copy(content)
+            if STEP3_SEND_COMPLIANCE_BRIEF:
+                compliance_title = f"📄 市场观察简报（合规版） {date.today().strftime('%Y-%m-%d')}"
+                compliance_name_map = {
+                    str(x.get("code", "")).strip(): str(x.get("name", x.get("code", ""))).strip()
+                    for x in items
+                    if isinstance(x, dict) and str(x.get("code", "")).strip()
+                }
+                compliance_content = _build_compliance_brief(
+                    benchmark_context=benchmark_context or {},
+                    selected_df=selected_df,
+                    ops_codes=[],
+                    code_name=compliance_name_map,
+                )
                 if not _notify_all(compliance_title, compliance_content):
-                    print("[step3] 合规版飞书推送失败（原文已发送）")
+                    print("[step3] 合规简报推送失败（主报告已发送）")
         return (True, "ok", report)
 
     payloads_by_track: dict[str, list[str]] = {"Trend": [], "Accum": []}
@@ -1388,11 +1344,16 @@ def run(
         if not _notify_all(title, content):
             print("[step3] 飞书推送失败")
             return (False, "feishu_failed", report)
-        if STEP3_SEND_COMPLIANCE_COPY:
-            compliance_title = f"📄 批量研报 B版（合规版） {date.today().strftime('%Y-%m-%d')}"
-            compliance_content = "【B版简版报告】\n\n" + _to_compliance_copy(content)
+        if STEP3_SEND_COMPLIANCE_BRIEF:
+            compliance_title = f"📄 市场观察简报（合规版） {date.today().strftime('%Y-%m-%d')}"
+            compliance_content = _build_compliance_brief(
+                benchmark_context=benchmark_context or {},
+                selected_df=selected_df,
+                ops_codes=ops_codes,
+                code_name=code_name,
+            )
             if not _notify_all(compliance_title, compliance_content):
-                print("[step3] 合规版飞书推送失败（原文已发送）")
+                print("[step3] 合规简报推送失败（主报告已发送）")
     print(
         f"[step3] 研报发送成功，股票数={sum(len(payloads_by_track.get(t, [])) for t in active_tracks)}，"
         f"拉取失败数={len(failed)}"
