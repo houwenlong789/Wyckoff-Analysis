@@ -19,6 +19,12 @@ from rich.markdown import Markdown
 from rich.spinner import Spinner
 from rich.text import Text
 
+from cli.loop_guard import (
+    build_retry_exhausted_warning,
+    build_retry_user_message,
+    missing_required_tool,
+    resolve_turn_expectation,
+)
 from cli.providers.base import LLMProvider
 from cli.tools import ToolRegistry
 
@@ -27,6 +33,7 @@ logger = logging.getLogger(__name__)
 _THINKING_TEXT = Text.from_markup("  [dim]思考中…[/dim]")
 
 MAX_TOOL_ROUNDS = 15
+MAX_INCOMPLETE_TOOL_RETRIES = 2
 
 
 def run(
@@ -48,6 +55,9 @@ def run(
     total_input = 0
     total_output = 0
     t_start = time.monotonic()
+    expectation = resolve_turn_expectation(messages)
+    incomplete_tool_retries = 0
+    used_tools_this_turn: list[str] = []
 
     for round_idx in range(MAX_TOOL_ROUNDS):
         text_buf = ""
@@ -149,6 +159,7 @@ def run(
                 name = call["name"]
                 args = call["args"]
                 call_id = call["id"]
+                used_tools_this_turn.append(name)
 
                 if on_tool_call:
                     on_tool_call(name, args)
@@ -167,7 +178,29 @@ def run(
             # 继续下一轮
             continue
 
+        if (
+            missing_required_tool(expectation, used_tools_this_turn)
+            and incomplete_tool_retries < MAX_INCOMPLETE_TOOL_RETRIES
+        ):
+            retry_prompt = build_retry_user_message(expectation, text_buf)
+            incomplete_tool_retries += 1
+            logger.info(
+                "loop_guard retry=%d required_tool=%s reason=%s",
+                incomplete_tool_retries,
+                expectation.required_tool if expectation else "",
+                expectation.reason if expectation else "",
+            )
+            if text_buf:
+                messages.append({"role": "assistant", "content": text_buf})
+            messages.append({"role": "user", "content": retry_prompt})
+            if console:
+                console.print("  [yellow]⚠ 检测到模型未执行必需工具，已自动要求继续执行[/yellow]")
+            continue
+
         # 纯文本回答 — 完成
+        if missing_required_tool(expectation, used_tools_this_turn):
+            warning = build_retry_exhausted_warning(expectation, incomplete_tool_retries)
+            text_buf = f"{warning}\n\n{text_buf}".strip()
         messages.append({"role": "assistant", "content": text_buf})
         elapsed = time.monotonic() - t_start
         return {

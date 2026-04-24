@@ -21,6 +21,13 @@ from textual.binding import Binding
 from textual.widgets import Input, OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
+from cli.loop_guard import (
+    build_retry_exhausted_warning,
+    build_retry_user_message,
+    missing_required_tool,
+    resolve_turn_expectation,
+)
+
 
 # ---------------------------------------------------------------------------
 # Widget
@@ -47,6 +54,8 @@ _COMPACTION_PROMPT = """请将以下对话历史总结为简洁的上下文摘�
 4. 未完成的任务
 
 用中文输出，控制在 500 字以内。只输出摘要，不要其他内容。"""
+
+_MAX_INCOMPLETE_TOOL_RETRIES = 2
 
 
 def _pop_lines(log_widget, n: int) -> None:
@@ -818,6 +827,9 @@ class WyckoffTUI(App):
         _user_text = self._messages[-1]["content"] if self._messages else ""
         _model_name = getattr(self._provider, "name", "") if self._provider else ""
         _provider_name = self._state.get("provider_name", "") if self._state else ""
+        expectation = resolve_turn_expectation(self._messages)
+        incomplete_tool_retries = 0
+        used_tools_this_turn: list[str] = []
         self._agent_log.info("session=%s user: %s", self._session_id, _user_text[:200])
         _chatlog_save = self._chatlog_save  # bound method ref
 
@@ -960,6 +972,7 @@ class WyckoffTUI(App):
                         args = call["args"]
                         call_id = call["id"]
                         display = self._tools.display_name(name)
+                        used_tools_this_turn.append(name)
 
                         # ── Doom-loop 检测 ──
                         args_hash = hash(json.dumps(args, sort_keys=True, ensure_ascii=False))
@@ -1009,7 +1022,36 @@ class WyckoffTUI(App):
                         continue
                     # doom-loop 中止：不再继续下一轮，走到最终输出
 
+                if (
+                    missing_required_tool(expectation, used_tools_this_turn)
+                    and incomplete_tool_retries < _MAX_INCOMPLETE_TOOL_RETRIES
+                ):
+                    retry_prompt = build_retry_user_message(expectation, text_buf)
+                    incomplete_tool_retries += 1
+                    self._agent_log.info(
+                        "session=%s loop_guard retry=%d required_tool=%s reason=%s",
+                        self._session_id,
+                        incomplete_tool_retries,
+                        expectation.required_tool if expectation else "",
+                        expectation.reason if expectation else "",
+                    )
+                    if _streaming_started and _stream_write_count > 0:
+                        self.call_from_thread(_pop_lines, log, _stream_write_count + 1)
+                        _stream_write_count = 0
+                        _streaming_started = False
+                    _write(Text.from_markup(
+                        "  [yellow]⚠ 模型未执行必需工具，已自动要求继续执行[/yellow]"
+                    ))
+                    _scroll()
+                    if text_buf:
+                        self._messages.append({"role": "assistant", "content": text_buf})
+                    self._messages.append({"role": "user", "content": retry_prompt})
+                    continue
+
                 # ── 最终输出 ──
+                if missing_required_tool(expectation, used_tools_this_turn):
+                    warning = build_retry_exhausted_warning(expectation, incomplete_tool_retries)
+                    text_buf = f"{warning}\n\n{text_buf}".strip()
                 self._messages.append({"role": "assistant", "content": text_buf})
                 if text_buf:
                     if _streaming_started and _stream_write_count > 0:
