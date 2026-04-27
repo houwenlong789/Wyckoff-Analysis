@@ -48,7 +48,7 @@ from integrations.supabase_market_signal import (
 from integrations.supabase_portfolio import load_portfolio_state
 from integrations.tickflow_notice import TICKFLOW_LIMIT_HINT, is_tickflow_rate_limited_error
 from integrations.tickflow_client import TickFlowClient, normalize_cn_symbol
-from utils.feishu import send_feishu_notification
+from utils.feishu import send_feishu_notification, send_tail_buy_card
 from utils.notify import send_to_telegram
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -1269,7 +1269,14 @@ def _send_notifications(
     tg_ok = False
     if feishu_webhook:
         try:
-            feishu_ok = bool(send_feishu_notification(feishu_webhook, title, report))
+            use_rich_card = _env_flag("FEISHU_TAIL_BUY_RICH_CARD", True)
+            if use_rich_card:
+                feishu_ok = bool(send_tail_buy_card(feishu_webhook, title, report))
+                if not feishu_ok:
+                    _log("Tail Buy 富卡片发送失败，降级为文本卡片重试。", logs_path)
+                    feishu_ok = bool(send_feishu_notification(feishu_webhook, title, report))
+            else:
+                feishu_ok = bool(send_feishu_notification(feishu_webhook, title, report))
         except Exception as e:
             _log(f"飞书推送异常: {e}", logs_path)
             feishu_ok = False
