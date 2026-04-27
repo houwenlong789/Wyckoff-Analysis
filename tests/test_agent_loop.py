@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from cli.loop_guard import check_doom_loop, resolve_turn_expectation
+from cli.tools import CONFIRM_TOOLS, ToolRegistry
 from tests.helpers.agent_loop_harness import AgentLoopHarness
 
 
@@ -226,3 +227,38 @@ class TestCheckDoomLoop:
 
         doom_msgs = [m for m in outcome["messages"] if m.get("role") == "tool" and "doom-loop" in m.get("content", "")]
         assert len(doom_msgs) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tool confirm callback
+# ---------------------------------------------------------------------------
+
+class TestToolConfirm:
+    def test_confirm_tools_constant(self):
+        assert "exec_command" in CONFIRM_TOOLS
+        assert "write_file" in CONFIRM_TOOLS
+        assert "update_portfolio" in CONFIRM_TOOLS
+        assert "get_stock_price" not in CONFIRM_TOOLS
+
+    def test_deny_blocks_execution(self):
+        registry = ToolRegistry()
+        registry.set_confirm_callback(lambda name, args: {"action": "deny"})
+        result = registry.execute("exec_command", {"command": "echo hi"})
+        assert "error" in result
+        assert "拒绝" in result["error"]
+
+    def test_always_skips_subsequent_confirms(self):
+        calls = []
+        def _confirm(name, args):
+            calls.append(name)
+            return {"action": "always"}
+        registry = ToolRegistry()
+        registry.set_confirm_callback(_confirm)
+        registry.execute("exec_command", {"command": "echo 1"})
+        registry.execute("exec_command", {"command": "echo 2"})
+        assert len(calls) == 1
+
+    def test_no_callback_skips_confirm(self):
+        registry = ToolRegistry()
+        result = registry.execute("exec_command", {"command": "echo hi"})
+        assert "error" not in result or "拒绝" not in result.get("error", "")

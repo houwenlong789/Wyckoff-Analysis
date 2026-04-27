@@ -315,6 +315,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 # 后台执行的长任务工具
 BACKGROUND_TOOLS = {"screen_stocks", "generate_ai_report", "generate_strategy_decision", "run_backtest"}
 
+# 需要用户确认的高风险写操作工具
+CONFIRM_TOOLS = {"exec_command", "write_file", "update_portfolio"}
+
 # 工具中文显示名，用于终端展示
 TOOL_DISPLAY_NAMES: dict[str, str] = {
     "search_stock_by_name": "搜索股票",
@@ -360,10 +363,16 @@ class ToolRegistry:
         self._tools = self._register_tools()
         self._bg_manager = None
         self._on_bg_complete = None
+        self._confirm_callback = None
+        self._always_allowed: set[str] = set()
 
     def set_provider(self, provider):
         """注入 LLM Provider，供委派工具启动 sub-agent。"""
         self._tool_context.provider = provider
+
+    def set_confirm_callback(self, callback):
+        """注入确认回调，高风险工具执行前会调用。callback(name, args) -> dict。"""
+        self._confirm_callback = callback
 
     def set_background_manager(self, bg_manager, on_complete=None):
         from cli.background import BackgroundTaskManager
@@ -443,6 +452,17 @@ class ToolRegistry:
         fn = self._tools.get(name)
         if fn is None:
             return {"error": f"未知工具: {name}"}
+
+        # 高风险工具确认
+        if name in CONFIRM_TOOLS and self._confirm_callback and name not in self._always_allowed:
+            confirm = self._confirm_callback(name, args)
+            action = confirm.get("action", "deny")
+            if action == "deny":
+                return {"error": "用户拒绝执行此操作"}
+            if action == "always":
+                self._always_allowed.add(name)
+            if action == "edit":
+                args = confirm.get("modified_args", args)
 
         # 用副本注入 tool_context，避免污染原始 args（会被序列化进 messages）
         call_args = dict(args)

@@ -18,6 +18,8 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import Vertical
+from textual.screen import ModalScreen
 from textual.widgets import Input, OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
@@ -147,6 +149,130 @@ class _InputState:
 
 
 # ---------------------------------------------------------------------------
+# 工具确认弹窗
+# ---------------------------------------------------------------------------
+
+class ToolConfirmScreen(ModalScreen[dict]):
+    """高风险工具执行前的确认弹窗。"""
+
+    DEFAULT_CSS = """
+    ToolConfirmScreen {
+        align: center middle;
+    }
+    #confirm-box {
+        width: 64;
+        max-height: 20;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #confirm-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #confirm-summary {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #confirm-options {
+        height: auto;
+        max-height: 6;
+    }
+    #confirm-edit {
+        display: none;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", show=False)]
+
+    def __init__(self, tool_name: str, args: dict, display_name: str):
+        super().__init__()
+        self.tool_name = tool_name
+        self.tool_args = args
+        self.display_name = display_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-box"):
+            yield Static(
+                f"⚠ [bold]{self.display_name}[/bold] 需要确认",
+                id="confirm-title",
+            )
+            yield Static(self._format_summary(), id="confirm-summary")
+            yield OptionList(
+                Option("允许一次", id="once"),
+                Option("本次会话总是允许", id="always"),
+                Option("修改后执行", id="edit"),
+                Option("不允许", id="deny"),
+                id="confirm-options",
+            )
+            yield Input(
+                value=self._editable_value(),
+                placeholder="修改后按 Enter 执行",
+                id="confirm-edit",
+            )
+
+    def _format_summary(self) -> str:
+        if self.tool_name == "exec_command":
+            return f"  命令: {self.tool_args.get('command', '')}"
+        if self.tool_name == "write_file":
+            path = self.tool_args.get("path", "")
+            size = len(self.tool_args.get("content", ""))
+            return f"  路径: {path}\n  内容: {size} 字符"
+        if self.tool_name == "update_portfolio":
+            action = self.tool_args.get("action", "")
+            code = self.tool_args.get("code", "")
+            parts = [f"操作: {action}"]
+            if code:
+                parts.append(f"代码: {code}")
+            shares = self.tool_args.get("shares")
+            if shares:
+                parts.append(f"股数: {shares}")
+            cost = self.tool_args.get("cost_price")
+            if cost:
+                parts.append(f"成本: {cost}")
+            cash = self.tool_args.get("free_cash")
+            if cash is not None:
+                parts.append(f"现金: {cash}")
+            return "  " + "  ".join(parts)
+        return f"  {json.dumps(self.tool_args, ensure_ascii=False)}"
+
+    def _editable_value(self) -> str:
+        if self.tool_name == "exec_command":
+            return self.tool_args.get("command", "")
+        if self.tool_name == "write_file":
+            return self.tool_args.get("path", "")
+        return json.dumps(self.tool_args, ensure_ascii=False)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_id == "edit":
+            self.query_one("#confirm-options").display = False
+            edit_input = self.query_one("#confirm-edit", Input)
+            edit_input.display = True
+            edit_input.focus()
+        else:
+            self.dismiss({"action": event.option_id})
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "confirm-edit":
+            return
+        modified = dict(self.tool_args)
+        if self.tool_name == "exec_command":
+            modified["command"] = event.value
+        elif self.tool_name == "write_file":
+            modified["path"] = event.value
+        else:
+            try:
+                modified = json.loads(event.value)
+            except json.JSONDecodeError:
+                pass
+        self.dismiss({"action": "edit", "modified_args": modified})
+
+    def action_cancel(self) -> None:
+        self.dismiss({"action": "deny"})
+
+
+# ---------------------------------------------------------------------------
 # 主应用
 # ---------------------------------------------------------------------------
 
@@ -219,6 +345,7 @@ class WyckoffTUI(App):
         self._bg_manager = BackgroundTaskManager()
         if self._tools:
             self._tools.set_background_manager(self._bg_manager, self._on_bg_complete)
+            self._tools.set_confirm_callback(self._request_tool_confirm)
         # 交互式输入状态
         self._input_mode = _InputState.NONE
         self._input_buf: dict[str, str] = {}
@@ -268,6 +395,27 @@ class WyckoffTUI(App):
 
     def _update_status(self) -> None:
         self.query_one("#status-bar", StatusBar).update(self._build_status_text())
+
+    # ----- 工具确认 -----
+
+    def _request_tool_confirm(self, name: str, args: dict) -> dict:
+        """从 worker 线程调用，阻塞直到用户在弹窗中做出选择。"""
+        import threading as _th
+
+        event = _th.Event()
+        result: list[dict | None] = [None]
+        display = self._tools.display_name(name) if self._tools else name
+
+        def _on_dismiss(choice: dict) -> None:
+            result[0] = choice
+            event.set()
+
+        def _show() -> None:
+            self.push_screen(ToolConfirmScreen(name, args, display), _on_dismiss)
+
+        self.call_from_thread(_show)
+        event.wait(timeout=120)
+        return result[0] or {"action": "deny"}
 
     # ----- 快捷键动作 -----
 
