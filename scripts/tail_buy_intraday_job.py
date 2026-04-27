@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 if __name__ == "__main__" or not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.constants import TABLE_PORTFOLIOS, TABLE_SIGNAL_PENDING
+from core.constants import TABLE_PORTFOLIOS, TABLE_RECOMMENDATION_TRACKING, TABLE_SIGNAL_PENDING
 from core.tail_buy_strategy import (
     DECISION_BUY,
     DECISION_SKIP,
@@ -50,7 +50,6 @@ from integrations.tickflow_notice import TICKFLOW_LIMIT_HINT, is_tickflow_rate_l
 from integrations.tickflow_client import TickFlowClient, normalize_cn_symbol
 from utils.feishu import send_feishu_notification
 from utils.notify import send_to_telegram
-from utils.trading_clock import resolve_end_calendar_day
 
 TZ = ZoneInfo("Asia/Shanghai")
 TICKFLOW_UPGRADE_HINT = TICKFLOW_LIMIT_HINT
@@ -172,6 +171,42 @@ def _safe_float(raw: Any, default: float = 0.0) -> float:
         return float(text)
     except Exception:
         return default
+
+
+def _normalize_iso_date(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+        return text[:10]
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) == 8:
+        return f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]}"
+    return ""
+
+
+def _normalize_yyyymmdd(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 8:
+        return digits[:8]
+    return ""
+
+
+def _normalize_code6(raw: Any) -> str:
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if not digits:
+        return ""
+    return digits[-6:].zfill(6)
+
+
+def _safe_bool(raw: Any) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw or "").strip().lower()
+    return text in {"1", "true", "yes", "on", "t"}
 
 
 def _resolve_quote_price(quote: dict[str, Any] | None) -> float:
@@ -608,15 +643,19 @@ def _resolve_trade_dates(logs_path: str | None = None) -> tuple[str, str]:
     """
     返回 (前一交易日, 当前交易日)。
     """
-    end_day = resolve_end_calendar_day()
+    calendar_today = _now().date()
     try:
-        window = _resolve_trading_window(end_calendar_day=end_day, trading_days=2)
+        window = _resolve_trading_window(end_calendar_day=calendar_today, trading_days=2)
         prev_trade = window.start_trade_date.isoformat()
         today_trade = window.end_trade_date.isoformat()
+        # 周末/节假日：今天不是交易日，则将“前一交易日”定位为最新交易日，
+        # 以便尾盘任务仍分析最新一日推荐池，而不是回退到更早一天。
+        if window.end_trade_date < calendar_today:
+            prev_trade = today_trade
         return prev_trade, today_trade
     except Exception as e:
-        prev_trade = (end_day - timedelta(days=1)).isoformat()
-        today_trade = end_day.isoformat()
+        prev_trade = (calendar_today - timedelta(days=1)).isoformat()
+        today_trade = calendar_today.isoformat()
         _log(
             f"交易日历解析失败，降级为自然日: prev={prev_trade}, today={today_trade}, err={e}",
             logs_path,
@@ -659,11 +698,146 @@ def _load_signal_pending_candidates(target_signal_date: str, logs_path: str | No
             raise RuntimeError(f"读取 signal_pending 失败: {e}") from e
 
     picked = pick_tail_candidates(rows, target_signal_date=target_signal_date)
+    _log(f"signal_pending 候选加载: raw={len(rows)}, picked={len(picked)}, signal_date={target_signal_date}", logs_path)
+    return picked
+
+
+def _load_recommendation_tracking_candidates(
+    target_signal_date: str,
+    logs_path: str | None = None,
+) -> list[TailBuyCandidate]:
+    if not is_admin_configured():
+        raise RuntimeError("Supabase 凭据未配置，无法读取 recommendation_tracking")
+
+    client = create_admin_client()
+    target_yyyymmdd = target_signal_date.replace("-", "")
+    rows: list[dict[str, Any]] = []
+    try:
+        rows = (
+            client.table(TABLE_RECOMMENDATION_TRACKING)
+            .select("code,name,recommend_date,funnel_score,is_ai_recommended")
+            .eq("recommend_date", int(target_yyyymmdd))
+            .limit(5000)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as e:
+        _log(f"recommendation_tracking 精确查询失败，尝试宽松查询: {e}", logs_path)
+
+    if not rows:
+        try:
+            rows = (
+                client.table(TABLE_RECOMMENDATION_TRACKING)
+                .select("code,name,recommend_date,funnel_score,is_ai_recommended")
+                .order("recommend_date", desc=True)
+                .limit(10000)
+                .execute()
+                .data
+                or []
+            )
+        except Exception as e:
+            raise RuntimeError(f"读取 recommendation_tracking 失败: {e}") from e
+
+    picked_map: dict[str, TailBuyCandidate] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        rec_date = _normalize_yyyymmdd(row.get("recommend_date"))
+        if rec_date != target_yyyymmdd:
+            continue
+        code = _normalize_code6(row.get("code"))
+        if not code:
+            continue
+        status = "confirmed" if _safe_bool(row.get("is_ai_recommended")) else "pending"
+        candidate = TailBuyCandidate(
+            code=code,
+            name=str(row.get("name", "") or code).strip() or code,
+            signal_date=_normalize_iso_date(target_signal_date) or target_signal_date,
+            status=status,
+            signal_type="unknown",
+            signal_score=_safe_float(row.get("funnel_score"), 0.0),
+        )
+        old = picked_map.get(code)
+        if old is None:
+            picked_map[code] = candidate
+            continue
+        old_rank = 1 if old.status == "confirmed" else 0
+        new_rank = 1 if candidate.status == "confirmed" else 0
+        if (new_rank, candidate.signal_score) > (old_rank, old.signal_score):
+            picked_map[code] = candidate
+
+    picked = list(picked_map.values())
+    picked.sort(key=lambda x: (x.status != "confirmed", -x.signal_score, x.code))
     _log(
-        f"候选池加载完成: raw={len(rows)}, picked={len(picked)}, signal_date={target_signal_date}",
+        f"recommendation_tracking 候选加载: raw={len(rows)}, picked={len(picked)}, recommend_date={target_yyyymmdd}",
         logs_path,
     )
     return picked
+
+
+def _merge_tail_candidates(
+    signal_pending_candidates: list[TailBuyCandidate],
+    recommendation_candidates: list[TailBuyCandidate],
+) -> tuple[list[TailBuyCandidate], int]:
+    merged: dict[str, TailBuyCandidate] = {}
+    for item in signal_pending_candidates or []:
+        if item.code:
+            merged[item.code] = item
+
+    appended = 0
+    for rec in recommendation_candidates or []:
+        if not rec.code:
+            continue
+        old = merged.get(rec.code)
+        if old is None:
+            merged[rec.code] = rec
+            appended += 1
+            continue
+        old.signal_score = max(_safe_float(old.signal_score), _safe_float(rec.signal_score))
+        if old.status != "confirmed" and rec.status == "confirmed":
+            old.status = "confirmed"
+        if (not old.name or old.name == old.code) and rec.name:
+            old.name = rec.name
+
+    out = list(merged.values())
+    out.sort(key=lambda x: (x.status != "confirmed", -x.signal_score, x.code))
+    return out, appended
+
+
+def _load_tail_candidates(target_signal_date: str, logs_path: str | None = None) -> tuple[list[TailBuyCandidate], str]:
+    pending: list[TailBuyCandidate] = []
+    recs: list[TailBuyCandidate] = []
+    pending_err = ""
+    rec_err = ""
+
+    try:
+        pending = _load_signal_pending_candidates(target_signal_date, logs_path)
+    except Exception as e:
+        pending_err = str(e)
+        _log(f"signal_pending 加载失败（降级继续）: {e}", logs_path)
+
+    try:
+        recs = _load_recommendation_tracking_candidates(target_signal_date, logs_path)
+    except Exception as e:
+        rec_err = str(e)
+        _log(f"recommendation_tracking 加载失败（降级继续）: {e}", logs_path)
+
+    if pending_err and rec_err:
+        raise RuntimeError(f"候选池双源都失败: signal_pending={pending_err}; recommendation_tracking={rec_err}")
+
+    merged, rec_added = _merge_tail_candidates(pending, recs)
+    source_desc = (
+        "signal_pending + recommendation_tracking "
+        f"(signal_date/recommend_date={target_signal_date}; rec_only={rec_added})"
+    )
+    _log(
+        "候选池加载完成: "
+        f"signal_pending={len(pending)}, recommendation_tracking={len(recs)}, "
+        f"merged={len(merged)}, signal_date={target_signal_date}",
+        logs_path,
+    )
+    return merged, source_desc
 
 
 def _scan_one_symbol(
@@ -1198,7 +1372,7 @@ def main() -> int:
 
     prev_trade_date, today_trade_date = _resolve_trade_dates(logs_path)
     try:
-        pending_candidates = _load_signal_pending_candidates(prev_trade_date, logs_path)
+        pending_candidates, candidate_source_desc = _load_tail_candidates(prev_trade_date, logs_path)
     except Exception as e:
         _log(f"读取候选池失败: {e}", logs_path)
         return 1
@@ -1370,6 +1544,7 @@ def main() -> int:
         elapsed_seconds=elapsed,
         extra_sections=[holdings_section],
         extra_sections_first=True,
+        candidate_source=candidate_source_desc,
     )
     feishu_ok, tg_ok = _send_notifications(
         feishu_webhook=feishu_webhook,

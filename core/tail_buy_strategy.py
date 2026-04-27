@@ -653,16 +653,20 @@ def build_tail_buy_markdown(
     extra_sections: list[str] | None = None,
     extra_sections_first: bool = False,
     max_error_items_per_block: int = 5,
+    candidate_source: str | None = None,
 ) -> str:
     counts = summarize_decision_counts(candidates)
     llm_route_plan = list(llm_route_plan or [])
     llm_route_stats = dict(llm_route_stats or {})
     route_line = " -> ".join(llm_route_plan) if llm_route_plan else "未启用"
     route_hits = ", ".join([f"{k}:{v}" for k, v in sorted(llm_route_stats.items())]) if llm_route_stats else "无"
+    source_text = str(candidate_source or "").strip() or (
+        f"signal_pending（signal_date={target_signal_date}, status in pending/confirmed）"
+    )
     lines: list[str] = [
         f"⏰ Tail Buy {now_text}",
         "",
-        f"- 候选来源: signal_pending（signal_date={target_signal_date}, status in pending/confirmed）",
+        f"- 候选来源: {source_text}",
         f"- 扫描数量: {len(candidates)}",
         f"- 分层结果: BUY={counts[DECISION_BUY]} / WATCH={counts[DECISION_WATCH]} / SKIP={counts[DECISION_SKIP]}",
         f"- LLM 二判: {llm_success}/{llm_total}",
