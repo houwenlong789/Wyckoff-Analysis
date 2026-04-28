@@ -276,7 +276,7 @@ def diagnose_portfolio(tool_context: ToolContext) -> dict:
         logger.info("diagnose_portfolio: user_id=%s, portfolio_id=%s", user_id, portfolio_id)
 
         _user_client = _get_user_client(tool_context)
-        state = load_portfolio_state(portfolio_id, client=_user_client)
+        state = _with_auth_retry(tool_context, load_portfolio_state, portfolio_id, client=_user_client)
         if state is None:
             from integrations.supabase_portfolio import is_supabase_configured
             if not is_supabase_configured():
@@ -923,29 +923,81 @@ _user_client_cache: dict[str, Any] = {}  # user_id → Client
 
 
 def _get_user_client(tool_context: ToolContext | None):
-    """获取或复用 user client。token 变化时重建 client。"""
+    """获取或复用 user client。token 变化时重建；auth 失败自动重登。"""
     if tool_context is None:
         return None
     at = (tool_context.state.get("access_token") or "")
     if not at:
         return None
     user_id = _get_user_id(tool_context)
-    # token 变化（如重新登录）时需重建 client
     cache_key = f"{user_id}:{at[:16]}"
     cached = _user_client_cache.get(cache_key)
     if cached is not None:
         return cached
     rt = (tool_context.state.get("refresh_token") or "")
     from integrations.supabase_base import create_user_client, get_session_tokens
-    client = create_user_client(at, rt)
-    # 回写刷新后的 token
-    new_at, new_rt = get_session_tokens(client)
+    try:
+        client = create_user_client(at, rt)
+        new_at, new_rt = get_session_tokens(client)
+    except Exception as e:
+        if _is_auth_error(e):
+            client, new_at, new_rt = _relogin_and_create_client(tool_context)
+            if client is None:
+                return None
+        else:
+            raise
     if new_at:
         tool_context.state["access_token"] = new_at
     if new_rt:
         tool_context.state["refresh_token"] = new_rt
-    _user_client_cache[cache_key] = client
+    final_key = f"{user_id}:{(new_at or at)[:16]}"
+    _user_client_cache[final_key] = client
     return client
+
+
+def _relogin_and_create_client(tool_context: ToolContext | None):
+    """用 wyckoff.json 中的凭证重新登录，返回 (client, access_token, refresh_token)。"""
+    from cli.auth import _auto_relogin
+    data = _auto_relogin()
+    if not data:
+        return None, "", ""
+    tool_context.state["access_token"] = data["access_token"]
+    tool_context.state["refresh_token"] = data["refresh_token"]
+    from integrations.supabase_base import create_user_client, get_session_tokens
+    client = create_user_client(data["access_token"], data["refresh_token"])
+    new_at, new_rt = get_session_tokens(client)
+    return client, new_at or data["access_token"], new_rt or data["refresh_token"]
+
+
+_AUTH_ERR_KEYWORDS = ("invalid", "expired", "revoked", "refresh", "jwt", "token")
+
+
+def _is_auth_error(e: Exception) -> bool:
+    err = str(e).lower()
+    return any(k in err for k in _AUTH_ERR_KEYWORDS)
+
+
+def _with_auth_retry(tool_context: ToolContext | None, fn, *args, **kwargs):
+    """执行 fn，遇到 auth 错误时自动重登并重试一次。"""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        if not _is_auth_error(e) or tool_context is None:
+            raise
+    _user_client_cache.clear()
+    client, new_at, new_rt = _relogin_and_create_client(tool_context)
+    if client is None:
+        return None
+    if "client" in kwargs:
+        kwargs["client"] = client
+    elif args:
+        args_list = list(args)
+        for i, a in enumerate(args_list):
+            if hasattr(a, "auth") and hasattr(a, "postgrest"):
+                args_list[i] = client
+                break
+        args = tuple(args_list)
+    return fn(*args, **kwargs)
 
 
 def _to_ts_code(code: str) -> str:
@@ -988,7 +1040,7 @@ def get_portfolio(tool_context: ToolContext) -> dict:
         if state is None:
             from integrations.supabase_portfolio import load_portfolio_state
             _client = _get_user_client(tool_context)
-            state = load_portfolio_state(portfolio_id, client=_client)
+            state = _with_auth_retry(tool_context, load_portfolio_state, portfolio_id, client=_client)
             if state:
                 try:
                     from integrations.local_db import save_portfolio
@@ -1092,7 +1144,7 @@ def update_portfolio(
                 name = real_name
             if not real_name and not name:
                 return {"error": f"代码 {code} 在股票列表中未找到，请确认代码是否正确"}
-            ok, msg = upsert_position(portfolio_id, {
+            ok, msg = _with_auth_retry(tool_context, upsert_position, portfolio_id, {
                 "code": code,
                 "name": name,
                 "shares": shares,
@@ -1105,12 +1157,12 @@ def update_portfolio(
         elif action == "remove":
             if not code:
                 return {"error": "remove 操作需要提供股票代码 code"}
-            ok, msg = delete_position(portfolio_id, code.strip(), client=client)
+            ok, msg = _with_auth_retry(tool_context, delete_position, portfolio_id, code.strip(), client=client)
             if not ok:
                 return {"error": msg}
 
         elif action == "set_cash":
-            ok, msg = update_free_cash(portfolio_id, free_cash, client=client)
+            ok, msg = _with_auth_retry(tool_context, update_free_cash, portfolio_id, free_cash, client=client)
             if not ok:
                 return {"error": msg}
 
@@ -1118,7 +1170,7 @@ def update_portfolio(
             return {"error": f"未知操作: {action}，支持 add/update/remove/set_cash"}
 
         # 返回最新持仓状态
-        state = load_portfolio_state(portfolio_id, client=client)
+        state = _with_auth_retry(tool_context, load_portfolio_state, portfolio_id, client=client)
         if not state:
             return {"success": True, "message": msg, "positions": []}
 
