@@ -36,6 +36,12 @@ logs/
 *.xls
 .env
 
+
 # 回测产物与快照缓存（体积大，本地生成即可）
 analysis/backtest/
 analysis/
+
+
+.github/*
+.codex-run/*
+.kiro/*
