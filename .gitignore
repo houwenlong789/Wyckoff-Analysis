@@ -36,6 +36,8 @@ logs/
 analysis/backtest/
 analysis/
 .openclaw/
+.codex
+.codex-local-skills/
 
 
 .github/*
