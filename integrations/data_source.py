@@ -32,6 +32,7 @@ from integrations.tickflow_notice import (
     is_tickflow_rate_limited_error,
     record_tickflow_limit_event,
 )
+from integrations.mootdx_source import try_fetch_stock_mootdx
 
 
 _BAOSTOCK_LOGGED = False
@@ -838,6 +839,17 @@ def fetch_stock_hist(
         "on",
     }
 
+    mootdx_df = try_fetch_stock_mootdx(
+        symbol,
+        start_s,
+        end_s,
+        adjust,
+        failed_sources,
+        failed_details,
+    )
+    if mootdx_df is not None:
+        return mootdx_df
+
     # 1. tickflow 优先（固定 qfq）
     if disable_tickflow:
         failed_sources.append("tickflow(disabled)")
@@ -1016,7 +1028,7 @@ def fetch_stock_hist(
     hint = _network_hint_from_details(failed_details)
     hint_suffix = f" 诊断提示：{hint}" if hint else ""
     raise RuntimeError(
-        f"数据拉取全线失败 [标:{symbol}, 范围:{start_s}..{end_s}, 复权:{adjust}]：已按顺序尝试 tickflow→tushare→akshare→baostock→efinance，"
+        f"数据拉取全线失败 [标:{symbol}, 范围:{start_s}..{end_s}, 复权:{adjust}]：已按顺序尝试 mootdx→tickflow→tushare→akshare→baostock→efinance，"
         f"均无可用 K 线数据。请检查该标的是否已退市或处于长期停牌期。{detail_suffix}{hint_suffix}"
     )
 

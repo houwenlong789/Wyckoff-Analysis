@@ -43,6 +43,7 @@ streamlit = [
     "litellm>=1.40.0",
 ]
 mcp = ["mcp>=1.0.0"]
+mootdx = ["mootdx>=0.11.7"]
 dev = ["pytest>=7.0"]
 
 [project.scripts]
