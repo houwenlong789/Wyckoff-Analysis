@@ -42,6 +42,10 @@ _PORTFOLIO_DIAGNOSE_PHRASES = (
 )
 
 _GENERIC_DIAGNOSE_HINTS = (
+    "分析",
+    "走势",
+    "未来走势",
+    "日线",
     "做一下体检",
     "做个体检",
     "体检一下",
@@ -51,6 +55,17 @@ _GENERIC_DIAGNOSE_HINTS = (
     "健康",
     "诊断",
     "审一下",
+)
+
+_AFFIRMATIVE_PHRASES = (
+    "要",
+    "要的",
+    "好的",
+    "可以",
+    "行",
+    "来吧",
+    "嗯",
+    "好",
 )
 
 _PORTFOLIO_CONTEXT_MARKERS = (
@@ -128,6 +143,16 @@ def resolve_turn_expectation(messages: list[dict[str, Any]]) -> TurnExpectation 
         return TurnExpectation(
             required_tool="diagnose_portfolio",
             reason="上一轮上下文已经明确在讨论持仓，这一轮体检需要继续做持仓诊断。",
+        )
+
+    if (
+        last_user in _AFFIRMATIVE_PHRASES
+        and any(hint in previous_context for hint in _GENERIC_DIAGNOSE_HINTS)
+        and any(marker in previous_context for marker in _PORTFOLIO_CONTEXT_MARKERS)
+    ):
+        return TurnExpectation(
+            required_tool="diagnose_portfolio",
+            reason="用户承接上一轮持仓体检/分析邀请，必须继续调用持仓诊断工具。",
         )
 
     return None

@@ -59,6 +59,37 @@ def _collect_tickflow_limit_hints_from_df(df: Any) -> list[str]:
     return [one] if one else []
 
 
+def _hist_metadata(df: Any) -> dict[str, Any]:
+    """Return compact provenance metadata for model-facing tool results."""
+    if df is None or not hasattr(df, "attrs"):
+        return {}
+    attrs = getattr(df, "attrs", {}) or {}
+    meta: dict[str, Any] = {}
+    for key in ("source", "upstream_source", "cache_status"):
+        val = str(attrs.get(key, "") or "").strip()
+        if val:
+            meta[key] = val
+    upstream_sources = attrs.get("upstream_sources")
+    if isinstance(upstream_sources, list):
+        clean = [str(x) for x in upstream_sources if str(x or "").strip()]
+        if clean:
+            meta["upstream_sources"] = clean
+    try:
+        meta["row_count"] = int(len(df))
+    except Exception:
+        pass
+    return meta
+
+
+def _latest_hist_date(df: Any, date_col: str = "date") -> str:
+    if df is None or not hasattr(df, "empty") or df.empty:
+        return ""
+    try:
+        return str(df.iloc[-1].get(date_col, "") or "")
+    except Exception:
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # 用户凭据：从 Supabase 实时获取 + 进程内短期缓存
 # ---------------------------------------------------------------------------
@@ -211,6 +242,8 @@ def diagnose_stock(code: str, cost: float = 0.0, tool_context: ToolContext = Non
         if df is None or df.empty:
             return {"error": f"无法获取 {code} 的行情数据"}
         hist_hints = _collect_tickflow_limit_hints_from_df(df)
+        hist_meta = _hist_metadata(df)
+        latest_date = _latest_hist_date(df, "日期")
 
         from core.stock_cache import _COL_MAP
         df = df.rename(columns=_COL_MAP)
@@ -240,6 +273,9 @@ def diagnose_stock(code: str, cost: float = 0.0, tool_context: ToolContext = Non
             "from_year_low_pct": round(d.from_year_low_pct, 1),
             "health_reasons": d.health_reasons,
             "formatted_text": text,
+            "data_status": "ok",
+            "latest_date": latest_date or _latest_hist_date(df),
+            **hist_meta,
             **({"tickflow_limit_hint": hist_hints[0]} if hist_hints else {}),
         }
     except Exception as e:
@@ -294,6 +330,8 @@ def diagnose_portfolio(tool_context: ToolContext) -> dict:
         start_date = end_date - timedelta(days=500)
         results = []
         hist_tickflow_hints: list[str] = []
+        successful_count = 0
+        failed_count = 0
         for pos in state["positions"]:
             code = pos["code"]
             name = pos.get("name", code)
@@ -301,14 +339,18 @@ def diagnose_portfolio(tool_context: ToolContext) -> dict:
             try:
                 df = get_stock_hist(code, start_date, end_date)
                 if df is None or df.empty:
+                    failed_count += 1
                     results.append({"code": code, "name": name, "error": "无行情数据"})
                     continue
+                hist_meta = _hist_metadata(df)
+                latest_date = _latest_hist_date(df, "日期")
                 for hint in _collect_tickflow_limit_hints_from_df(df):
                     if hint not in hist_tickflow_hints:
                         hist_tickflow_hints.append(hint)
                 from core.stock_cache import _COL_MAP
                 df = df.rename(columns=_COL_MAP)
                 d = diagnose_one_stock(code, name, cost, df)
+                successful_count += 1
                 results.append({
                     "code": d.code,
                     "name": d.name,
@@ -319,14 +361,20 @@ def diagnose_portfolio(tool_context: ToolContext) -> dict:
                     "l4_triggers": d.l4_triggers,
                     "health_reasons": d.health_reasons,
                     "formatted_text": format_diagnostic_text(d),
+                    "data_status": "ok",
+                    "latest_date": latest_date or _latest_hist_date(df),
+                    **hist_meta,
                 })
             except Exception as e:
+                failed_count += 1
                 results.append({"code": code, "name": name, "error": str(e)})
 
         result = {
             "portfolio_id": portfolio_id,
             "free_cash": state.get("free_cash", 0),
             "position_count": len(state["positions"]),
+            "successful_count": successful_count,
+            "failed_count": failed_count,
             "diagnostics": results,
         }
         if hist_tickflow_hints:
@@ -363,6 +411,7 @@ def get_stock_price(code: str, days: int = 30, tool_context: ToolContext = None)
         if df is None or df.empty:
             return {"error": f"无法获取 {code} 的行情数据"}
         hist_hints = _collect_tickflow_limit_hints_from_df(df)
+        hist_meta = _hist_metadata(df)
 
         from core.stock_cache import _COL_MAP
         df = df.rename(columns=_COL_MAP)
@@ -386,6 +435,8 @@ def get_stock_price(code: str, days: int = 30, tool_context: ToolContext = None)
             "days": len(records),
             "latest_close": round(float(latest.get("close", 0)), 2),
             "latest_date": str(latest.get("date", "")),
+            "data_status": "ok",
+            **hist_meta,
             "data": records,
             **({"tickflow_limit_hint": hist_hints[0]} if hist_hints else {}),
         }

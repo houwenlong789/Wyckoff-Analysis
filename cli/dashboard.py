@@ -535,9 +535,10 @@ function applyTheme(){
 function toggleTheme(){_theme=_theme==='dark'?'light':'dark';localStorage.setItem('wk_theme',_theme);applyTheme()}
 applyTheme();
 
-// ═══ Clock ═══
+// ═══ Clock & Timezone ═══
 function tickClock(){const d=new Date(),p=n=>String(n).padStart(2,'0');$('#clock').textContent=`${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`}
 setInterval(tickClock,1000);tickClock();
+function localTime(s){if(!s)return '';try{const d=new Date(s.includes('T')||s.includes('Z')?s:s.replace(' ','T')+'Z');if(isNaN(d))return s;const p=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`}catch(e){return s}}
 
 // ═══ Nav ═══
 let currentPage='overview';
@@ -585,7 +586,7 @@ function renderRecTable(recs,showDel){
   return `<table class="tbl"><thead><tr><th>${t('th_code')}</th><th>${t('th_name')}</th><th>${t('th_camp')}</th><th>${t('th_date')}</th><th>${t('th_init_price')}</th><th>${t('th_cur_price')}</th><th>${t('th_ai')}</th>${showDel?'<th></th>':''}</tr></thead><tbody>${recs.map(r=>{
     const code=String(r.code||'').padStart(6,'0');
     const ai=r.is_ai_recommended?'<span class="pill pill-green">AI</span>':'<span class="pill pill-dim">Manual</span>';
-    return `<tr><td>${code}</td><td>${r.name||''}</td><td>${r.camp||''}</td><td>${r.recommend_date||''}</td><td>${(r.initial_price||0).toFixed(2)}</td><td>${(r.current_price||0).toFixed(2)}</td><td>${ai}</td>${showDel?`<td><button class="btn-del" onclick="delRec('${code}')">${t('del')}</button></td>`:''}</tr>`}).join('')}</tbody></table>`}
+    return `<tr><td>${code}</td><td>${r.name||''}</td><td>${r.camp||''}</td><td>${localTime(r.recommend_date)}</td><td>${(r.initial_price||0).toFixed(2)}</td><td>${(r.current_price||0).toFixed(2)}</td><td>${ai}</td>${showDel?`<td><button class="btn-del" onclick="delRec('${code}')">${t('del')}</button></td>`:''}</tr>`}).join('')}</tbody></table>`}
 
 // ═══ Recommendations ═══
 async function renderRecommendations(c){
@@ -601,7 +602,7 @@ async function renderSignals(c){
   const statusPill=s=>{const m={pending:'pill-amber',confirmed:'pill-green',expired:'pill-red',rejected:'pill-red'};return `<span class="pill ${m[s]||'pill-dim'}">${s}</span>`};
   c.innerHTML=`<div class="tbl-wrap fade-in"><table class="tbl"><thead><tr><th>${t('th_code')}</th><th>${t('th_name')}</th><th>${t('th_type')}</th><th>${t('th_status')}</th><th>${t('th_date')}</th><th>${t('th_score')}</th><th>${t('th_days')}</th><th>${t('th_regime')}</th><th>${t('th_industry')}</th><th></th></tr></thead><tbody>${sigs.map(s=>{
     const code=String(s.code||'').padStart(6,'0');
-    return `<tr><td>${code}</td><td>${s.name||''}</td><td>${s.signal_type||''}</td><td>${statusPill(s.status||'')}</td><td>${s.signal_date||''}</td><td>${(s.signal_score||0).toFixed(2)}</td><td>${s.days_elapsed||0}</td><td>${s.regime||''}</td><td>${s.industry||''}</td><td><button class="btn-del" onclick="delSig('${code}')">${t('del')}</button></td></tr>`}).join('')}</tbody></table></div>`}
+    return `<tr><td>${code}</td><td>${s.name||''}</td><td>${s.signal_type||''}</td><td>${statusPill(s.status||'')}</td><td>${localTime(s.signal_date)}</td><td>${(s.signal_score||0).toFixed(2)}</td><td>${s.days_elapsed||0}</td><td>${s.regime||''}</td><td>${s.industry||''}</td><td><button class="btn-del" onclick="delSig('${code}')">${t('del')}</button></td></tr>`}).join('')}</tbody></table></div>`}
 window.delSig=async function(code){if(!confirm(t('confirm_del_sig')+code+'?'))return;await fetch('/api/signals/'+code,{method:'DELETE'});loadPage('signals')};
 
 // ═══ Portfolio ═══
@@ -628,7 +629,7 @@ async function renderMemory(c){
     <div class="mem-item"><div style="flex:1">
       <div style="margin-bottom:4px">${typePill(m.memory_type)} ${m.codes?`<span style="color:var(--text-dim);font-size:10px;margin-left:8px">${m.codes}</span>`:''}</div>
       <div class="mem-content">${escHtml(m.content)}</div>
-      <div class="mem-meta">#${m.id} · ${m.created_at||''}</div>
+      <div class="mem-meta">#${m.id} · ${localTime(m.created_at)}</div>
     </div><button class="btn-del" onclick="delMemory(${m.id})">${t('del')}</button></div>`).join('')}</div>`}
 window.delMemory=async function(id){if(!confirm(t('confirm_del')+id+'?'))return;await fetch('/api/memory/'+id,{method:'DELETE'});loadPage('memory')};
 
@@ -716,7 +717,7 @@ async function renderSync(c){
   const now=Date.now();
   c.innerHTML=`<div class="card fade-in"><div class="card-title">${t('sync_title')}</div>${sync.map(s=>{
     let cls='none',label=t('never_synced');
-    if(s.last_synced_at){const age=(now-new Date(s.last_synced_at+'Z').getTime())/3600000;cls=age<8?'ok':'stale';label=s.last_synced_at}
+    if(s.last_synced_at){const age=(now-new Date(s.last_synced_at+'Z').getTime())/3600000;cls=age<8?'ok':'stale';label=localTime(s.last_synced_at)}
     return `<div class="sync-row"><div class="sync-dot ${cls}"></div><div style="flex:1;font-weight:600">${s.table}</div><div style="color:var(--text2)">${s.row_count||0} ${t('rows')}</div><div style="color:var(--text-dim);font-size:11px;width:180px;text-align:right">${label}</div></div>`}).join('')}</div>`}
 
 // ═══ Chat Log ═══
@@ -727,7 +728,7 @@ async function renderChatLog(c){
   if(!Array.isArray(sessions)||!sessions.length){c.innerHTML=`<div class="empty">${t('no_sessions')}</div>`;return}
   c.innerHTML=`<div class="tbl-wrap fade-in"><table class="tbl"><thead><tr><th>${t('th_session')}</th><th>${t('th_started')}</th><th>${t('th_ended')}</th><th>${t('th_messages')}</th><th>${t('th_tokens_in')}</th><th>${t('th_tokens_out')}</th><th>${t('th_error')}</th><th></th></tr></thead><tbody>${sessions.map(s=>{
     const hasErr=s.last_error?'<span class="pill pill-red">ERR</span>':'<span class="pill pill-green">OK</span>';
-    return `<tr><td style="color:var(--accent);cursor:pointer" onclick="viewSession('${s.session_id}')">${s.session_id}</td><td>${s.started_at||''}</td><td>${s.ended_at||''}</td><td>${s.msg_count||0}</td><td>${(s.total_tokens_in||0).toLocaleString()}</td><td>${(s.total_tokens_out||0).toLocaleString()}</td><td>${hasErr}</td><td><span style="cursor:pointer;color:var(--accent);margin-right:8px" onclick="viewSession('${s.session_id}')">${t('view')}</span><button class="btn-del" onclick="delSession('${s.session_id}')">${t('del')}</button></td></tr>`}).join('')}</tbody></table></div>`}
+    return `<tr><td style="color:var(--accent);cursor:pointer" onclick="viewSession('${s.session_id}')">${s.session_id}</td><td>${localTime(s.started_at)}</td><td>${localTime(s.ended_at)}</td><td>${s.msg_count||0}</td><td>${(s.total_tokens_in||0).toLocaleString()}</td><td>${(s.total_tokens_out||0).toLocaleString()}</td><td>${hasErr}</td><td><span style="cursor:pointer;color:var(--accent);margin-right:8px" onclick="viewSession('${s.session_id}')">${t('view')}</span><button class="btn-del" onclick="delSession('${s.session_id}')">${t('del')}</button></td></tr>`}).join('')}</tbody></table></div>`}
 window.viewSession=function(sid){_chatSessionId=sid;loadPage('chatlog')};
 window.backToSessions=function(){_chatSessionId=null;loadPage('chatlog')};
 window.delSession=async function(sid){if(!confirm(t('confirm_del_session')+sid+'?'))return;await fetch('/api/chat-sessions/'+sid,{method:'DELETE'});_chatSessionId=null;loadPage('chatlog')};
@@ -737,7 +738,7 @@ async function renderChatSession(c,sid){
   const rolePill=r=>{const m={user:'pill-blue',assistant:'pill-green',error:'pill-red',tool:'pill-dim'};return `<span class="pill ${m[r]||'pill-dim'}">${r}</span>`};
   c.innerHTML=`<div style="margin-bottom:12px"><span style="cursor:pointer;color:var(--accent)" onclick="backToSessions()">&larr; ${t('back')}</span><span style="margin-left:12px;color:var(--text-dim)">${t('session')}: ${sid}</span></div>
     <div class="tbl-wrap fade-in">${logs.map(l=>`<div class="mem-item"><div style="flex:1">
-      <div style="margin-bottom:4px">${rolePill(l.role)} <span style="color:var(--text-dim);font-size:10px;margin-left:8px">${l.created_at||''}</span>
+      <div style="margin-bottom:4px">${rolePill(l.role)} <span style="color:var(--text-dim);font-size:10px;margin-left:8px">${localTime(l.created_at)}</span>
         ${l.model?`<span style="color:var(--text-dim);font-size:10px;margin-left:8px">${l.model}</span>`:''}
         ${l.tokens_in||l.tokens_out?`<span style="color:var(--text-dim);font-size:10px;margin-left:8px">↑${l.tokens_in||0} ↓${l.tokens_out||0}</span>`:''}
         ${l.elapsed_s?`<span style="color:var(--text-dim);font-size:10px;margin-left:8px">${l.elapsed_s}s</span>`:''}</div>

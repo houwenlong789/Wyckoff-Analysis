@@ -22,6 +22,38 @@ def test_resolve_turn_expectation_uses_portfolio_context_for_followup_checkup():
     assert expectation.required_tool == "diagnose_portfolio"
 
 
+def test_resolve_turn_expectation_handles_affirmative_followup_after_portfolio_invite():
+    messages = [
+        {"role": "user", "content": "你看看我最新的持仓是啥"},
+        {
+            "role": "assistant",
+            "content": "你当前有 5 只持仓，现金 29,755.63 元。要我对这5只票做个全面体检吗？",
+        },
+        {"role": "user", "content": "要的"},
+    ]
+
+    expectation = resolve_turn_expectation(messages)
+
+    assert expectation is not None
+    assert expectation.required_tool == "diagnose_portfolio"
+
+
+def test_resolve_turn_expectation_handles_portfolio_daily_trend_followup():
+    messages = [
+        {"role": "user", "content": "你看看我最新的持仓是啥"},
+        {
+            "role": "assistant",
+            "content": "你当前有 5 只持仓，现金 29,755.63 元。",
+        },
+        {"role": "user", "content": "你根据过去的日线分析一下这几个股票的未来走势吧"},
+    ]
+
+    expectation = resolve_turn_expectation(messages)
+
+    assert expectation is not None
+    assert expectation.required_tool == "diagnose_portfolio"
+
+
 def test_agent_loop_retries_planning_only_portfolio_turn_until_tool_executes():
     def second_round(messages, tools, system_prompt):
         assert messages[-1]["role"] == "user"

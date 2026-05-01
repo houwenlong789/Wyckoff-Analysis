@@ -42,6 +42,7 @@ class OpenAIProvider(LLMProvider):
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": oai_messages,
+            "frequency_penalty": 0.3,
         }
         if oai_tools:
             kwargs["tools"] = oai_tools
@@ -70,6 +71,7 @@ class OpenAIProvider(LLMProvider):
             "messages": oai_messages,
             "stream": True,
             "stream_options": {"include_usage": True},
+            "frequency_penalty": 0.3,
         }
         if oai_tools:
             kwargs["tools"] = oai_tools
@@ -83,12 +85,13 @@ class OpenAIProvider(LLMProvider):
         try:
             stream = self._client.chat.completions.create(**kwargs)
         except Exception:
-            # 某些第三方端点不支持 stream_options 或 tool_choice，逐个去掉后重试
+            # 某些第三方端点不支持 stream_options 或 tool_choice/frequency_penalty，逐个去掉后重试
             kwargs.pop("stream_options", None)
             try:
                 stream = self._client.chat.completions.create(**kwargs)
             except Exception:
                 kwargs.pop("tool_choice", None)
+                kwargs.pop("frequency_penalty", None)
                 stream = self._client.chat.completions.create(**kwargs)
 
         for chunk in stream:

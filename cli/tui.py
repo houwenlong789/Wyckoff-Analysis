@@ -1005,6 +1005,7 @@ class WyckoffTUI(App):
         expectation = resolve_turn_expectation(self._messages)
         incomplete_tool_retries = 0
         used_tools_this_turn: list[str] = []
+        executed_tool_summaries: list[dict[str, object]] = []
         self._agent_log.info("session=%s user: %s", self._session_id, _user_text[:200])
         _chatlog_save = self._chatlog_save  # bound method ref
 
@@ -1175,14 +1176,30 @@ class WyckoffTUI(App):
                         _spinner_stop()
 
                         if isinstance(result, dict) and result.get("error"):
+                            executed_tool_summaries.append({
+                                "name": name,
+                                "args_brief": str(args)[:100],
+                                "status": "error",
+                                "error": str(result.get("error", ""))[:160],
+                            })
                             _write(Text.from_markup(
                                 f"  [red]✗ {display}[/red] [dim]{elapsed_tool:.1f}s {str(result['error'])[:80]}[/dim]"
                             ))
                         elif isinstance(result, dict) and result.get("status") == "background":
+                            executed_tool_summaries.append({
+                                "name": name,
+                                "args_brief": str(args)[:100],
+                                "status": "background",
+                            })
                             _write(Text.from_markup(
                                 f"  [cyan]↗ {display}[/cyan] [dim]已提交后台[/dim]"
                             ))
                         else:
+                            executed_tool_summaries.append({
+                                "name": name,
+                                "args_brief": str(args)[:100],
+                                "status": "ok",
+                            })
                             _write(Text.from_markup(
                                 f"  [green]✓ {display}[/green] [dim]{elapsed_tool:.1f}s[/dim]"
                             ))
@@ -1253,14 +1270,11 @@ class WyckoffTUI(App):
 
                 # 保存对话记录
                 _chatlog_save("user", _user_text, model=_model_name, provider=_provider_name)
-                _tc_json = ""
-                if self._messages:
-                    last_asst = [m for m in self._messages if m.get("role") == "assistant"]
-                    if last_asst and last_asst[-1].get("tool_calls"):
-                        _tc_json = json.dumps(
-                            [{"name": tc["name"], "args_brief": str(tc.get("args", {}))[:100]} for tc in last_asst[-1]["tool_calls"]],
-                            ensure_ascii=False,
-                        )
+                _tc_json = (
+                    json.dumps(executed_tool_summaries, ensure_ascii=False)
+                    if executed_tool_summaries
+                    else ""
+                )
                 _chatlog_save(
                     "assistant", text_buf,
                     model=_model_name, provider=_provider_name,
