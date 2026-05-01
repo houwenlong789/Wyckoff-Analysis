@@ -89,7 +89,7 @@ _WELCOME_TEXT = (
 )
 
 # 当系统提示词/工具策略有重要变更时，提升版本号以触发会话内 manager 重建
-CHAT_AGENT_VERSION = "2026-04-10-market-fetch-v1"
+CHAT_AGENT_VERSION = "2026-05-01-portfolio-tool-source-v1"
 
 def _get_chat_config() -> tuple[str, str, str, str]:
     """
@@ -139,36 +139,6 @@ def _get_chat_config() -> tuple[str, str, str, str]:
     return provider, api_key, model, base_url
 
 
-def _load_portfolio_context(user_id: str) -> str:
-    """从 Supabase 加载用户持仓，格式化为注入 Agent system prompt 的文本。"""
-    try:
-        from integrations.supabase_portfolio import load_portfolio_state, build_user_live_portfolio_id
-        state = load_portfolio_state(build_user_live_portfolio_id(user_id))
-        if not state or not state.get("positions"):
-            return ""
-        positions = state["positions"]
-        cash = state.get("free_cash", 0.0)
-        lines = [
-            "用户当前持仓（来自实盘组合）：",
-            f"可用资金：¥{cash:,.2f}",
-            "",
-            "| 代码 | 名称 | 成本 | 股数 | 止损 |",
-            "|------|------|------|------|------|",
-        ]
-        for p in positions:
-            sl = f"{p['stop_loss']:.2f}" if p.get("stop_loss") is not None else "--"
-            lines.append(
-                f"| {p['code']} | {p['name']} | {p['cost']:.2f} | {p['shares']} | {sl} |"
-            )
-        lines.append("")
-        lines.append("以上数据自动加载自用户的实盘持仓记录。对话中涉及这些股票时，你已经知道用户的成本和仓位。")
-        return "\n".join(lines)
-    except Exception:
-        import logging
-        logging.getLogger(__name__).warning("Failed to load portfolio context for user %s", user_id, exc_info=True)
-        return ""
-
-
 def _init_chat_manager():
     """初始化或获取已有的 ChatSessionManager。"""
     user = st.session_state.get("user") or {}
@@ -189,14 +159,8 @@ def _init_chat_manager():
         from agents.wyckoff_chat_agent import create_agent
         from agents.session_manager import ChatSessionManager
 
-        # 加载用户持仓注入 Agent 上下文（记忆系统阶段 1）
-        portfolio_ctx = ""
-        if user_id:
-            portfolio_ctx = _load_portfolio_context(user_id)
-
         agent = create_agent(
             provider=provider, model=model, api_key=api_key, base_url=base_url,
-            portfolio_context=portfolio_ctx,
         )
         mgr = ChatSessionManager(
             user_id=user_id or "anonymous",

@@ -54,6 +54,21 @@ def test_resolve_turn_expectation_handles_portfolio_daily_trend_followup():
     assert expectation.required_tool == "diagnose_portfolio"
 
 
+def test_resolve_turn_expectation_does_not_hijack_explicit_stock_after_portfolio_context():
+    messages = [
+        {"role": "user", "content": "跟我的持仓股票做一下未来的预测"},
+        {
+            "role": "assistant",
+            "content": "5只票全部诊断完成，数据截至 2026-04-30。",
+        },
+        {"role": "user", "content": "分析一下海德股份"},
+    ]
+
+    expectation = resolve_turn_expectation(messages)
+
+    assert expectation is None
+
+
 def test_agent_loop_retries_planning_only_portfolio_turn_until_tool_executes():
     def second_round(messages, tools, system_prompt):
         assert messages[-1]["role"] == "user"

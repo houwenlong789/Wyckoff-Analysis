@@ -46,6 +46,9 @@ _GENERIC_DIAGNOSE_HINTS = (
     "走势",
     "未来走势",
     "日线",
+)
+
+_PURE_FOLLOWUP_DIAGNOSE_PHRASES = (
     "做一下体检",
     "做个体检",
     "体检一下",
@@ -66,6 +69,21 @@ _AFFIRMATIVE_PHRASES = (
     "来吧",
     "嗯",
     "好",
+)
+
+_PORTFOLIO_FOLLOWUP_REFERENCES = (
+    "他们",
+    "它们",
+    "这些",
+    "这几个",
+    "几个股票",
+    "几只",
+    "上面",
+    "上述",
+    "这些票",
+    "这几只",
+    "我的持仓",
+    "持仓股票",
 )
 
 _PORTFOLIO_CONTEXT_MARKERS = (
@@ -137,7 +155,13 @@ def resolve_turn_expectation(messages: list[dict[str, Any]]) -> TurnExpectation 
 
     previous_context = _recent_context_text(messages[:-1], limit=4)
     if (
-        any(hint in last_user for hint in _GENERIC_DIAGNOSE_HINTS)
+        (
+            any(phrase in last_user for phrase in _PURE_FOLLOWUP_DIAGNOSE_PHRASES)
+            or (
+                any(hint in last_user for hint in _GENERIC_DIAGNOSE_HINTS)
+                and any(ref in last_user for ref in _PORTFOLIO_FOLLOWUP_REFERENCES)
+            )
+        )
         and any(marker in previous_context for marker in _PORTFOLIO_CONTEXT_MARKERS)
     ):
         return TurnExpectation(
@@ -147,7 +171,10 @@ def resolve_turn_expectation(messages: list[dict[str, Any]]) -> TurnExpectation 
 
     if (
         last_user in _AFFIRMATIVE_PHRASES
-        and any(hint in previous_context for hint in _GENERIC_DIAGNOSE_HINTS)
+        and (
+            any(hint in previous_context for hint in _GENERIC_DIAGNOSE_HINTS)
+            or any(hint in previous_context for hint in _PURE_FOLLOWUP_DIAGNOSE_PHRASES)
+        )
         and any(marker in previous_context for marker in _PORTFOLIO_CONTEXT_MARKERS)
     ):
         return TurnExpectation(

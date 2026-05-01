@@ -84,7 +84,6 @@ def create_agent(
     api_key: str = "",
     base_url: str = "",
     provider: str = "gemini",
-    portfolio_context: str = "",
 ) -> LlmAgent:
     """
     创建 Wyckoff 对话 Agent 实例。
@@ -116,14 +115,10 @@ def create_agent(
             ),
         )
 
-    instruction = CHAT_AGENT_SYSTEM_PROMPT
-    if portfolio_context:
-        instruction += f"\n\n# 当前用户持仓\n\n{portfolio_context}"
-
     agent = LlmAgent(
         name="wyckoff_advisor",
         model=llm_model,
-        instruction=instruction,
+        instruction=CHAT_AGENT_SYSTEM_PROMPT,
         tools=WYCKOFF_TOOLS,
         output_key="last_response",
         **extra_kwargs,

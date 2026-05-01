@@ -77,6 +77,20 @@ def _merge_norm_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def _can_use_cache_when_tail_gap_fails(
+    gap_start: date,
+    meta: CacheMeta | None,
+    cached_norm: pd.DataFrame | None,
+) -> bool:
+    """Allow stale-but-current cache when only a future/non-trading tail gap fails."""
+    return (
+        meta is not None
+        and cached_norm is not None
+        and not cached_norm.empty
+        and gap_start > meta.end_date
+    )
+
+
 def _compute_gap_ranges(
     requested_start: date, requested_end: date, meta: CacheMeta | None
 ) -> list[tuple[date, date]]:
@@ -185,6 +199,7 @@ def get_stock_hist(
     fetched_frames: list[pd.DataFrame] = []
     tickflow_limit_hints: list[str] = []
     upstream_sources: list[str] = []
+    skipped_tail_gap_error = ""
     did_fetch = False
 
     for gap_start, gap_end in gaps:
@@ -193,7 +208,18 @@ def get_stock_hist(
             f"[stock_repo] cache_miss symbol={symbol} adjust={cache_adjust} "
             f"range={gap_start}..{gap_end} context={context}"
         )
-        frame, upstream_source = _fetch_gap(symbol, gap_start, gap_end, adjust)
+        try:
+            frame, upstream_source = _fetch_gap(symbol, gap_start, gap_end, adjust)
+        except Exception as e:
+            if _can_use_cache_when_tail_gap_fails(gap_start, meta, cached_norm):
+                skipped_tail_gap_error = f"{type(e).__name__}: {str(e)[:240]}"
+                print(
+                    f"[stock_repo] tail_gap_fetch_failed_use_cache symbol={symbol} "
+                    f"adjust={cache_adjust} gap={gap_start}..{gap_end} "
+                    f"cached_until={meta.end_date} err={skipped_tail_gap_error}"
+                )
+                continue
+            raise
         fetched_frames.append(frame)
         if upstream_source and upstream_source not in upstream_sources:
             upstream_sources.append(upstream_source)
@@ -259,7 +285,12 @@ def get_stock_hist(
         result.attrs["upstream_sources"] = upstream_sources
     elif meta is not None:
         result.attrs["upstream_source"] = str(meta.source or "cache")
-    result.attrs["cache_status"] = "miss_refilled" if did_fetch or meta is None else "hit"
+    if skipped_tail_gap_error:
+        result.attrs["cache_status"] = "hit_tail_gap_skipped"
+        result.attrs["tail_gap_error"] = skipped_tail_gap_error
+        result.attrs["cached_until"] = meta.end_date.isoformat() if meta else ""
+    else:
+        result.attrs["cache_status"] = "miss_refilled" if did_fetch or meta is None else "hit"
     if tickflow_limit_hints:
         result.attrs["tickflow_limit_hints"] = tickflow_limit_hints
         result.attrs["tickflow_limit_hint"] = tickflow_limit_hints[0]
