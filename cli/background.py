@@ -49,13 +49,11 @@ class BackgroundTaskManager:
         args: dict[str, Any],
         on_complete: Callable[[str, str, Any], None] | None = None,
     ) -> str:
-        task = BackgroundTask(id=task_id, tool_name=tool_name)
+        task = BackgroundTask(id=task_id, tool_name=tool_name, status="running")
         with self._lock:
             self._tasks[task_id] = task
 
         def _run():
-            with self._lock:
-                task.status = "running"
             from cli.progress import set_reporter
             def _on_progress(stage, detail, progress):
                 with self._lock:
@@ -84,6 +82,8 @@ class BackgroundTaskManager:
             finally:
                 set_reporter(None)
 
+        if self._progress_callback:
+            self._progress_callback(task)
         t = threading.Thread(target=_run, daemon=True, name=f"bg-{task_id}")
         t.start()
         return task_id

@@ -87,10 +87,9 @@ class BackgroundTaskPanel(Static):
         dock: top;
         height: auto;
         max-height: 5;
-        background: $surface;
+        background: $boost;
         color: $text;
         padding: 0 1;
-        display: none;
         border-bottom: solid $primary;
     }
     """
@@ -98,6 +97,7 @@ class BackgroundTaskPanel(Static):
     def __init__(self, bg_manager, **kwargs):
         super().__init__("", **kwargs)
         self._bg_manager = bg_manager
+        self.styles.display = "none"
 
     def on_mount(self) -> None:
         self.set_interval(1.0, self._tick)
@@ -105,9 +105,11 @@ class BackgroundTaskPanel(Static):
     def _tick(self) -> None:
         tasks = self._bg_manager.active_tasks()
         if not tasks:
-            self.display = False
+            if self.styles.display != "none":
+                self.styles.display = "none"
             return
-        self.display = True
+        if self.styles.display == "none":
+            self.styles.display = "block"
         from cli.tools import TOOL_DISPLAY_NAMES
         lines = []
         for t in tasks:
@@ -1407,9 +1409,12 @@ class WyckoffTUI(App):
     def _on_bg_progress(self, _task) -> None:
         """后台线程报进度 → 刷新面板。"""
         try:
-            self.call_from_thread(self.query_one("#bg-panel", BackgroundTaskPanel)._tick)
+            self.call_from_thread(self._refresh_bg_panel)
         except Exception:
             pass
+
+    def _refresh_bg_panel(self) -> None:
+        self.query_one("#bg-panel", BackgroundTaskPanel)._tick()
 
     def _on_bg_complete(self, task_id: str, tool_name: str, result) -> None:
         """后台任务完成，注入结果到消息队列。"""
