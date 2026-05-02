@@ -351,7 +351,10 @@ def _load_cached_market_signal() -> dict | None:
 
 
 def _render_market_signal_banner() -> None:
-    row = _load_cached_market_signal()
+    try:
+        row = _load_cached_market_signal()
+    except Exception:
+        return
     if not isinstance(row, dict):
         return
 

@@ -26,6 +26,7 @@ if __name__ == "__main__" or not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integrations.supabase_market_signal import upsert_market_signal_daily
 from utils.feishu import send_feishu_notification
+from utils.trading_clock import is_a_share_trading_day
 
 TZ = ZoneInfo("Asia/Shanghai")
 US_TZ = ZoneInfo("America/New_York")
@@ -529,28 +530,32 @@ def main() -> int:
         return 0
 
     trade_date = _premarket_session_trade_date_str()
-    db_ok = upsert_market_signal_daily(
-        trade_date,
-        {
-            "a50_value_date": a50.get("date"),
-            "a50_source": a50.get("source"),
-            "a50_close": a50.get("close"),
-            "a50_pct_chg": a50.get("pct_chg"),
-            "vix_value_date": vix.get("date"),
-            "vix_source": vix.get("source"),
-            "vix_close": vix.get("close"),
-            "vix_pct_chg": vix.get("pct_chg"),
-            "premarket_regime": regime,
-            "premarket_reasons": reasons,
-            "source_jobs": {
-                "premarket_risk_job": {
-                    "updated_at": datetime.now(TZ).isoformat(),
-                    "writer": "a50_vix_risk",
-                }
+
+    if not is_a_share_trading_day(datetime.now(TZ).date()):
+        _log(f"非A股交易日({trade_date})，跳过写库", logs_path)
+    else:
+        db_ok = upsert_market_signal_daily(
+            trade_date,
+            {
+                "a50_value_date": a50.get("date"),
+                "a50_source": a50.get("source"),
+                "a50_close": a50.get("close"),
+                "a50_pct_chg": a50.get("pct_chg"),
+                "vix_value_date": vix.get("date"),
+                "vix_source": vix.get("source"),
+                "vix_close": vix.get("close"),
+                "vix_pct_chg": vix.get("pct_chg"),
+                "premarket_regime": regime,
+                "premarket_reasons": reasons,
+                "source_jobs": {
+                    "premarket_risk_job": {
+                        "updated_at": datetime.now(TZ).isoformat(),
+                        "writer": "a50_vix_risk",
+                    }
+                },
             },
-        },
-    )
-    _log(f"市场信号写库(premarket): ok={db_ok}, trade_date={trade_date}, regime={regime}", logs_path)
+        )
+        _log(f"市场信号写库(premarket): ok={db_ok}, trade_date={trade_date}, regime={regime}", logs_path)
 
     if not webhook:
         _log("FEISHU_WEBHOOK_URL 未配置，跳过飞书发送", logs_path)
