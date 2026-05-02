@@ -98,7 +98,7 @@ def _get_chat_config() -> tuple[str, str, str, str]:
     根据 session_state['chat_provider'] 决定从哪组配置中读取凭证。
     """
     provider = (
-        str(st.session_state.get("chat_provider") or "").strip() or "gemini"
+        str(st.session_state.get("chat_provider") or "").strip() or "1router"
     )
 
     if provider == "gemini":

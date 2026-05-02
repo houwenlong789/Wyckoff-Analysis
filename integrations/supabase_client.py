@@ -52,6 +52,9 @@ def reset_user_settings_state() -> None:
     st.session_state.tg_chat_id = ""
 
     # 多厂商大模型配置（按需使用）
+    st.session_state["1router_api_key"] = ""
+    st.session_state["1router_model"] = ""
+    st.session_state["1router_base_url"] = OPENAI_COMPATIBLE_BASE_URLS.get("1router", "")
     st.session_state.openai_api_key = ""
     st.session_state.openai_model = ""
     st.session_state.openai_base_url = OPENAI_COMPATIBLE_BASE_URLS.get("openai", "")
