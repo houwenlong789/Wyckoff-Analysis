@@ -5,18 +5,20 @@
 用法:
     wyckoff                         # 启动 TUI
     wyckoff update                  # 升级到最新版
+    wyckoff screen                  # 全市场漏斗筛选
+    wyckoff backtest                # 策略历史回测
+    wyckoff report 000001,600519    # AI 深度研报
+    wyckoff mcp                     # 启动 MCP Server
+    wyckoff memory                  # 查看 Agent 记忆
+    wyckoff log                     # 查看对话日志
     wyckoff dashboard               # 启动本地可视化面板
-    wyckoff auth <email> <password> # 登录
-    wyckoff auth logout             # 退出登录
-    wyckoff auth status             # 查看登录状态
-    wyckoff model list              # 列出模型
-    wyckoff model add               # 添加模型（交互式）
-    wyckoff model set <id> <provider> <key> [--model X] [--base-url X]
-    wyckoff model rm <id>           # 删除模型
-    wyckoff model default <id>      # 设默认模型
-    wyckoff config                  # 查看数据源配置
-    wyckoff config tushare <token>  # 配置 Tushare Token
-    wyckoff config tickflow <key>   # 配置 TickFlow API Key
+    wyckoff auth <email>            # 登录
+    wyckoff model list/add/rm       # 模型管理
+    wyckoff config                  # 数据源配置
+    wyckoff portfolio list/add/rm   # 持仓管理
+    wyckoff signal                  # 信号确认池
+    wyckoff recommend               # AI 推荐跟踪
+    wyckoff sync                    # 同步 Supabase → SQLite
 """
 from __future__ import annotations
 
@@ -482,6 +484,227 @@ def _cmd_recommend(args):
 
 
 # ---------------------------------------------------------------------------
+# wyckoff screen — 漏斗筛选
+# ---------------------------------------------------------------------------
+
+def _cmd_screen(args):
+    from integrations.local_db import init_db
+    init_db()
+    board = args.board or "all"
+    print(f"正在执行全市场漏斗筛选 (board={board}) ...")
+    from scripts.wyckoff_funnel import run_funnel_job
+    try:
+        triggers, metrics = run_funnel_job()
+    except Exception as e:
+        print(f"✗ 筛选失败: {e}")
+        sys.exit(1)
+    total = sum(len(v) for v in triggers.values())
+    print(f"\n✓ 筛选完成  命中 {total} 只")
+    for signal_type, items in triggers.items():
+        if items:
+            print(f"\n  [{signal_type}] ({len(items)} 只)")
+            for code, score in items[:10]:
+                print(f"    {code}  score={score:.2f}")
+    if metrics:
+        print(f"\n  指标: {json.dumps(metrics, ensure_ascii=False)}")
+
+
+# ---------------------------------------------------------------------------
+# wyckoff backtest — 策略回测
+# ---------------------------------------------------------------------------
+
+def _cmd_backtest(args):
+    from datetime import date, timedelta
+    from pathlib import Path
+    from integrations.local_db import init_db
+    init_db()
+
+    end_dt = date.today() - timedelta(days=1)
+    start_dt = end_dt - timedelta(days=args.months * 30)
+    print(f"正在回测 {start_dt} → {end_dt}  hold_days={args.hold_days} ...")
+    from scripts.backtest_runner import run_backtest
+    try:
+        df, summary = run_backtest(
+            start_dt=start_dt,
+            end_dt=end_dt,
+            hold_days=args.hold_days,
+            top_n=args.top_n,
+            board="all",
+            sample_size=0,
+            trading_days=60,
+            max_workers=4,
+        )
+    except Exception as e:
+        print(f"✗ 回测失败: {e}")
+        sys.exit(1)
+    print(f"\n✓ 回测完成  交易 {len(df)} 笔")
+    for k, v in summary.items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
+        else:
+            print(f"  {k}: {v}")
+
+
+# ---------------------------------------------------------------------------
+# wyckoff report — AI 研报
+# ---------------------------------------------------------------------------
+
+def _cmd_report(args):
+    codes = [c.strip() for c in args.codes.split(",") if c.strip()]
+    if not codes:
+        print("用法: wyckoff report 000001,600519")
+        sys.exit(1)
+    from integrations.local_db import init_db
+    init_db()
+    # 需要 LLM
+    from cli.auth import load_model_configs, load_default_model_id
+    configs = load_model_configs()
+    default_id = load_default_model_id()
+    if not configs:
+        print("✗ 未配置模型，请先 wyckoff model add")
+        sys.exit(1)
+    cfg = next((c for c in configs if c["id"] == default_id), configs[0])
+    env_map = {"gemini": "GEMINI_API_KEY", "claude": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+    ek = env_map.get(cfg.get("provider_name", ""))
+    if ek and cfg.get("api_key"):
+        os.environ.setdefault(ek, cfg["api_key"])
+
+    symbols_info = [{"code": c, "name": "", "tag": ""} for c in codes]
+    print(f"正在生成 AI 研报 ({len(codes)} 只) ...")
+    from scripts.step3_batch_report import run as run_report
+    try:
+        result = run_report(
+            symbols_info=symbols_info,
+            webhook_url="",
+            api_key=cfg.get("api_key", ""),
+            model=cfg.get("model", ""),
+            notify=False,
+            provider=cfg.get("provider_name", "gemini"),
+            llm_base_url=cfg.get("base_url", ""),
+        )
+        print("✓ 研报生成完成")
+        if isinstance(result, dict):
+            for camp, stocks in result.items():
+                if stocks:
+                    print(f"\n  [{camp}]")
+                    for s in stocks[:5]:
+                        print(f"    {s}")
+    except Exception as e:
+        print(f"✗ 研报生成失败: {e}")
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# wyckoff mcp — 启动 MCP Server
+# ---------------------------------------------------------------------------
+
+def _cmd_mcp(_args):
+    print("启动 Wyckoff MCP Server ...")
+    print("按 Ctrl+C 停止\n")
+    from mcp_server import main as mcp_main
+    try:
+        mcp_main()
+    except KeyboardInterrupt:
+        print("\nMCP Server 已停止")
+
+
+# ---------------------------------------------------------------------------
+# wyckoff memory — 查看/清除 Agent 记忆
+# ---------------------------------------------------------------------------
+
+def _cmd_memory(args):
+    from integrations.local_db import init_db, get_recent_memories, prune_memories
+    init_db()
+    sub = args.memory_cmd or "list"
+
+    if sub == "list":
+        mtype = args.type or None
+        memories = get_recent_memories(memory_type=mtype, limit=args.limit)
+        if not memories:
+            print("暂无记忆记录")
+            return
+        print(f"Agent 记忆 ({len(memories)} 条)")
+        print(f"{'ID':>5} {'类型':<12} {'日期':<20} {'内容'}")
+        print("-" * 80)
+        for m in memories:
+            content = m.get("content", "")
+            if len(content) > 60:
+                content = content[:60] + "..."
+            print(f"{m['id']:>5} {m.get('memory_type',''):<12} {m.get('created_at','')[:19]:<20} {content}")
+        return
+
+    if sub == "search":
+        keyword = args.keyword
+        if not keyword:
+            print("用法: wyckoff memory search <关键词>")
+            sys.exit(1)
+        from integrations.local_db import search_memory
+        results = search_memory(keyword=keyword, limit=args.limit)
+        if not results:
+            print(f"未找到包含 '{keyword}' 的记忆")
+            return
+        for m in results:
+            content = m.get("content", "")
+            if len(content) > 80:
+                content = content[:80] + "..."
+            print(f"  [{m['id']}] {m.get('memory_type','')} | {content}")
+        return
+
+    if sub == "clear":
+        count = prune_memories(keep_days=0)
+        print(f"✓ 已清除 {count} 条过期记忆（preference 类型保留）")
+        return
+
+    if sub == "delete":
+        mid = args.memory_id
+        if not mid:
+            print("用法: wyckoff memory delete <id>")
+            sys.exit(1)
+        from integrations.local_db import get_db
+        conn = get_db()
+        with conn:
+            cur = conn.execute("DELETE FROM agent_memory WHERE id=?", (mid,))
+        if cur.rowcount:
+            print(f"✓ 已删除记忆 #{mid}")
+        else:
+            print(f"✗ 记忆 #{mid} 不存在")
+        return
+
+    print(f"未知子命令: {sub}")
+    print("用法: wyckoff memory [list|search|clear|delete]")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# wyckoff log — 查看对话日志
+# ---------------------------------------------------------------------------
+
+def _cmd_log(args):
+    from integrations.local_db import init_db, load_chat_logs
+    init_db()
+    session_id = args.session or None
+    limit = args.limit
+    logs = load_chat_logs(session_id=session_id, limit=limit)
+    if not logs:
+        print("暂无对话日志")
+        return
+    if session_id:
+        print(f"会话 {session_id} 的对话日志 ({len(logs)} 条)")
+    else:
+        print(f"最近对话日志 ({len(logs)} 条)")
+    print()
+    for entry in logs[-limit:]:
+        role = entry.get("role", "")
+        ts = entry.get("created_at", "")[:19]
+        content = entry.get("content", "")
+        if isinstance(content, str) and len(content) > 120:
+            content = content[:120] + "..."
+        tag = {"user": "❯", "assistant": "◆", "tool": "⚙"}.get(role, "·")
+        sid = entry.get("session_id", "")[:8]
+        print(f"  {tag} [{ts}] ({sid}) {content}")
+
+
+# ---------------------------------------------------------------------------
 # wyckoff sync — 手动同步 Supabase → SQLite
 # ---------------------------------------------------------------------------
 
@@ -696,6 +919,36 @@ def main():
     p_dash = sub.add_parser("dashboard", help="启动本地可视化面板", aliases=["dash"])
     p_dash.add_argument("--port", type=int, default=8765, help="HTTP 端口 (默认 8765)")
 
+    # wyckoff screen
+    p_screen = sub.add_parser("screen", help="全市场漏斗筛选")
+    p_screen.add_argument("--board", default="all", help="板块 (all/main/gem/star)")
+
+    # wyckoff backtest
+    p_bt = sub.add_parser("backtest", help="策略历史回测", aliases=["bt"])
+    p_bt.add_argument("--hold-days", type=int, default=15, help="持有天数 (默认 15)")
+    p_bt.add_argument("--months", type=int, default=18, help="回测月数 (默认 18)")
+    p_bt.add_argument("--top-n", type=int, default=5, help="每批取前N只 (默认 5)")
+
+    # wyckoff report
+    p_report = sub.add_parser("report", help="AI 深度研报")
+    p_report.add_argument("codes", help="股票代码，逗号分隔 (如 000001,600519)")
+
+    # wyckoff mcp
+    sub.add_parser("mcp", help="启动 MCP Server")
+
+    # wyckoff memory
+    p_mem = sub.add_parser("memory", help="Agent 记忆管理", aliases=["mem"])
+    p_mem.add_argument("memory_cmd", nargs="?", default="list", help="list/search/clear/delete")
+    p_mem.add_argument("keyword", nargs="?", default="", help="搜索关键词 (search 时)")
+    p_mem.add_argument("memory_id", nargs="?", default="", help="记忆 ID (delete 时)")
+    p_mem.add_argument("--type", default="", help="过滤类型 (session/preference)")
+    p_mem.add_argument("-n", "--limit", type=int, default=20, help="返回条数")
+
+    # wyckoff log
+    p_log = sub.add_parser("log", help="查看对话日志")
+    p_log.add_argument("--session", default="", help="指定会话 ID")
+    p_log.add_argument("-n", "--limit", type=int, default=30, help="返回条数")
+
     # wyckoff sync
     p_sync = sub.add_parser("sync", help="同步 Supabase → 本地 SQLite")
     p_sync.add_argument("sync_cmd", nargs="?", default="", help="status: 查看同步状态")
@@ -719,6 +972,18 @@ def main():
     elif args.cmd in ("dashboard", "dash"):
         from cli.dashboard import start_dashboard
         start_dashboard(port=args.port)
+    elif args.cmd == "screen":
+        _cmd_screen(args)
+    elif args.cmd in ("backtest", "bt"):
+        _cmd_backtest(args)
+    elif args.cmd == "report":
+        _cmd_report(args)
+    elif args.cmd == "mcp":
+        _cmd_mcp(args)
+    elif args.cmd in ("memory", "mem"):
+        _cmd_memory(args)
+    elif args.cmd == "log":
+        _cmd_log(args)
     elif args.cmd == "sync":
         _cmd_sync(args)
     else:
