@@ -600,6 +600,18 @@ def _cmd_tui(_args=None):
     if state["provider"]:
         tools.set_provider(state["provider"])
 
+    # 后台启动 dashboard 并打开浏览器
+    import threading, webbrowser
+    def _dash_bg():
+        try:
+            from http.server import HTTPServer
+            from cli.dashboard import _Handler
+            HTTPServer(("127.0.0.1", 8765), _Handler).serve_forever()
+        except Exception:
+            pass
+    threading.Thread(target=_dash_bg, daemon=True).start()
+    webbrowser.open("http://127.0.0.1:8765")
+
     from cli.tui import WyckoffTUI
     app = WyckoffTUI(
         provider=state["provider"],

@@ -301,6 +301,8 @@ def run_funnel_job(
         f"merged={len(merged_symbols)}, st_excluded={len(st_symbols)}, "
         f"final={len(all_symbols)}, limit={pool_stats.get('pool_limit', 0)}, batches={total_batches} (batch_size={BATCH_SIZE})"
     )
+    from cli.progress import report_progress
+    report_progress("股票池加载", f"共{len(all_symbols)}只", 0.05)
 
     # 批量元数据
     print(f"[funnel] 加载行业映射...")
@@ -402,6 +404,7 @@ def run_funnel_job(
 
     # 统一漏斗计算：L1 -> L2 -> L3 -> L4
     print(f"[funnel] 开始执行全量漏斗筛选...")
+    report_progress("漏斗筛选", "L1~L4 计算中", 0.85)
 
     # Layer 1
     l1_input = list(all_df_map.keys())
@@ -547,6 +550,7 @@ def run_funnel_job(
         f"L3={metrics['layer3']}, 命中={total_hits}, "
         f"Top行业={top_sectors}, 各触发={metrics['by_trigger']}"
     )
+    report_progress("筛选完成", f"命中={total_hits}只", 1.0)
 
     return triggers, metrics
 

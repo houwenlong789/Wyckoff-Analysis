@@ -646,6 +646,8 @@ def run_backtest(
     else:
         symbols, name_map = _build_universe(board=board, sample_size=sample_size)
         print(f"[backtest] 股票池={len(symbols)} (网络拉取, board={board}, sample_size={sample_size})")
+    from cli.progress import report_progress
+    report_progress("股票池建立", f"共{len(symbols)}只", 0.0)
     if not symbols:
         raise RuntimeError("股票池为空")
 
@@ -672,6 +674,7 @@ def run_backtest(
         )
     else:
         print(f"[backtest] 开始拉取历史日线: symbols={len(symbols)}, workers={max_workers}")
+        report_progress("拉取历史", f"共{len(symbols)}只", 0.0)
         with ThreadPoolExecutor(max_workers=max(int(max_workers), 1)) as ex:
             futures = {
                 ex.submit(_fetch_hist_norm, sym, prefetch_start, prefetch_end): sym for sym in symbols
@@ -687,7 +690,9 @@ def run_backtest(
                     failures.append(f"{sym}:{err or 'unknown'}")
                 if done % 200 == 0 or done == len(futures):
                     print(f"[backtest] 拉取进度 {done}/{len(futures)}")
+                    report_progress("拉取历史", f"{done}/{len(futures)}", done / len(futures) * 0.4)
         print(f"[backtest] 历史拉取完成: ok={len(all_df_map)}, fail={len(failures)}")
+        report_progress("拉取完成", f"成功={len(all_df_map)}", 0.4)
 
     if bench_df is None or bench_df.empty:
         try:
@@ -1058,6 +1063,7 @@ def run_backtest(
 
         if (idx + 1) % 20 == 0 or (idx + 1) == max_idx:
             print(f"[backtest] 回放进度 {idx + 1}/{max_idx}, trades={len(records)}")
+            report_progress("回放交易", f"{idx + 1}/{max_idx}", 0.4 + (idx + 1) / max_idx * 0.6)
 
     trades_df = pd.DataFrame([r.__dict__ for r in records])
     summary = {

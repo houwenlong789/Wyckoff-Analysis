@@ -20,6 +20,10 @@ class BackgroundTask:
     error: str = ""
     submitted_at: float = field(default_factory=time.monotonic)
     completed_at: float | None = None
+    # progress fields
+    current_stage: str = ""
+    current_detail: str = ""
+    current_progress: float = -1.0   # 0.0~1.0, -1 = indeterminate
 
 
 class BackgroundTaskManager:
@@ -28,6 +32,14 @@ class BackgroundTaskManager:
     def __init__(self):
         self._tasks: dict[str, BackgroundTask] = {}
         self._lock = threading.Lock()
+        self._progress_callback: Callable | None = None
+
+    def set_progress_callback(self, cb: Callable | None) -> None:
+        self._progress_callback = cb
+
+    def active_tasks(self) -> list[BackgroundTask]:
+        with self._lock:
+            return [t for t in self._tasks.values() if t.status == "running"]
 
     def submit(
         self,
@@ -44,6 +56,15 @@ class BackgroundTaskManager:
         def _run():
             with self._lock:
                 task.status = "running"
+            from cli.progress import set_reporter
+            def _on_progress(stage, detail, progress):
+                with self._lock:
+                    task.current_stage = stage
+                    task.current_detail = detail
+                    task.current_progress = progress
+                if self._progress_callback:
+                    self._progress_callback(task)
+            set_reporter(_on_progress)
             try:
                 result = fn(**args)
                 with self._lock:
@@ -60,6 +81,8 @@ class BackgroundTaskManager:
                     task.completed_at = time.monotonic()
                 if on_complete:
                     on_complete(task_id, tool_name, {"error": str(e)})
+            finally:
+                set_reporter(None)
 
         t = threading.Thread(target=_run, daemon=True, name=f"bg-{task_id}")
         t.start()

@@ -18,7 +18,7 @@ from core.constants import LOCAL_DB_PATH
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -123,6 +123,18 @@ CREATE TABLE IF NOT EXISTS tail_buy_history (
     UNIQUE(code, run_date)
 );
 
+CREATE TABLE IF NOT EXISTS background_task_result (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    session_id TEXT DEFAULT '',
+    tool_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'completed',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    summary TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(task_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_rec_date ON recommendation_tracking(recommend_date);
 CREATE INDEX IF NOT EXISTS idx_sig_status ON signal_pending(status);
 CREATE INDEX IF NOT EXISTS idx_mem_type ON agent_memory(memory_type);
@@ -131,6 +143,8 @@ CREATE INDEX IF NOT EXISTS idx_chatlog_session ON chat_log(session_id);
 CREATE INDEX IF NOT EXISTS idx_chatlog_created ON chat_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_tail_run_date ON tail_buy_history(run_date);
 CREATE INDEX IF NOT EXISTS idx_tail_decision ON tail_buy_history(final_decision);
+CREATE INDEX IF NOT EXISTS idx_bg_task_session ON background_task_result(session_id);
+CREATE INDEX IF NOT EXISTS idx_bg_task_created ON background_task_result(created_at);
 """
 
 
@@ -161,12 +175,54 @@ def init_db() -> None:
             conn.execute("ALTER TABLE portfolio_position ADD COLUMN buy_dt TEXT DEFAULT ''")
         except Exception:
             pass
+    if current < 5:
+        _backfill_background_tasks_from_chat_log(conn)
     if current < _SCHEMA_VERSION:
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version) VALUES(?)",
             (_SCHEMA_VERSION,),
         )
         conn.commit()
+
+
+def _backfill_background_tasks_from_chat_log(conn: sqlite3.Connection) -> None:
+    """Backfill historical background completions that were only saved as chat messages."""
+    try:
+        rows = conn.execute(
+            """SELECT id, session_id, content, created_at
+               FROM chat_log
+               WHERE role='user' AND content LIKE '[后台任务完成] %'"""
+        ).fetchall()
+    except sqlite3.Error:
+        return
+    for row in rows:
+        content = str(row["content"] or "")
+        rest = content.removeprefix("[后台任务完成] ").strip()
+        tool_name = rest.split(":", 1)[0].strip() or "background"
+        status = "failed" if '"error"' in content or "'error'" in content else "completed"
+        payload = {"raw": content}
+        if ":" in rest:
+            raw_json = rest.split(":", 1)[1].strip()
+            try:
+                payload = json.loads(raw_json)
+            except json.JSONDecodeError:
+                payload = {"raw": raw_json}
+        result_json = json.dumps(payload, ensure_ascii=False, default=str)
+        summary = result_json[:2000] + ("..." if len(result_json) > 2000 else "")
+        conn.execute(
+            """INSERT OR IGNORE INTO background_task_result
+               (task_id, session_id, tool_name, status, result_json, summary, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                f"chatlog_{row['id']}",
+                row["session_id"] or "",
+                tool_name,
+                status,
+                result_json,
+                summary,
+                row["created_at"],
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +620,59 @@ def load_chat_logs(*, session_id: str | None = None, limit: int = 200) -> list[d
             (limit,),
         )
     return [dict(r) for r in cur.fetchall()]
+
+
+def save_background_task_result(
+    task_id: str,
+    tool_name: str,
+    result: Any,
+    *,
+    session_id: str = "",
+    status: str = "completed",
+) -> int:
+    """Persist a completed CLI background task result for dashboard history."""
+    result_json = json.dumps(result, ensure_ascii=False, default=str)
+    summary = result_json
+    if len(summary) > 2000:
+        summary = summary[:2000] + "..."
+    conn = get_db()
+    with conn:
+        cur = conn.execute(
+            """INSERT OR REPLACE INTO background_task_result
+               (task_id, session_id, tool_name, status, result_json, summary, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, datetime('now'))""",
+            (task_id, session_id, tool_name, status, result_json, summary),
+        )
+        return cur.lastrowid or 0
+
+
+def load_background_task_results(*, limit: int = 100) -> list[dict]:
+    conn = get_db()
+    cur = conn.execute(
+        """SELECT id, task_id, session_id, tool_name, status, summary, created_at
+           FROM background_task_result
+           ORDER BY created_at DESC
+           LIMIT ?""",
+        (min(max(limit, 1), 500),),
+    )
+    return [dict(r) for r in cur.fetchall()]
+
+
+def load_background_task_result(task_id: str) -> dict | None:
+    conn = get_db()
+    cur = conn.execute(
+        "SELECT * FROM background_task_result WHERE task_id=?",
+        (task_id,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    data = dict(row)
+    try:
+        data["result"] = json.loads(data.get("result_json") or "{}")
+    except json.JSONDecodeError:
+        data["result"] = data.get("result_json") or ""
+    return data
 
 
 def get_session_preview(session_id: str) -> str:

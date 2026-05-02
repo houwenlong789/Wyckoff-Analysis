@@ -280,6 +280,8 @@ def fetch_all_ohlcv(
         f"(executor={executor_mode}, batch_size={batch_size}, max_workers={max_workers}, "
         f"batch_timeout={batch_timeout}s, fetch_timeout={FETCH_TIMEOUT}s, retries={MAX_RETRIES})"
     )
+    from cli.progress import report_progress
+    report_progress("拉取日线", f"共{len(symbols)}只, {total_batches}批", 0.0)
     total_fetch_started = time.monotonic()
     for i in range(0, len(symbols), batch_size):
         batch_no = i // batch_size + 1
@@ -361,6 +363,7 @@ def fetch_all_ohlcv(
             f"[funnel] 批次#{batch_no} 完成: 成功={batch_ok}, 失败={batch_fail}, "
             f"耗时={batch_elapsed:.1f}s, qps={batch_qps:.2f}, 累计成功={fetch_ok}, 累计失败={fetch_fail}"
         )
+        report_progress("拉取日线", f"批次#{batch_no}/{total_batches}", batch_no / total_batches)
         if i + batch_size < len(symbols) and batch_sleep > 0:
             time.sleep(batch_sleep)
 
@@ -370,6 +373,7 @@ def fetch_all_ohlcv(
         f"[funnel] 日线拉取完成: 成功={fetch_ok}, 失败={fetch_fail}, "
         f"总耗时={total_fetch_elapsed:.1f}s, 平均qps={overall_qps:.2f}"
     )
+    report_progress("拉取完成", f"成功={fetch_ok}, 失败={fetch_fail}", 1.0)
     if enforce_target_trade_date:
         print(
             f"[funnel] 交易日对齐检查: mismatch={fetch_date_mismatch}, "

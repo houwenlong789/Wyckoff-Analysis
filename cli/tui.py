@@ -79,6 +79,46 @@ class StatusBar(Static):
     """
 
 
+class BackgroundTaskPanel(Static):
+    """后台任务实时进度面板 — 仅有运行中任务时显示。"""
+
+    DEFAULT_CSS = """
+    BackgroundTaskPanel {
+        dock: top;
+        height: auto;
+        max-height: 5;
+        background: $surface;
+        color: $text;
+        padding: 0 1;
+        display: none;
+        border-bottom: solid $primary;
+    }
+    """
+
+    def __init__(self, bg_manager, **kwargs):
+        super().__init__("", **kwargs)
+        self._bg_manager = bg_manager
+
+    def on_mount(self) -> None:
+        self.set_interval(1.0, self._tick)
+
+    def _tick(self) -> None:
+        tasks = self._bg_manager.active_tasks()
+        if not tasks:
+            self.display = False
+            return
+        self.display = True
+        from cli.tools import TOOL_DISPLAY_NAMES
+        lines = []
+        for t in tasks:
+            m, s = divmod(int(time.monotonic() - t.submitted_at), 60)
+            stage = t.current_stage or "准备中"
+            detail = f" · {t.current_detail}" if t.current_detail else ""
+            name = TOOL_DISPLAY_NAMES.get(t.tool_name, t.tool_name)
+            lines.append(f"  ⟳ {name}  {stage}{detail}    [{m}m{s:02d}s]" if m else f"  ⟳ {name}  {stage}{detail}    [{s}s]")
+        self.update("\n".join(lines))
+
+
 class SelectorScreen(ModalScreen):
     """模态选择器 — 上下键选择，Enter 确认，Esc 取消。"""
 
@@ -339,6 +379,7 @@ class WyckoffTUI(App):
         # 后台任务管理
         from cli.background import BackgroundTaskManager
         self._bg_manager = BackgroundTaskManager()
+        self._bg_manager.set_progress_callback(self._on_bg_progress)
         if self._tools:
             self._tools.set_background_manager(self._bg_manager, self._on_bg_complete)
             self._tools.set_confirm_callback(self._request_tool_confirm)
@@ -348,6 +389,7 @@ class WyckoffTUI(App):
 
     def compose(self) -> ComposeResult:
         yield StatusBar(self._build_status_text(), id="status-bar")
+        yield BackgroundTaskPanel(self._bg_manager, id="bg-panel")
         yield ChatLog(id="chat-log", highlight=True, markup=True, wrap=True)
         yield Input(placeholder="问我关于股票的任何问题... (/help 查看命令)", id="chat-input")
 
@@ -1362,11 +1404,30 @@ class WyckoffTUI(App):
 
     # ----- 后台任务回调 -----
 
+    def _on_bg_progress(self, _task) -> None:
+        """后台线程报进度 → 刷新面板。"""
+        try:
+            self.call_from_thread(self.query_one("#bg-panel", BackgroundTaskPanel)._tick)
+        except Exception:
+            pass
+
     def _on_bg_complete(self, task_id: str, tool_name: str, result) -> None:
         """后台任务完成，注入结果到消息队列。"""
         from cli.tools import TOOL_DISPLAY_NAMES
         display = TOOL_DISPLAY_NAMES.get(tool_name, tool_name)
         is_error = isinstance(result, dict) and result.get("error")
+
+        try:
+            from integrations.local_db import save_background_task_result
+            save_background_task_result(
+                task_id,
+                tool_name,
+                result,
+                session_id=self._session_id,
+                status="failed" if is_error else "completed",
+            )
+        except Exception:
+            pass
 
         log = self.query_one("#chat-log", ChatLog)
         if is_error:

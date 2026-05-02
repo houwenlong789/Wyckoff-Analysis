@@ -166,6 +166,22 @@ def _get_chat_log(session_id: str) -> list[dict]:
         return []
 
 
+def _get_background_tasks() -> list[dict]:
+    try:
+        from integrations.local_db import load_background_task_results
+        return load_background_task_results(limit=100)
+    except Exception:
+        return []
+
+
+def _get_background_task(task_id: str) -> dict:
+    try:
+        from integrations.local_db import load_background_task_result
+        return load_background_task_result(task_id) or {}
+    except Exception:
+        return {}
+
+
 def _get_agent_log_tail(lines: int = 100) -> str:
     try:
         from core.constants import LOCAL_DB_PATH
@@ -226,6 +242,11 @@ class _Handler(BaseHTTPRequestHandler):
         elif path.startswith("/api/chat-log/"):
             sid = path.split("/")[-1]
             self._json(_get_chat_log(sid))
+        elif path == "/api/background-tasks":
+            self._json(_get_background_tasks())
+        elif path.startswith("/api/background-tasks/"):
+            task_id = path.split("/")[-1]
+            self._json(_get_background_task(task_id))
         elif path == "/api/agent-log":
             params = parse_qs(parsed.query)
             n = int(params.get("lines", ["100"])[0])
@@ -476,6 +497,7 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;b
     <div class="nav-item" data-page="portfolio" data-i18n="nav_portfolio"></div>
     <div class="nav-item" data-page="memory" data-i18n="nav_memory"></div>
     <div class="nav-item" data-page="config" data-i18n="nav_config"></div>
+    <div class="nav-item" data-page="bgtasks" data-i18n="nav_bgtasks"></div>
     <div class="nav-item" data-page="chatlog" data-i18n="nav_chatlog"></div>
     <div class="nav-item" data-page="agentlog" data-i18n="nav_agentlog"></div>
     <div class="nav-item" data-page="sync" data-i18n="nav_sync"></div>
@@ -500,10 +522,10 @@ const API=p=>fetch(p).then(r=>r.json());
 const I18N={
 zh:{
   nav_overview:'总览',nav_recommendations:'AI 推荐',nav_signals:'信号池',nav_tailbuy:'尾盘记录',nav_portfolio:'持仓',
-  nav_memory:'Agent 记忆',nav_config:'配置',nav_chatlog:'对话日志',nav_agentlog:'Agent 日志',nav_sync:'同步状态',
+  nav_memory:'Agent 记忆',nav_config:'配置',nav_bgtasks:'后台任务',nav_chatlog:'对话日志',nav_agentlog:'Agent 日志',nav_sync:'同步状态',
   theme_dark:'深色',theme_light:'浅色',
   overview:'总览',recommendations:'AI 推荐',signals:'信号池',tailbuy:'尾盘记录',portfolio:'持仓',
-  memory:'Agent 记忆',config:'配置',chatlog:'对话日志',agentlog:'Agent 日志',sync:'同步状态',
+  memory:'Agent 记忆',config:'配置',bgtasks:'后台任务',chatlog:'对话日志',agentlog:'Agent 日志',sync:'同步状态',
   no_tailbuy:'暂无尾盘买入记录',th_run_date:'执行日',th_signal_type:'信号',th_rule_score:'规则分',th_priority:'优先级',th_llm:'LLM',confirm_del_tailbuy:'确认删除尾盘记录：',
   card_recs:'AI 推荐跟踪',card_signals:'信号确认池',card_portfolio:'持仓',card_memory:'Agent 记忆',card_sync:'同步状态',
   tracked:'只跟踪中',pending_confirm:'条待确认',positions:'持仓',cash:'可用资金',stored:'条记忆',synced:'表已同步',
@@ -518,6 +540,7 @@ zh:{
   model_alias:'别名',provider:'供应商',api_key_label:'API Key',model_name:'模型名',base_url_label:'Base URL',
   th_id:'ID',th_provider:'供应商',th_model:'模型',th_apikey:'API Key',th_baseurl:'Base URL',th_actions:'操作',
   sync_title:'Supabase → SQLite 同步',never_synced:'从未同步',rows:'行',
+  no_bg_tasks:'暂无后台任务',th_task:'任务',th_tool:'工具',bg_session:'会话',th_created:'时间',th_summary:'摘要',view_result:'查看结果',bg_back:'返回',
   no_sessions:'暂无对话记录',th_session:'会话',th_started:'开始',th_ended:'结束',
   th_messages:'消息数',th_tokens_in:'输入 Token',th_tokens_out:'输出 Token',th_error:'状态',
   view:'查看',back:'返回列表',session:'会话',no_messages:'暂无消息',
@@ -527,10 +550,10 @@ zh:{
 },
 en:{
   nav_overview:'Overview',nav_recommendations:'Recommendations',nav_signals:'Signals',nav_tailbuy:'Tail Buy',nav_portfolio:'Portfolio',
-  nav_memory:'Memory',nav_config:'Config',nav_chatlog:'Chat Log',nav_agentlog:'Agent Log',nav_sync:'Sync Status',
+  nav_memory:'Memory',nav_config:'Config',nav_bgtasks:'Background Tasks',nav_chatlog:'Chat Log',nav_agentlog:'Agent Log',nav_sync:'Sync Status',
   theme_dark:'Dark',theme_light:'Light',
   overview:'Overview',recommendations:'Recommendations',signals:'Signals',tailbuy:'Tail Buy',portfolio:'Portfolio',
-  memory:'Memory',config:'Config',chatlog:'Chat Log',agentlog:'Agent Log',sync:'Sync Status',
+  memory:'Memory',config:'Config',bgtasks:'Background Tasks',chatlog:'Chat Log',agentlog:'Agent Log',sync:'Sync Status',
   no_tailbuy:'No tail buy records',th_run_date:'Run Date',th_signal_type:'Signal',th_rule_score:'Rule Score',th_priority:'Priority',th_llm:'LLM',confirm_del_tailbuy:'Delete tail buy record: ',
   card_recs:'AI Recommendations',card_signals:'Signal Pool',card_portfolio:'Portfolio',card_memory:'Agent Memory',card_sync:'Sync Status',
   tracked:'tracked stocks',pending_confirm:'pending confirmation',positions:'positions',cash:'cash',stored:'stored memories',synced:'tables synced',
@@ -545,6 +568,7 @@ en:{
   model_alias:'Alias',provider:'Provider',api_key_label:'API Key',model_name:'Model',base_url_label:'Base URL',
   th_id:'ID',th_provider:'Provider',th_model:'Model',th_apikey:'API Key',th_baseurl:'Base URL',th_actions:'Actions',
   sync_title:'Supabase → SQLite Sync',never_synced:'Never synced',rows:'rows',
+  no_bg_tasks:'No background tasks',th_task:'Task',th_tool:'Tool',bg_session:'Session',th_created:'Time',th_summary:'Summary',view_result:'View',bg_back:'Back',
   no_sessions:'No chat sessions recorded',th_session:'Session',th_started:'Started',th_ended:'Ended',
   th_messages:'Messages',th_tokens_in:'Tokens In',th_tokens_out:'Tokens Out',th_error:'Status',
   view:'VIEW',back:'Back to sessions',session:'Session',no_messages:'No messages',
@@ -590,6 +614,7 @@ async function loadPage(page){
       case 'overview':return renderOverview(c);case 'recommendations':return renderRecommendations(c);
       case 'signals':return renderSignals(c);case 'tailbuy':return renderTailBuy(c);case 'portfolio':return renderPortfolio(c);
       case 'memory':return renderMemory(c);case 'config':return renderConfig(c);
+      case 'bgtasks':return renderBgTasks(c);
       case 'chatlog':return renderChatLog(c);case 'agentlog':return renderAgentLog(c);
       case 'sync':return renderSync(c);
     }
@@ -765,6 +790,26 @@ async function renderSync(c){
     let cls='none',label=t('never_synced');
     if(s.last_synced_at){const age=(now-new Date(s.last_synced_at+'Z').getTime())/3600000;cls=age<8?'ok':'stale';label=localTime(s.last_synced_at)}
     return `<div class="sync-row"><div class="sync-dot ${cls}"></div><div style="flex:1;font-weight:600">${s.table}</div><div style="color:var(--text2)">${s.row_count||0} ${t('rows')}</div><div style="color:var(--text-dim);font-size:11px;width:180px;text-align:right">${label}</div></div>`}).join('')}</div>`}
+
+// ═══ Background Tasks ═══
+let _bgTaskId=null;
+async function renderBgTasks(c){
+  if(_bgTaskId)return renderBgTaskDetail(c,_bgTaskId);
+  const rows=await API('/api/background-tasks');
+  if(!Array.isArray(rows)||!rows.length){c.innerHTML=`<div class="empty">${t('no_bg_tasks')}</div>`;return}
+  const statusPill=s=>`<span class="pill ${s==='completed'?'pill-green':(s==='failed'?'pill-red':'pill-amber')}">${s||''}</span>`;
+  c.innerHTML=`<div class="tbl-wrap fade-in"><table class="tbl"><thead><tr><th>${t('th_task')}</th><th>${t('th_tool')}</th><th>${t('th_status')}</th><th>${t('bg_session')}</th><th>${t('th_created')}</th><th>${t('th_summary')}</th><th></th></tr></thead><tbody>${rows.map(r=>`
+    <tr><td style="color:var(--accent);cursor:pointer" onclick="viewBgTask('${escHtml(r.task_id)}')">${escHtml(r.task_id)}</td><td>${escHtml(r.tool_name)}</td><td>${statusPill(r.status)}</td><td>${escHtml(r.session_id||'')}</td><td>${localTime(r.created_at)}</td><td style="max-width:420px;overflow:hidden;text-overflow:ellipsis">${escHtml(r.summary||'')}</td><td><span style="cursor:pointer;color:var(--accent)" onclick="viewBgTask('${escHtml(r.task_id)}')">${t('view_result')}</span></td></tr>`).join('')}</tbody></table></div>`}
+window.viewBgTask=function(taskId){_bgTaskId=taskId;loadPage('bgtasks')};
+window.backToBgTasks=function(){_bgTaskId=null;loadPage('bgtasks')};
+async function renderBgTaskDetail(c,taskId){
+  const row=await API('/api/background-tasks/'+encodeURIComponent(taskId));
+  if(!row||!row.task_id){c.innerHTML=`<div class="empty">${t('no_data')}</div>`;return}
+  const payload=row.result!==undefined?JSON.stringify(row.result,null,2):(row.result_json||'');
+  c.innerHTML=`<div style="margin-bottom:12px"><span style="cursor:pointer;color:var(--accent)" onclick="backToBgTasks()">&larr; ${t('bg_back')}</span><span style="margin-left:12px;color:var(--text-dim)">${escHtml(row.task_id)}</span></div>
+    <div class="card fade-in"><div class="card-title">${escHtml(row.tool_name||'')} · ${escHtml(row.status||'')} · ${localTime(row.created_at)}</div>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">${t('bg_session')}: ${escHtml(row.session_id||'')}</div>
+    <pre style="font-size:11px;line-height:1.6;color:var(--text);white-space:pre-wrap;word-break:break-all;max-height:calc(100vh - 210px);overflow-y:auto">${escHtml(payload)}</pre></div>`}
 
 // ═══ Chat Log ═══
 let _chatSessionId=null;

@@ -740,6 +740,8 @@ def run(
             items.append(s)
 
     print(f"[step3] AI 输入股票数={len(items)}（全量命中输入）")
+    from cli.progress import report_progress
+    report_progress("研报准备", f"输入{len(items)}只", 0.1)
 
     end_day = resolve_end_calendar_day()
     window = _resolve_trading_window(end_calendar_day=end_day, trading_days=TRADING_DAYS)
@@ -1291,8 +1293,9 @@ def run(
 
     track_reports: list[tuple[str, str]] = []
     used_models: dict[str, str] = {}
-    for request in track_requests:
+    for _req_idx, request in enumerate(track_requests):
         track = str(request.get("track", "Trend"))
+        report_progress("LLM生成", f"{track}轨调用中", 0.3 + 0.5 * _req_idx / max(len(track_requests), 1))
         ok, track_report, used_model = _call_track_report(
             track=track,
             system_prompt=WYCKOFF_FUNNEL_SYSTEM_PROMPT,
@@ -1379,4 +1382,5 @@ def run(
         f"[step3] 研报发送成功，股票数={sum(len(payloads_by_track.get(t, [])) for t in active_tracks)}，"
         f"拉取失败数={len(failed)}"
     )
+    report_progress("研报完成", "", 1.0)
     return (True, "ok", report)

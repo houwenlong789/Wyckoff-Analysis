@@ -1637,6 +1637,8 @@ def run(
     print(
         f"[step4] 持仓来源: {portfolio_source} | portfolio_id={portfolio_id} | state_sig={state_signature or '-'}"
     )
+    from cli.progress import report_progress
+    report_progress("持仓决策", f"来源: {portfolio_source}", 0.1)
 
     if not str(tg_bot_token or "").strip() or not str(tg_chat_id or "").strip():
         print("[step4] tg_bot_token/tg_chat_id 未配置，跳过 Step4 推送")
@@ -1762,6 +1764,7 @@ def run(
         symbols=sorted(allowed_codes),
     )
 
+    report_progress("LLM决策", "计算中", 0.5)
     try:
         raw = call_llm(
             provider="gemini",
@@ -1957,4 +1960,5 @@ def run(
         f"[step4] 交易工单发送成功: decisions={len(decisions)}, tickets={len(tickets)}, "
         f"model={model}, portfolio_id={portfolio_id}"
     )
+    report_progress("决策完成", f"订单={len(tickets)}条", 1.0)
     return (True, "ok")

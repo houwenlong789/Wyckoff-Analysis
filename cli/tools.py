@@ -410,7 +410,7 @@ class ToolRegistry:
 
         # 长任务提交后台
         if name in BACKGROUND_TOOLS and self._bg_manager is not None:
-            task_id = f"bg_{int(time.time())}_{name}"
+            task_id = f"bg_{time.time_ns()}_{name}"
             display = TOOL_DISPLAY_NAMES.get(name, name)
             self._bg_manager.submit(
                 task_id, name, fn, call_args,
