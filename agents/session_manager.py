@@ -76,11 +76,13 @@ class ChatSessionManager:
     def current_session_id(self) -> str | None:
         return self._current_session_id
 
-    def new_session(self, *, state: dict[str, Any] | None = None) -> str:
+    def new_session(self, *, state: dict[str, Any] | None = None, auth_state: dict[str, str] | None = None) -> str:
         """创建新会话，返回 session_id。"""
         session_id = f"session_{uuid4().hex[:12]}"
         initial_state = state or {}
         initial_state.setdefault("user_id", self.user_id)
+        if auth_state:
+            initial_state.update(auth_state)
 
         loop = asyncio.new_event_loop()
         try:
@@ -98,11 +100,30 @@ class ChatSessionManager:
         finally:
             loop.close()
 
-    def ensure_session(self) -> str:
-        """确保有活跃会话，没有则创建新的。"""
+    def ensure_session(self, *, auth_state: dict[str, str] | None = None) -> str:
+        """确保有活跃会话，没有则创建新的。有 auth_state 时更新到会话。"""
         if self._current_session_id is None:
-            return self.new_session()
+            return self.new_session(auth_state=auth_state)
+        if auth_state:
+            self._update_session_state(self._current_session_id, auth_state)
         return self._current_session_id
+
+    def _update_session_state(self, session_id: str, patch: dict[str, Any]) -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            session = loop.run_until_complete(
+                self._session_service.get_session(
+                    app_name=APP_NAME,
+                    user_id=self.user_id,
+                    session_id=session_id,
+                )
+            )
+            if session:
+                session.state.update(patch)
+        except Exception:
+            pass
+        finally:
+            loop.close()
 
     def set_session(self, session_id: str) -> None:
         """切换到指定会话。"""
@@ -127,7 +148,7 @@ class ChatSessionManager:
         return final_text or "(Agent 未返回内容)"
 
     def send_message_streaming(
-        self, text: str
+        self, text: str, *, auth_state: dict[str, str] | None = None
     ) -> Generator[tuple[str, Any], None, None]:
         """
         真流式发送消息 — Thread + Queue 桥接 ADK async → sync generator。
@@ -142,7 +163,7 @@ class ChatSessionManager:
             - ("done", str)         — 最终完整回复
             - ("error", str)        — 错误信息
         """
-        session_id = self.ensure_session()
+        session_id = self.ensure_session(auth_state=auth_state)
 
         user_content = types.Content(
             role="user",

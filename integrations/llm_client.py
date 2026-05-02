@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # 多厂商：Gemini + OpenAI 兼容（OpenAI/智谱/Minimax/DeepSeek/Qwen/火山引擎）
 SUPPORTED_PROVIDERS = (
-    "1router",
+    "1route",
     "gemini",
     "openai",
     "zhipu",
@@ -30,7 +30,7 @@ SUPPORTED_PROVIDERS = (
 )
 # OpenAI 兼容接口的默认 base_url（可被调用方 base_url 覆盖）
 OPENAI_COMPATIBLE_BASE_URLS = {
-    "1router": "https://www.1route.dev/v1",
+    "1route": "https://www.1route.dev/v1",
     "openai": "https://api.openai.com/v1",
     "zhipu": "https://open.bigmodel.cn/api/paas/v4",
     "minimax": "https://api.minimax.chat/v1",
@@ -51,7 +51,7 @@ GEMINI_RETRY_DELAY = 2.0
 
 # 供应商展示名（供 UI selectbox 的 format_func 使用）
 PROVIDER_LABELS: dict[str, str] = {
-    "1router": "1Router（推荐）",
+    "1route": "1Route（推荐）",
     "gemini": "Gemini",
     "openai": "OpenAI",
     "zhipu": "智谱",
@@ -88,7 +88,7 @@ def get_provider_credentials(provider: str) -> tuple[str, str, str]:
         base_url = (OPENAI_COMPATIBLE_BASE_URLS.get(provider, "") or "").strip()
     if not model and provider == "gemini":
         model = st.session_state.get("gemini_model") or DEFAULT_GEMINI_MODEL
-    if not model and provider == "1router":
+    if not model and provider == "1route":
         model = "gpt-5.5"
     return (api_key, model or "", base_url)
 

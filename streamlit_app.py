@@ -98,7 +98,7 @@ def _get_chat_config() -> tuple[str, str, str, str]:
     根据 session_state['chat_provider'] 决定从哪组配置中读取凭证。
     """
     provider = (
-        str(st.session_state.get("chat_provider") or "").strip() or "1router"
+        str(st.session_state.get("chat_provider") or "").strip() or "1route"
     )
 
     if provider == "gemini":
@@ -137,6 +137,14 @@ def _get_chat_config() -> tuple[str, str, str, str]:
         )
 
     return provider, api_key, model, base_url
+
+
+def _get_auth_state() -> dict[str, str]:
+    """从 st.session_state 提取当前 Supabase auth tokens 供 ADK 会话使用。"""
+    return {
+        "access_token": st.session_state.get("access_token") or "",
+        "refresh_token": st.session_state.get("refresh_token") or "",
+    }
 
 
 def _init_chat_manager():
@@ -366,7 +374,7 @@ with content_col:
         if new_chat_clicked:
             mgr = st.session_state.get("chat_manager")
             if mgr:
-                mgr.new_session()
+                mgr.new_session(auth_state=_get_auth_state())
             st.session_state["chat_messages"] = []
             st.rerun()
 
@@ -404,7 +412,7 @@ with content_col:
                         unsafe_allow_html=True,
                     )
 
-                    for event_type, data in manager.send_message_streaming(prompt):
+                    for event_type, data in manager.send_message_streaming(prompt, auth_state=_get_auth_state()):
 
                         if event_type == "thinking":
                             # 首次出现 thinking 时创建可折叠区域

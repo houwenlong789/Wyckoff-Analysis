@@ -175,6 +175,29 @@ def _get_credential(tool_context: ToolContext | None, key: str, env_fallback: st
     return ""
 
 
+def _resolve_llm_config(tool_context) -> tuple[str, str, str, str]:
+    """解析用户配置的 LLM 凭据：(provider, api_key, model, base_url)。
+
+    优先读 CLI 默认模型配置，其次 Supabase/env gemini 兜底。
+    """
+    try:
+        from cli.auth import load_model_configs, load_default_model_id
+        configs = load_model_configs()
+        default_id = load_default_model_id()
+        cfg = next((c for c in configs if c["id"] == default_id), None)
+        if cfg and cfg.get("api_key"):
+            prov = cfg.get("provider_name", "openai")
+            from integrations.llm_client import OPENAI_COMPATIBLE_BASE_URLS
+            base = cfg.get("base_url", "") or OPENAI_COMPATIBLE_BASE_URLS.get(prov, "")
+            return prov, cfg["api_key"], cfg.get("model", ""), base
+    except Exception:
+        pass
+    api_key = _get_credential(tool_context, "gemini_api_key", "GEMINI_API_KEY")
+    model = _get_credential(tool_context, "gemini_model", "GEMINI_MODEL") or "gemini-2.0-flash"
+    base_url = _get_credential(tool_context, "gemini_base_url", "")
+    return "gemini", api_key, model, base_url
+
+
 def _ensure_tushare_token(tool_context: ToolContext | None) -> None:
     """确保 tushare 能拿到 token：从 Supabase 获取后设置到环境变量。
 
@@ -708,7 +731,7 @@ def generate_ai_report(stock_codes: list[str], tool_context: ToolContext) -> dic
     - 储备营地 (Building Cause)
     - 起跳板 (On the Springboard)
 
-    需要配置 Gemini API Key 才能使用。
+    需要配置大模型 API Key 才能使用。
 
     Args:
         stock_codes: 股票代码列表，如 ["000001", "600519", "300750"]，最多 10 只
@@ -723,12 +746,9 @@ def generate_ai_report(stock_codes: list[str], tool_context: ToolContext) -> dic
         if len(stock_codes) > 10:
             stock_codes = stock_codes[:10]
 
-        # 从 Supabase 获取 Gemini 凭据，兜底环境变量
-        api_key = _get_credential(tool_context, "gemini_api_key", "GEMINI_API_KEY")
-        model = _get_credential(tool_context, "gemini_model", "GEMINI_MODEL") or "gemini-2.0-flash"
-        base_url = _get_credential(tool_context, "gemini_base_url", "")
+        provider, api_key, model, base_url = _resolve_llm_config(tool_context)
         if not api_key:
-            return {"error": "未配置 Gemini API Key，无法生成 AI 研报。请在设置页面配置。"}
+            return {"error": "未配置 LLM API Key，无法生成 AI 研报。请通过 /model 或设置页面配置。"}
 
         # 构建 symbols_info 格式
         symbols_info = []
@@ -746,7 +766,7 @@ def generate_ai_report(stock_codes: list[str], tool_context: ToolContext) -> dic
             model=model,
             benchmark_context=None,
             notify=False,
-            provider="gemini",
+            provider=provider,
             llm_base_url=base_url,
         )
 
@@ -773,7 +793,7 @@ def generate_strategy_decision(tool_context: ToolContext) -> dict:
     - 现有持仓的去留决策（EXIT/TRIM/HOLD）
     - 外部候选的买入建议（PROBE/ATTACK）
 
-    需要配置 Gemini API Key 和持仓数据。
+    需要配置大模型 API Key 和持仓数据。
 
     Returns:
         策略决策结果 dict。
@@ -781,12 +801,9 @@ def generate_strategy_decision(tool_context: ToolContext) -> dict:
     try:
         _ensure_tushare_token(tool_context)
 
-        # 从 Supabase 获取 Gemini 凭据
-        api_key = _get_credential(tool_context, "gemini_api_key", "GEMINI_API_KEY")
-        model = _get_credential(tool_context, "gemini_model", "GEMINI_MODEL") or "gemini-2.0-flash"
-        base_url = _get_credential(tool_context, "gemini_base_url", "")
+        provider, api_key, model, base_url = _resolve_llm_config(tool_context)
         if not api_key:
-            return {"error": "未配置 Gemini API Key，无法生成策略决策。请在设置页面配置。"}
+            return {"error": "未配置 LLM API Key，无法生成策略决策。请通过 /model 或设置页面配置。"}
 
         user_id = _get_user_id(tool_context)
         from integrations.supabase_portfolio import build_user_live_portfolio_id
@@ -812,7 +829,7 @@ def generate_strategy_decision(tool_context: ToolContext) -> dict:
                 model=model,
                 benchmark_context=None,
                 notify=False,
-                provider="gemini",
+                provider=provider,
                 llm_base_url=base_url,
             )
 
