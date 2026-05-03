@@ -891,13 +891,14 @@ async function renderChatSession(c,sid){
   c.innerHTML=`<div class="fade-in" style="display:flex;height:calc(100vh - 120px);gap:0">
     <!-- Left: Traces + Spans Tree -->
     <div style="width:380px;min-width:320px;border-right:1px solid var(--border);overflow-y:auto;padding:12px">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
         <span style="cursor:pointer;color:var(--accent)" onclick="backToSessions()">&larr; ${t('back')}</span>
         <div style="display:flex;gap:8px;font-size:10px;color:var(--text-dim)">
           <span>Traces <b>${traces.length}</b></span>
           <span>Spans <b>${totalSpans}</b></span>
         </div>
       </div>
+      <div style="font-size:10px;color:var(--text-dim);margin-bottom:10px;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${sid}">${t('session')}: ${sid}</div>
       ${traces.map((tr,i)=>{
         const isActive=i===sel;
         const bg=isActive?'background:var(--accent-dim);border-left:3px solid var(--accent)':'border-left:3px solid transparent';
