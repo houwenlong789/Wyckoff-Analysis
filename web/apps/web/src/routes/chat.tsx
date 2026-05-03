@@ -1,9 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { Send, RotateCcw, ChevronDown } from 'lucide-react'
+import { Send, RotateCcw, ChevronDown, ChevronRight, Wrench, Brain } from 'lucide-react'
 import { useAuthStore } from '@/stores/auth'
-import { loadLLMConfig, loadAllModels, runChatAgentStream, type LLMConfig, type ModelOption } from '@/lib/chat-agent'
+import { loadLLMConfig, loadAllModels, runChatAgentStream, type LLMConfig, type ModelOption, type StepInfo } from '@/lib/chat-agent'
 import { MarkdownContent } from '@/components/markdown'
-import { WyckoffLoading } from '@/components/loading'
 
 const TOOL_LABELS: Record<string, string> = {
   search_stock: '搜索股票',
@@ -22,6 +21,49 @@ interface Message {
   role: 'user' | 'assistant'
   content: string
   isError?: boolean
+  steps?: StepInfo[]
+}
+
+function StepsCollapsible({ steps }: { steps: StepInfo[] }) {
+  const [expanded, setExpanded] = useState(false)
+
+  if (steps.length === 0) return null
+
+  const toolCalls = steps.filter((s) => s.type === 'tool_call')
+  const summary = toolCalls.length > 0
+    ? `${toolCalls.length} 个工具调用`
+    : `${steps.length} 个推理步骤`
+
+  return (
+    <div className="mb-2">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-1 text-[11px] text-muted-foreground/70 hover:text-muted-foreground transition-colors"
+      >
+        <ChevronRight size={12} className={`transition-transform ${expanded ? 'rotate-90' : ''}`} />
+        <span>{summary}</span>
+      </button>
+      {expanded && (
+        <div className="mt-1.5 ml-3 space-y-1 border-l-2 border-border/50 pl-2.5">
+          {steps.map((step, i) => (
+            <div key={i} className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              {step.type === 'tool_call' ? (
+                <>
+                  <Wrench size={10} className="text-amber-500" />
+                  <span>{TOOL_LABELS[step.toolName!] || step.toolName}</span>
+                </>
+              ) : (
+                <>
+                  <Brain size={10} className="text-blue-500" />
+                  <span className="line-clamp-1">{step.text?.slice(0, 80)}…</span>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
 }
 
 export function ChatPage() {
@@ -33,8 +75,7 @@ export function ChatPage() {
   const [llmConfig, setLlmConfig] = useState<LLMConfig | null>(null)
   const [models, setModels] = useState<ModelOption[]>([])
   const [showModelPicker, setShowModelPicker] = useState(false)
-  const [streamingText, setStreamingText] = useState('')
-  const [toolStatus, setToolStatus] = useState('')
+  const [liveSteps, setLiveSteps] = useState<StepInfo[]>([])
   const scrollRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef(false)
   const pickerRef = useRef<HTMLDivElement>(null)
@@ -64,7 +105,7 @@ export function ChatPage() {
 
   useEffect(() => {
     scrollToBottom()
-  }, [messages, streamingText, scrollToBottom])
+  }, [messages, liveSteps, scrollToBottom])
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -81,11 +122,8 @@ export function ChatPage() {
     setInput('')
     setError('')
     setLoading(true)
-    setStreamingText('')
-    setToolStatus('')
+    setLiveSteps([])
     abortRef.current = false
-
-    let accumulated = ''
 
     const chatHistory = newMessages
       .filter((m) => !m.isError)
@@ -99,37 +137,23 @@ export function ChatPage() {
       user!.id,
       chatHistory,
       {
-        onText: (text) => {
+        onStep: (step) => {
           if (abortRef.current) return
-          accumulated = text
-          setStreamingText(text)
-          setToolStatus('')
+          setLiveSteps((prev) => [...prev, step])
         },
-        onToolCall: (toolName) => {
+        onFinish: (finalText, steps) => {
           if (abortRef.current) return
-          const label = TOOL_LABELS[toolName] || toolName
-          setToolStatus(`正在调用：${label}`)
-        },
-        onFinish: (finalText) => {
-          if (abortRef.current) return
-          const content = finalText || accumulated
-          if (content) {
-            setMessages((prev) => [...prev, { role: 'assistant', content }])
+          if (finalText) {
+            setMessages((prev) => [...prev, { role: 'assistant', content: finalText, steps }])
           }
-          setStreamingText('')
-          setToolStatus('')
+          setLiveSteps([])
           setLoading(false)
         },
         onError: (err) => {
           const msg = err.message || '请求失败'
           setError(msg)
-          if (accumulated) {
-            setMessages((prev) => [...prev, { role: 'assistant', content: accumulated }])
-          } else {
-            setMessages((prev) => [...prev, { role: 'assistant', content: `⚠️ ${msg}`, isError: true }])
-          }
-          setStreamingText('')
-          setToolStatus('')
+          setMessages((prev) => [...prev, { role: 'assistant', content: `⚠️ ${msg}`, isError: true }])
+          setLiveSteps([])
           setLoading(false)
         },
       },
@@ -139,8 +163,7 @@ export function ChatPage() {
   function handleNewChat() {
     abortRef.current = true
     setMessages([])
-    setStreamingText('')
-    setToolStatus('')
+    setLiveSteps([])
     setError('')
     setLoading(false)
   }
@@ -198,7 +221,7 @@ export function ChatPage() {
 
       {/* Messages */}
       <div ref={scrollRef} className="flex-1 overflow-auto px-6 py-4">
-        {messages.length === 0 && !streamingText ? (
+        {messages.length === 0 && !loading ? (
           <div className="flex h-full flex-col items-center justify-center text-muted-foreground">
             <div className="mb-4 text-4xl">📈</div>
             <p className="text-sm font-medium">我是威科夫，只看供需和主力行为</p>
@@ -217,7 +240,7 @@ export function ChatPage() {
             <div className="mt-8 rounded-lg border border-dashed border-border/60 px-4 py-2.5 text-center">
               <p className="text-[11px] text-muted-foreground/70">
                 网页版暂不支持会话历史、Agent 记忆与后台任务 ·{' '}
-                <code className="rounded bg-muted px-1 py-0.5 text-[10px]">pip install youngcan-wyckoff-analysis</code>{' '}
+                <code className="rounded bg-muted px-1 py-0.5 text-[10px]">curl -fsSL https://raw.githubusercontent.com/YoungCan-Wang/Wyckoff-Analysis/main/install.sh | bash</code>{' '}
                 解锁完整能力
               </p>
             </div>
@@ -238,24 +261,49 @@ export function ChatPage() {
                         : 'bg-muted text-foreground'
                   }`}
                 >
-                  {msg.role === 'user' ? msg.content : <MarkdownContent content={msg.content} />}
+                  {msg.role === 'user' ? (
+                    msg.content
+                  ) : (
+                    <>
+                      {msg.steps && msg.steps.length > 0 && <StepsCollapsible steps={msg.steps} />}
+                      <MarkdownContent content={msg.content} />
+                    </>
+                  )}
                 </div>
               </div>
             ))}
 
-            {/* Streaming response */}
+            {/* Live streaming indicator */}
             {loading && (
               <div className="flex justify-start">
                 <div className="max-w-[80%] rounded-2xl bg-muted px-4 py-2.5 text-sm text-foreground">
-                  {streamingText ? (
-                    <span><MarkdownContent content={streamingText} className="inline" /><span className="animate-pulse">▌</span></span>
-                  ) : toolStatus ? (
-                    <span className="text-muted-foreground">
-                      <span className="mr-1.5 inline-block h-2 w-2 animate-pulse rounded-full bg-primary" />
-                      {toolStatus}
-                    </span>
+                  {liveSteps.length > 0 ? (
+                    <div className="space-y-1.5">
+                      {liveSteps.map((step, i) => (
+                        <div key={i} className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                          {step.type === 'tool_call' ? (
+                            <>
+                              <Wrench size={10} className="text-amber-500" />
+                              <span>✓ {TOOL_LABELS[step.toolName!] || step.toolName}</span>
+                            </>
+                          ) : (
+                            <>
+                              <Brain size={10} className="text-blue-500" />
+                              <span className="line-clamp-1">{step.text?.slice(0, 60)}…</span>
+                            </>
+                          )}
+                        </div>
+                      ))}
+                      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                        <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
+                        <span>思考中…</span>
+                      </div>
+                    </div>
                   ) : (
-                    <WyckoffLoading size="sm" />
+                    <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                      <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
+                      <span>思考中…</span>
+                    </div>
                   )}
                 </div>
               </div>
@@ -291,4 +339,3 @@ export function ChatPage() {
     </div>
   )
 }
-

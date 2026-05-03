@@ -5,34 +5,34 @@
 ## 系统全景
 
 ```
-     ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-     │  Streamlit   │  │  CLI (TUI)   │  │  MCP Server  │  │  GitHub      │
-     │  Web UI      │  │  Terminal    │  │  (stdio)     │  │  Actions     │
-     └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-            │                 │                 │                 │
-            ▼                 ▼                 ▼                 ▼
-     ┌─────────────────────────────────────────────────────────────────┐
-     │                      Agent Brain                                │
-     │  Web: Google ADK · CLI: Agent Loop + BG Task · MCP: FastMCP    │
-     │                                                                 │
-     │  10 专业工具 + 5 通用能力 — LLM 自主编排                          │
-     │  自动 Plan Mode — 复杂任务拆步骤执行                              │
-     └──────────────────────────┬──────────────────────────────────────┘
-                                         │
-          ┌──────────────────────────────┼──────────────────────────────┐
-          ▼                              ▼                              ▼
-   ┌─────────────┐              ┌──────────────┐              ┌──────────────┐
-   │ Core Engine │              │ LLM          │              │ Storage      │
-   │             │              │              │              │              │
-   │ Funnel      │              │ Gemini  ★    │              │ Supabase     │
-   │ Diagnostic  │              │ Claude       │              │ SQLite 本地  │
-   │ Strategy    │              │ OpenAI       │              │  (离线缓存)  │
-   │ Signal      │              │ DeepSeek     │              │              │
-   │ Sector      │              │ Qwen/Kimi    │              └──────────────┘
-   │ Tail-Buy    │              │ 智谱/火山    │
-   └──────┬──────┘              │ Minimax      │
-          │                     └──────────────┘
-          ▼
+     ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+     │ React Web   │  │  Streamlit   │  │  CLI (TUI)   │  │  MCP Server  │  │  GitHub      │
+     │ (CF Pages)  │  │  Web UI      │  │  Terminal    │  │  (stdio)     │  │  Actions     │
+     └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+            │                 │                 │                 │                 │
+            ▼                 ▼                 ▼                 ▼                 ▼
+     ┌─────────────────────────────────────────────────────────────────────────────────┐
+     │                              Agent Brain                                        │
+     │  React: Vercel AI SDK · Streamlit: Google ADK · CLI: Agent Loop · MCP: FastMCP │
+     │                                                                                 │
+     │  10 专业工具 + 5 通用能力 — LLM 自主编排                                          │
+     │  自动 Plan Mode — 复杂任务拆步骤执行                                              │
+     └──────────────────────────────┬──────────────────────────────────────────────────┘
+                                    │
+          ┌─────────────────────────┼──────────────────────────────┐
+          ▼                         ▼                              ▼
+   ┌─────────────┐         ┌──────────────┐              ┌──────────────┐
+   │ Core Engine │         │ LLM          │              │ Storage      │
+   │             │         │              │              │              │
+   │ Funnel      │         │ Gemini  ★    │              │ Supabase     │
+   │ Diagnostic  │         │ Claude       │              │ SQLite 本地  │
+   │ Strategy    │         │ OpenAI       │              │  (离线缓存)  │
+   │ Signal      │         │ DeepSeek     │              │ CF Pages     │
+   │ Sector      │         │ Qwen/Kimi    │              │  (边缘代理)  │
+   │ Tail-Buy    │         │ 智谱/火山    │              └──────────────┘
+   └──────┬──────┘         │ Minimax      │
+          │                │ 1Route       │
+          ▼                └──────────────┘
    ┌─────────────┐
    │ Data Sources│
    │             │
@@ -44,26 +44,89 @@
    └─────────────┘
 ```
 
+## React Web App（Cloudflare Pages）
+
+### 架构概览
+
+```
+浏览器 (React SPA)
+  │
+  ├─→ Supabase (Auth + DB)     ← 直连，无 CORS 问题（Supabase 自带 CORS 头）
+  │
+  ├─→ /api/llm-proxy/*         ← CF Pages Functions 边缘代理
+  │       │
+  │       └─→ X-Target-URL 头指定目标 → DeepSeek / OpenAI / 1Route / ...
+  │
+  └─→ 静态资源 (CF Pages CDN)
+```
+
+**为什么需要边缘代理？**
+
+浏览器直接请求 LLM API 会被 CORS 拦截（这些 API 不返回 `Access-Control-Allow-Origin`），而 Supabase 本身配置了 CORS 所以可直连。CF Pages Functions 在边缘节点代理请求，绕过浏览器同源限制。
+
+### 技术栈
+
+| 层 | 技术 |
+|---|---|
+| 框架 | React 19 + React Router 7 + TypeScript |
+| AI SDK | Vercel AI SDK（`@ai-sdk/openai`，`compatibility: 'compatible'`） |
+| 样式 | Tailwind CSS 4 + shadcn/ui 组件 |
+| 构建 | Vite 6 → CF Pages 部署 |
+| 边缘代理 | CF Pages Functions（`web/functions/api/llm-proxy/[[path]].ts`） |
+| 状态管理 | Zustand（auth store） |
+| 数据 | Supabase JS SDK 直连 |
+
+### 页面结构
+
+| 路由 | 页面 | 功能 |
+|------|------|------|
+| `/chat` | 读盘室 | Agent 多轮对话，10 个工具，模型快速切换 |
+| `/analysis` | 单股分析 | 输入代码 → K 线图 + LLM 诊断 |
+| `/screener` | 漏斗选股 | 展示最新 AI 推荐结果 |
+| `/portfolio` | 持仓 | 持仓明细 + 收益率 |
+| `/tracking` | 跟踪 | 推荐跟踪 + 涨跌幅 |
+| `/tail-buy` | 尾盘记录 | 尾盘策略执行历史 |
+| `/export` | 数据导出 | CSV 导出 |
+| `/home` | 项目主页 | iframe 嵌入 GitHub Pages 主页 |
+| `/changelog` | 更新日志 | Web 端独立版本线（v1.0.0 起） |
+| `/settings` | 设置 | 模型 / API Key / 数据源配置 |
+
+### DeepSeek R1 兼容
+
+DeepSeek 推理模型要求多轮对话中 assistant 消息必须携带 `reasoning_content` 字段。Web 端通过 `createReasoningFetch()` 自定义 fetch 包装器实现：
+
+1. 响应时缓存每轮 assistant 的 `reasoning_content`
+2. 下次请求时自动注入到历史 assistant 消息中
+
+### 与 CLI 的能力差异
+
+网页版 Agent 缺失会话历史、跨会话记忆、后台任务、上下文压缩等能力。完整能力体验请移步 CLI。
+
+---
+
 ## Agent 架构
 
-### 三通道复用
+### 四通道复用
 
-Web、CLI、MCP 共享同一套工具函数（`agents/chat_tools.py`）+ 同一份 System Prompt（`core/prompts.py`），通过不同运行时驱动：
+Web（React）、Web（Streamlit）、CLI、MCP 共享同一套工具函数（`agents/chat_tools.py`）+ 同一份 System Prompt（`core/prompts.py`），通过不同运行时驱动：
 
-| | Web（Streamlit） | CLI（TUI） | MCP Server |
-|---|---|---|---|
-| 运行时 | Google ADK `LlmAgent` | Agent Loop（`cli/tui.py`） | FastMCP（stdio） |
-| UI | Streamlit 页面 | Textual 全屏 TUI | 无（被 Claude Code 等调用） |
-| 入口 | `streamlit_app.py` | `wyckoff`（无子命令） | `wyckoff-mcp` |
-| 工具数 | 10（共享） | 18（+5 本地 +3 委派） | 10（三层权限） |
-| 对话能力 | ✓ ADK Runner 多轮 | ✓ Agent Loop 多轮 | ✗ 单次工具调用 |
-| 后台任务 | ✗ | ✓ 长任务非阻塞 | ✗ |
-| 消息排队 | ✗ | ✓ Agent 忙时自动排队 | N/A |
-| Thinking | ✗ | ✓ 推理模型 reasoning 展示 | N/A |
-| Agent 记忆 | ✗ | ✓ 跨会话记忆（SQLite） | ✗ |
-| 上下文压缩 | ✗ | ✓ 动态阈值（25% context window）自动压缩 | N/A |
-| 可视化面板 | ✗ | ✓ `wyckoff dashboard` | ✗ |
-| Plan Mode | ✓ prompt 驱动 | ✓ prompt 驱动 | N/A |
+| | React Web (CF Pages) | Streamlit | CLI（TUI） | MCP Server |
+|---|---|---|---|---|
+| 运行时 | Vercel AI SDK `generateText` | Google ADK `LlmAgent` | Agent Loop（`cli/tui.py`） | FastMCP（stdio） |
+| UI | React SPA | Streamlit 页面 | Textual 全屏 TUI | 无（被 Claude Code 等调用） |
+| 入口 | `web/apps/web/` | `streamlit_app.py` | `wyckoff`（无子命令） | `wyckoff-mcp` |
+| 工具数 | 10（独立实现） | 10（共享） | 18（+5 本地 +3 委派） | 10（三层权限） |
+| 部署 | CF Pages + Functions | Streamlit Cloud | 本地 pip 安装 | 本地进程 |
+| 对话能力 | ✓ maxSteps 多轮 | ✓ ADK Runner 多轮 | ✓ Agent Loop 多轮 | ✗ 单次工具调用 |
+| 后台任务 | ✗ | ✗ | ✓ 长任务非阻塞 | ✗ |
+| 消息排队 | ✗ | ✗ | ✓ Agent 忙时自动排队 | N/A |
+| Thinking | ✗ | ✗ | ✓ 推理模型 reasoning 展示 | N/A |
+| Agent 记忆 | ✗ | ✗ | ✓ 跨会话记忆（SQLite） | ✗ |
+| 上下文压缩 | ✗ | ✗ | ✓ 动态阈值（25% context window）自动压缩 | N/A |
+| 可视化面板 | ✗ | ✗ | ✓ `wyckoff dashboard` | ✗ |
+| Plan Mode | ✗ | ✓ prompt 驱动 | ✓ prompt 驱动 | N/A |
+
+Streamlit 框架在 MVP 阶段支撑了产品验证，但随着项目功能持续增长，Streamlit 在组件定制、状态管理、部署灵活性等方面的局限性日益凸显，已不适用于当前规模。数据导出功能仍保留在 Streamlit 内，其余功能均已迁移至 CF Pages React 版本。
 
 **CLI 专属工具**（Web / MCP 不可用）：`exec_command`、`read_file`、`write_file`、`web_fetch`、`check_background_tasks`、`delegate_to_research`、`delegate_to_analysis`、`delegate_to_trading`
 
@@ -410,6 +473,7 @@ CREATE TABLE chat_log (
     elapsed_s   REAL DEFAULT 0,
     error       TEXT DEFAULT '',
     tool_calls  TEXT DEFAULT '',     -- JSON
+    metadata    TEXT DEFAULT '',     -- JSON（cache_read/cache_write/stop_reason/rounds/messages/system_prompt/tools）
     created_at  TEXT DEFAULT (datetime('now'))
 );
 ```
@@ -429,7 +493,7 @@ CREATE TABLE chat_log (
 
 | 表 | 用途 |
 |---|------|
-| `schema_version` | 迁移版本管理（当前 v6） |
+| `schema_version` | 迁移版本管理（当前 v7） |
 | `agent_memory_fts` | FTS5 全文检索索引（自动同步） |
 | `recommendation_tracking` | 推荐跟踪镜像 |
 | `signal_pending` | 信号池镜像 |
@@ -438,8 +502,9 @@ CREATE TABLE chat_log (
 | `portfolio_position` | 持仓明细镜像 |
 | `agent_memory` | 跨会话 Agent 记忆 |
 | `sync_meta` | 同步元数据（每表最后同步时间） |
-| `chat_log` | 对话日志（用户输入 + LLM 输出 + token） |
+| `chat_log` | 对话日志（用户输入 + LLM 输出 + token + metadata） |
 | `tail_buy_history` | 尾盘策略执行历史 |
+| `background_task_result` | 后台任务结果缓存 |
 
 ### Supabase → SQLite 同步
 
@@ -576,6 +641,7 @@ wyckoff signal [status]          # 查看信号池
 wyckoff recommend                # 查看推荐记录（别名 rec）
 wyckoff dashboard [--port N]     # 启动可视化面板（别名 dash）
 wyckoff sync [status]            # 手动同步 / 查看同步状态
+wyckoff cleanup [--days N]       # 清理过期本地数据（默认 30 天）
 wyckoff-mcp                      # 启动 MCP Server（供 Claude Code 等调用）
 ```
 
@@ -605,4 +671,11 @@ utils/           通知推送（飞书/企微/钉钉/Telegram）、格式化
 tests/           测试用例
 data/            本地缓存（交易日历、股票列表、行业映射）
 Formula/         Homebrew formula
+web/             React Web App（CF Pages 部署）
+  apps/web/      前端 SPA（React + Vite + Tailwind）
+    src/routes/  页面组件（chat / analysis / portfolio / ...）
+    src/lib/     chat-agent（Vercel AI SDK）、supabase 客户端
+    src/stores/  Zustand 状态管理（auth）
+  functions/     CF Pages Functions（边缘代理）
+    api/llm-proxy/  LLM API 反向代理
 ```

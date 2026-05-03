@@ -185,17 +185,6 @@ def _get_background_task(task_id: str) -> dict:
         return {}
 
 
-def _get_agent_log_tail(lines: int = 100) -> str:
-    try:
-        from core.constants import LOCAL_DB_PATH
-        log_path = LOCAL_DB_PATH.parent / "agent.log"
-        if not log_path.exists():
-            return ""
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
-            return "".join(all_lines[-lines:])
-    except Exception:
-        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -250,10 +239,6 @@ class _Handler(BaseHTTPRequestHandler):
         elif path.startswith("/api/background-tasks/"):
             task_id = path.split("/")[-1]
             self._json(_get_background_task(task_id))
-        elif path == "/api/agent-log":
-            params = parse_qs(parsed.query)
-            n = int(params.get("lines", ["100"])[0])
-            self._json({"log": _get_agent_log_tail(n)})
         else:
             self._html(_DASHBOARD_HTML)
 
@@ -514,7 +499,6 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;b
     <div class="nav-item" data-page="memory" data-i18n="nav_memory"></div>
     <div class="nav-item" data-page="bgtasks" data-i18n="nav_bgtasks"></div>
     <div class="nav-item" data-page="chatlog" data-i18n="nav_chatlog"></div>
-    <div class="nav-item" data-page="agentlog" data-i18n="nav_agentlog"></div>
     <div class="nav-item" data-page="sync" data-i18n="nav_sync"></div>
   </div>
   <div class="main">
@@ -537,10 +521,10 @@ const API=p=>fetch(p).then(r=>r.json());
 const I18N={
 zh:{
   nav_overview:'总览',nav_recommendations:'AI 推荐',nav_signals:'信号池',nav_tailbuy:'尾盘记录',nav_portfolio:'持仓',
-  nav_memory:'Agent 记忆',nav_config:'配置',nav_bgtasks:'后台任务',nav_chatlog:'对话日志',nav_agentlog:'Agent 日志',nav_sync:'同步状态',
+  nav_memory:'Agent 记忆',nav_config:'配置',nav_bgtasks:'后台任务',nav_chatlog:'对话日志',nav_sync:'同步状态',
   theme_dark:'深色',theme_light:'浅色',
   overview:'总览',recommendations:'AI 推荐',signals:'信号池',tailbuy:'尾盘记录',portfolio:'持仓',
-  memory:'Agent 记忆',config:'配置',bgtasks:'后台任务',chatlog:'对话日志',agentlog:'Agent 日志',sync:'同步状态',
+  memory:'Agent 记忆',config:'配置',bgtasks:'后台任务',chatlog:'对话日志',sync:'同步状态',
   no_tailbuy:'暂无尾盘买入记录',th_run_date:'执行日',th_signal_type:'信号',th_rule_score:'规则分',th_priority:'优先级',th_llm:'LLM',confirm_del_tailbuy:'确认删除尾盘记录：',
   card_recs:'AI 推荐跟踪',card_signals:'信号确认池',card_portfolio:'持仓',card_memory:'Agent 记忆',card_sync:'同步状态',
   tracked:'只跟踪中',pending_confirm:'条待确认',positions:'持仓',cash:'可用资金',stored:'条记忆',synced:'表已同步',
@@ -559,17 +543,16 @@ zh:{
   no_sessions:'暂无对话记录',th_session:'会话',th_started:'开始',th_ended:'结束',
   th_messages:'消息数',th_tokens_in:'输入 Token',th_tokens_out:'输出 Token',th_error:'状态',
   view:'查看',back:'返回列表',session:'会话',no_messages:'暂无消息',
-  agent_log_title:'Agent 日志（最近 200 行）',no_agent_log:'暂无日志 (~/.wyckoff/agent.log)',
   no_recs:'暂无推荐',no_signals:'暂无信号',
   confirm_del_rec:'确认删除推荐记录：',confirm_del_sig:'确认删除信号记录：',confirm_del_session:'确认删除整个会话？会话 ID：',
   buy_links:'购买 API Key',buy_tickflow:'数据源（TickFlow）',buy_llm:'大模型（1Route）',
 },
 en:{
   nav_overview:'Overview',nav_recommendations:'Recommendations',nav_signals:'Signals',nav_tailbuy:'Tail Buy',nav_portfolio:'Portfolio',
-  nav_memory:'Memory',nav_config:'Config',nav_bgtasks:'Background Tasks',nav_chatlog:'Chat Log',nav_agentlog:'Agent Log',nav_sync:'Sync Status',
+  nav_memory:'Memory',nav_config:'Config',nav_bgtasks:'Background Tasks',nav_chatlog:'Chat Log',nav_sync:'Sync Status',
   theme_dark:'Dark',theme_light:'Light',
   overview:'Overview',recommendations:'Recommendations',signals:'Signals',tailbuy:'Tail Buy',portfolio:'Portfolio',
-  memory:'Memory',config:'Config',bgtasks:'Background Tasks',chatlog:'Chat Log',agentlog:'Agent Log',sync:'Sync Status',
+  memory:'Memory',config:'Config',bgtasks:'Background Tasks',chatlog:'Chat Log',sync:'Sync Status',
   no_tailbuy:'No tail buy records',th_run_date:'Run Date',th_signal_type:'Signal',th_rule_score:'Rule Score',th_priority:'Priority',th_llm:'LLM',confirm_del_tailbuy:'Delete tail buy record: ',
   card_recs:'AI Recommendations',card_signals:'Signal Pool',card_portfolio:'Portfolio',card_memory:'Agent Memory',card_sync:'Sync Status',
   tracked:'tracked stocks',pending_confirm:'pending confirmation',positions:'positions',cash:'cash',stored:'stored memories',synced:'tables synced',
@@ -588,7 +571,6 @@ en:{
   no_sessions:'No chat sessions recorded',th_session:'Session',th_started:'Started',th_ended:'Ended',
   th_messages:'Messages',th_tokens_in:'Tokens In',th_tokens_out:'Tokens Out',th_error:'Status',
   view:'VIEW',back:'Back to sessions',session:'Session',no_messages:'No messages',
-  agent_log_title:'Agent Log (last 200 lines)',no_agent_log:'No agent log (~/.wyckoff/agent.log)',
   no_recs:'No recommendations',no_signals:'No signals',
   confirm_del_rec:'Delete recommendation: ',confirm_del_sig:'Delete signal: ',confirm_del_session:'Delete entire session? ID: ',
   buy_links:'Get API Keys',buy_tickflow:'Data Source (TickFlow)',buy_llm:'LLM API (1Route)',
@@ -632,7 +614,7 @@ async function loadPage(page){
       case 'signals':return renderSignals(c);case 'tailbuy':return renderTailBuy(c);case 'portfolio':return renderPortfolio(c);
       case 'memory':return renderMemory(c);
       case 'bgtasks':return renderBgTasks(c);
-      case 'chatlog':return renderChatLog(c);case 'agentlog':return renderAgentLog(c);
+      case 'chatlog':return renderChatLog(c);
       case 'sync':return renderSync(c);
     }
   }catch(e){c.innerHTML=`<div class="empty">Error: ${e.message}</div>`}
@@ -927,7 +909,7 @@ async function renderChatSession(c,sid){
           <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">
             <span style="font-size:10px;color:var(--text-dim)">${time}</span>
             ${dur?`<span style="font-size:10px;color:var(--text-dim)">${dur}</span>`:''}
-            ${trToolSpans.length?`<span class="pill pill-dim" style="font-size:9px">${trToolSpans.length} spans</span>`:''}
+            ${trToolSpans.length?`<span class="pill pill-dim" style="font-size:9px">${trToolSpans.length} spans</span>`:''}${(()=>{const ec=trToolSpans.filter(s=>s.status==='error').length;return ec?`<span class="pill pill-red" style="font-size:9px">${ec} errors</span>`:''})()}
           </div>
           <div style="font-size:12px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escHtml(uContent)}</div>
           ${aContent?`<div style="font-size:11px;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px">→ ${escHtml(aContent)}</div>`:''}
@@ -985,11 +967,6 @@ async function renderChatSession(c,sid){
     </div>
   </div>`}
 
-// ═══ Agent Log ═══
-async function renderAgentLog(c){
-  const data=await API('/api/agent-log?lines=200');const log=data?.log||'';
-  if(!log){c.innerHTML=`<div class="empty">${t('no_agent_log')}</div>`;return}
-  c.innerHTML=`<div class="card fade-in"><div class="card-title">${t('agent_log_title')}</div><pre style="font-size:11px;line-height:1.6;color:var(--text);white-space:pre-wrap;word-break:break-all;max-height:calc(100vh - 160px);overflow-y:auto">${escHtml(log)}</pre></div>`}
 
 // ═══ Init ═══
 applyI18n();loadPage('overview');

@@ -612,10 +612,15 @@ function buildTools(userId: string, config: LLMConfig) {
   }
 }
 
+export interface StepInfo {
+  type: 'tool_call' | 'text'
+  toolName?: string
+  text?: string
+}
+
 export interface StreamCallbacks {
-  onText: (text: string) => void
-  onToolCall: (toolName: string) => void
-  onFinish: (finalText: string) => void
+  onStep: (step: StepInfo) => void
+  onFinish: (finalText: string, steps: StepInfo[]) => void
   onError: (error: Error) => void
 }
 
@@ -628,6 +633,7 @@ export async function runChatAgentStream(
   const provider = createProxiedProvider(config)
 
   const tools = buildTools(userId, config)
+  const steps: StepInfo[] = []
 
   try {
     const result = await generateText({
@@ -639,16 +645,20 @@ export async function runChatAgentStream(
       onStepFinish: ({ toolCalls, text }) => {
         if (toolCalls && toolCalls.length > 0) {
           for (const tc of toolCalls) {
-            callbacks.onToolCall(tc.toolName)
+            const step: StepInfo = { type: 'tool_call', toolName: tc.toolName }
+            steps.push(step)
+            callbacks.onStep(step)
           }
         }
         if (text) {
-          callbacks.onText(text)
+          const step: StepInfo = { type: 'text', text }
+          steps.push(step)
+          callbacks.onStep(step)
         }
       },
     })
 
-    callbacks.onFinish(result.text)
+    callbacks.onFinish(result.text, steps)
   } catch (err) {
     callbacks.onError(err instanceof Error ? err : new Error(String(err)))
   }

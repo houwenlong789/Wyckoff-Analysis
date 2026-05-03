@@ -31,7 +31,7 @@
 
 ### 1.1 定时与环境对齐
 - 由 GitHub Actions 在工作日自动化调度（同分支并发互斥机制避免任务重叠）。
-- 从 `v2.0.0` 起，Web 端的 `Wyckoff Funnel` 与批量 `AI 分析` 也统一改为 **Streamlit 前台触发 + GitHub Actions 后台执行**。页面只负责提交参数、查看状态、读取结果 artifact，不再在 Streamlit 进程内重算全量漏斗。
+- Web 端的 `Wyckoff Funnel` 与批量 `AI 分析` 采用 **前台触发 + GitHub Actions 后台执行** 架构。页面只负责提交参数、查看状态、读取结果 artifact，不在前端进程内重算全量漏斗。
 - 统一切换目标交易日（T / T-1）：由 `utils/trading_clock.py` 判定，严格依据盘后及盘中时间节点切分。
 - **窗口口径统一：** 漏斗、Step3、Step4、回测与导出默认回看窗口统一为 **320 个交易日**，单股大师模式同样按近 320 个交易日输入，确保 MA200 计算稳定且跨模块一致。
 - **单股超时口径：** 单股分析默认 `LLM_REQUEST_TIMEOUT=90s`、`LLM_TOTAL_TIMEOUT=240s`，减少复杂输入下的误超时中断。
@@ -111,7 +111,6 @@ OMS 层是保证这套系统不出致命灾难的“最终刹车片”。
 
 补充说明：
 - Web 端的后台漏斗与后台批量研报，当前使用 GitHub Actions artifact 作为轻量结果承载，不额外引入新数据库表。
-- 这样可以在没有独立服务器的前提下，把高内存链路从 Streamlit Community Cloud 挪走，同时保留页面内的交互入口。
 
 ### 4.1 独立决策权与系统性物理熔断
 - **边界划分：** LLM 输出的文字一律视为“建议”，真正挂单的执行权被全权接管在 Python OMS 里。

@@ -45,7 +45,7 @@ CLI + Web + MCP 三通道，Gemini / Claude / OpenAI 多模型切换，GitHub Ac
 
 ### Streamlit
 
-Streamlit 版本功能完整可用，不再迭代新功能。
+Streamlit 框架仅支撑了 MVP 阶段，随着项目功能持续增长 Streamlit 已不适用。数据导出功能仍保留在 Streamlit 内，其余功能均已迁移至 CF Pages。
 
 在线地址：**[wyckoff-analysis-youngcanphoenix.streamlit.app](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**
 
@@ -131,9 +131,9 @@ wyckoff dashboard
 
 功能页面：AI 推荐、信号池、持仓、Agent 记忆、配置、对话日志、Agent 日志、同步状态。支持暗色/亮色主题切换，中英双语。
 
-| 数据总览 | 对话日志 |
-|:---:|:---:|
-| <img src="attach/dashboard-overview.png" width="450" /> | <img src="attach/dashboard-chatlog.png" width="450" /> |
+| 数据总览 | 对话日志 | Trace 详情 |
+|:---:|:---:|:---:|
+| <img src="attach/dashboard-overview.png" width="300" /> | <img src="attach/dashboard-chatlog.png" width="300" /> | <img src="attach/dashboard-chatlog-trace.png" width="300" /> |
 
 ---
 
