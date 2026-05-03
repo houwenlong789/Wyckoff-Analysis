@@ -165,6 +165,7 @@ function createProxiedProvider(config: LLMConfig) {
     apiKey: config.api_key,
     baseURL: '/api/llm-proxy',
     headers: { 'X-Target-URL': config.base_url },
+    compatibility: 'compatible',
   })
 }
 

@@ -219,11 +219,12 @@ async function callLLM(config: LLMConfig, code: string, name: string, klineSumma
 
   const userMsg = `请分析股票 ${code} ${name}。基于威科夫理论给出当前阶段判断和操作建议。${klineSummary}`
 
-  const response = await fetch(`${config.base_url}/chat/completions`, {
+  const response = await fetch('/api/llm-proxy/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${config.api_key}`,
+      'X-Target-URL': config.base_url,
     },
     body: JSON.stringify({
       model: config.model,
