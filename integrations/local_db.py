@@ -926,3 +926,21 @@ def list_chat_sessions(limit: int = 50) -> list[dict]:
         (limit,),
     )
     return [dict(r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+def cleanup_old_records(days: int = 30) -> dict[str, int]:
+    """删除 N 天前的 chat_log / background_task_result / agent_memory 记录。"""
+    conn = get_db()
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    deleted: dict[str, int] = {}
+    with conn:
+        for table in ("chat_log", "background_task_result", "agent_memory"):
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE created_at < ?", (cutoff,),
+            )
+            deleted[table] = cur.rowcount
+    return deleted

@@ -761,6 +761,21 @@ def _cmd_sync(_args=None):
     print("同步完成")
 
 
+def _cmd_cleanup(args):
+    from integrations.local_db import init_db, cleanup_old_records
+    init_db()
+    days = args.days
+    print(f"清理 {days} 天前的本地数据...")
+    deleted = cleanup_old_records(days)
+    for table, count in deleted.items():
+        print(f"  {table}: 删除 {count} 条")
+    total = sum(deleted.values())
+    if total:
+        print(f"共清理 {total} 条记录")
+    else:
+        print("无过期数据")
+
+
 # ---------------------------------------------------------------------------
 # TUI 启动
 # ---------------------------------------------------------------------------
@@ -982,6 +997,10 @@ def main():
     p_sync = sub.add_parser("sync", help="同步 Supabase → 本地 SQLite")
     p_sync.add_argument("sync_cmd", nargs="?", default="", help="status: 查看同步状态")
 
+    # wyckoff cleanup
+    p_cleanup = sub.add_parser("cleanup", help="清理过期本地数据")
+    p_cleanup.add_argument("--days", type=int, default=30, help="保留天数 (默认 30)")
+
     args = parser.parse_args()
 
     if args.cmd == "update":
@@ -1015,6 +1034,8 @@ def main():
         _cmd_log(args)
     elif args.cmd == "sync":
         _cmd_sync(args)
+    elif args.cmd == "cleanup":
+        _cmd_cleanup(args)
     else:
         _cmd_tui(args)
 

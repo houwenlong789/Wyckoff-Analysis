@@ -1367,6 +1367,9 @@ class WyckoffTUI(App):
                     "cache_write": round_usage.get("cache_write_tokens", 0),
                     "stop_reason": round_usage.get("stop_reason", "stop"),
                     "rounds": round_idx + 1,
+                    "messages": list(self._messages),
+                    "system_prompt": self._system_prompt,
+                    "tools": self._tools.schemas() if self._tools else [],
                 }
                 _chatlog_save(
                     "assistant", text_buf,
