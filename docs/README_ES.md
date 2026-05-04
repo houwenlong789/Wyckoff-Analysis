@@ -7,7 +7,8 @@
 [![PyPI](https://img.shields.io/pypi/v/youngcan-wyckoff-analysis?color=blue)](https://pypi.org/project/youngcan-wyckoff-analysis/)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](../LICENSE)
-[![Streamlit](https://img.shields.io/badge/demo-Streamlit-FF4B4B.svg)](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)
+[![Web App](https://img.shields.io/badge/Web-React%20App-0ea5e9.svg)](https://wyckoff-analysis.pages.dev/home)
+[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B.svg)](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)
 
 [中文](../README.md) | [English](README_EN.md) | [日本語](README_JA.md) | [한국어](README_KO.md) | [Arquitectura](ARCHITECTURE.md)
 
@@ -114,7 +115,9 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-Demo en linea: **[wyckoff-analysis-youngcanphoenix.streamlit.app](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**
+Web App: **[wyckoff-analysis.pages.dev](https://wyckoff-analysis.pages.dev/home)**
+
+Streamlit: **[wyckoff-analysis-youngcanphoenix.streamlit.app](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**
 
 ## Herramientas
 
@@ -162,13 +165,13 @@ Tareas programadas con GitHub Actions integradas en el repositorio:
 | Resumen de limit-up | Lun-Vie 19:25 | Revision de acciones con alza diaria >= 8 % |
 | Repricing de recomendaciones | Dom-Jue 23:00 | Sincroniza precios de cierre |
 | Grid de backtest | 1 y 15 de cada mes 04:00 | 18 combos de parametros en paralelo → reporte agregado |
-| Mantenimiento de cache | Diario 23:05 | Limpia cache de cotizaciones expiradas |
+| Mantenimiento de base de datos | Diario 23:05 | Limpia cotizaciones, órdenes, señales y datos de mercado fuera de la ventana |
 
 ## Soporte de modelos
 
 **CLI**: Gemini / Claude / OpenAI — cambia al instante con `/model`; compatible con cualquier endpoint compatible con OpenAI (DeepSeek / Qwen / Kimi, etc.).
 
-**Web / Pipeline**: Gemini / OpenAI / DeepSeek / Qwen / Kimi / Zhipu / Volcengine / Minimax — 8 proveedores en total.
+**Web / Pipeline**: 1Route / Gemini / OpenAI / Zhipu / Minimax / DeepSeek / Qwen / Volcengine. Kimi y otros proveedores compatibles con OpenAI pueden configurarse con `base_url` / `custom_providers`.
 
 ## Configuracion
 

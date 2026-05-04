@@ -1,5 +1,5 @@
-# -*- coding: utf-8 -*-
 """Deterministic harness for agent loop tests."""
+
 from __future__ import annotations
 
 from collections.abc import Callable, Generator
@@ -8,7 +8,6 @@ from typing import Any
 
 from cli.agent import run
 from cli.providers.base import LLMProvider
-
 
 Chunk = dict[str, Any]
 RoundScript = list[Chunk] | Callable[[list[dict[str, Any]], list[dict[str, Any]], str], list[Chunk]]
@@ -61,15 +60,31 @@ class StubToolRegistry:
         *,
         schemas: list[dict[str, Any]] | None = None,
         tool_results: dict[str, Any] | None = None,
+        concurrency_safe_tools: set[str] | None = None,
     ):
-        self._schemas = deepcopy(schemas) if schemas is not None else [
-            {
-                "name": "portfolio",
-                "description": "Mock portfolio tool",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        ]
+        self._schemas = (
+            deepcopy(schemas)
+            if schemas is not None
+            else [
+                {
+                    "name": "portfolio",
+                    "description": "Mock portfolio tool",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            ]
+        )
         self._tool_results = tool_results or {}
+        self._concurrency_safe_tools = (
+            concurrency_safe_tools
+            if concurrency_safe_tools is not None
+            else {
+                "search_stock_by_name",
+                "analyze_stock",
+                "portfolio",
+                "get_market_overview",
+                "query_history",
+            }
+        )
         self.calls: list[dict[str, Any]] = []
 
     def schemas(self) -> list[dict[str, Any]]:
@@ -81,6 +96,9 @@ class StubToolRegistry:
         if callable(result):
             return result(name, deepcopy(args))
         return deepcopy(result)
+
+    def concurrency_safe(self, name: str) -> bool:
+        return name in self._concurrency_safe_tools
 
 
 class AgentLoopHarness:
@@ -109,9 +127,7 @@ class AgentLoopHarness:
             tools=self.tools,
             messages=working_messages,
             system_prompt=system_prompt,
-            on_tool_call=lambda name, args: observed_tool_calls.append(
-                {"name": name, "args": deepcopy(args)}
-            ),
+            on_tool_call=lambda name, args: observed_tool_calls.append({"name": name, "args": deepcopy(args)}),
             on_tool_result=lambda name, result: observed_tool_results.append(
                 {"name": name, "result": deepcopy(result)}
             ),

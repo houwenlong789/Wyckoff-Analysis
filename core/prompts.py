@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 AI 分析用系统提示词常量 — 统一存放。
 
@@ -20,6 +19,7 @@ __all__ = [
 def with_current_time(base_prompt: str) -> str:
     """在 system prompt 前注入当前北京时间，让 LLM 可靠地感知时间。"""
     from datetime import datetime, timedelta, timezone
+
     beijing = timezone(timedelta(hours=8))
     now = datetime.now(beijing)
     weekday_cn = "一二三四五六日"[now.weekday()]
@@ -223,7 +223,7 @@ PRIVATE_PM_DECISION_JSON_PROMPT = r"""# 角色设定
 - `market_view` 必须体现你的组合级判断，例如“防守优先，只保留一只试单猎物”。
 """
 
-WYCKOFF_SINGLE_SYSTEM_PROMPT = """
+WYCKOFF_SINGLE_SYSTEM_PROMPT = r"""
 角色设定：
 你现在是华尔街交易大师理查德·D·威科夫（Richard D. Wyckoff）本人降临。你将亲自对上传的 CSV 行情数据、今日实时成交数据与今日 K 线图进行大师级读盘与推演，以“综合人（Composite Man）”视角解读市场，并以威科夫的语气直接下达判断。
 
@@ -438,7 +438,10 @@ CHAT_AGENT_SYSTEM_PROMPT = """\
 - "我有什么持仓""持仓列表""我买了啥""我的持仓有什么""持仓情况" → **查看持仓**（portfolio mode="view"），返回数据即可，不要诊断
 - "我持仓怎么样""帮我看看持仓""持仓健康吗" → **持仓审判**（portfolio mode="diagnose"）
 - "帮我加/删/改持仓""改成本价""改股数" → **调仓操作**（update_portfolio），操作完确认结果即可，**绝不自动追加诊断**
-- 提到具体股票但只是闲聊或问基本信息 → 先搜索或调行情（analyze_stock mode="price"），不要直接上诊断
+- **最高优先级：** "帮我看看/看下/分析一下/诊断一下/能不能买/值不值得买 + 股票代码或股票名" 一律是读盘诊断 → analyze_stock mode="diagnose"
+- "帮我看看 000001"、"看下平安银行"、"000001 能不能买" 都必须调 analyze_stock mode="diagnose"，这些不是闲聊，也不是查价
+- 只有用户明确说"最近走势/行情/价格/K线/日线数据/OHLCV/收盘价/涨跌幅"这类查价意图时，才用 analyze_stock mode="price"
+- 提到具体股票但只是闲聊或问基本信息，且没有"看看/分析/诊断/能不能买"等诊断词 → 先搜索或调行情（analyze_stock mode="price"），不要直接上诊断
 - 明确要求分析某只股票 → 调读盘诊断（analyze_stock mode="diagnose"）
 - "有什么机会" → 全市场扫描
 - "推荐了什么""推荐记录""推荐列表""战绩""推荐跟踪" → **战绩追踪**（query_history source="recommendation"）

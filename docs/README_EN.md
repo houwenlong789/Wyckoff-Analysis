@@ -7,7 +7,8 @@
 [![PyPI](https://img.shields.io/pypi/v/youngcan-wyckoff-analysis?color=blue)](https://pypi.org/project/youngcan-wyckoff-analysis/)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](../LICENSE)
-[![Streamlit](https://img.shields.io/badge/demo-Streamlit-FF4B4B.svg)](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)
+[![Web App](https://img.shields.io/badge/Web-React%20App-0ea5e9.svg)](https://wyckoff-analysis.pages.dev/home)
+[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B.svg)](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)
 
 [中文](../README.md) | [日本語](README_JA.md) | [Español](README_ES.md) | [한국어](README_KO.md) | [Architecture](ARCHITECTURE.md)
 
@@ -114,7 +115,9 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-Live demo: **[wyckoff-analysis-youngcanphoenix.streamlit.app](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**
+Web App: **[wyckoff-analysis.pages.dev](https://wyckoff-analysis.pages.dev/home)**
+
+Streamlit: **[wyckoff-analysis-youngcanphoenix.streamlit.app](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**
 
 ## Tools
 
@@ -162,13 +165,13 @@ Built-in GitHub Actions cron jobs:
 | Limit-Up Review | Mon–Fri 19:25 | Review stocks that rose >= 8% today |
 | Recommendation Reprice | Sun–Thu 23:00 | Sync closing prices |
 | Backtest Grid | 1st & 15th monthly 04:00 | 18 parallel parameter combos → aggregated report |
-| Cache Maintenance | Daily 23:05 | Purge stale quote caches |
+| DB Maintenance | Daily 23:05 | Purge stale quotes, orders, signals, market signals, and other rolling-window data |
 
 ## Model Support
 
 **CLI**: Gemini / Claude / OpenAI — switch with `/model`; any OpenAI-compatible endpoint works (DeepSeek, Qwen, Kimi, etc.).
 
-**Web / Pipeline**: Gemini / OpenAI / DeepSeek / Qwen / Kimi / Zhipu / Volcengine / Minimax — 8 providers total.
+**Web / Pipeline**: 1Route / Gemini / OpenAI / Zhipu / Minimax / DeepSeek / Qwen / Volcengine. Kimi and other OpenAI-compatible providers can be configured via custom `base_url` / `custom_providers`.
 
 ## Configuration
 

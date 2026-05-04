@@ -7,7 +7,8 @@
 [![PyPI](https://img.shields.io/pypi/v/youngcan-wyckoff-analysis?color=blue)](https://pypi.org/project/youngcan-wyckoff-analysis/)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](../LICENSE)
-[![Streamlit](https://img.shields.io/badge/demo-Streamlit-FF4B4B.svg)](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)
+[![Web App](https://img.shields.io/badge/Web-React%20App-0ea5e9.svg)](https://wyckoff-analysis.pages.dev/home)
+[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B.svg)](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)
 
 [中文](../README.md) | [English](README_EN.md) | [日本語](README_JA.md) | [Español](README_ES.md) | [아키텍처](ARCHITECTURE.md)
 
@@ -114,7 +115,9 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-온라인 데모: **[wyckoff-analysis-youngcanphoenix.streamlit.app](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**
+Web App: **[wyckoff-analysis.pages.dev](https://wyckoff-analysis.pages.dev/home)**
+
+Streamlit: **[wyckoff-analysis-youngcanphoenix.streamlit.app](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**
 
 ## 도구
 
@@ -162,13 +165,13 @@ streamlit run streamlit_app.py
 | 상한가 복기 | 월-금 19:25 | 당일 상승률 >= 8% 복기 |
 | 추천 추적 가격 갱신 | 일-목 23:00 | 종가 동기화 |
 | 백테스트 그리드 | 매월 1일, 15일 04:00 | 18개 병렬 파라미터 → 종합 리포트 |
-| 캐시 유지보수 | 매일 23:05 | 만료된 시세 캐시 정리 |
+| DB 유지보수 | 매일 23:05 | 시세, 주문, 신호, 시장 신호 등 롤링 윈도우 데이터를 정리 |
 
 ## 모델 지원
 
 **CLI**: Gemini / Claude / OpenAI, `/model`로 원클릭 전환, 임의의 OpenAI 호환 엔드포인트 지원 (DeepSeek / Qwen / Kimi 등).
 
-**Web / Pipeline**: Gemini / OpenAI / DeepSeek / Qwen / Kimi / Zhipu / Volcengine / Minimax, 총 8개 제공사.
+**Web / Pipeline**: 1Route / Gemini / OpenAI / Zhipu / Minimax / DeepSeek / Qwen / Volcengine. Kimi 등 OpenAI 호환 제공사는 `base_url` / `custom_providers`로 연결할 수 있습니다.
 
 ## 설정
 

@@ -36,6 +36,9 @@ logs/
 analysis/backtest/
 analysis/
 .openclaw/
+test-results/
+.traces/
+wiki_repo_new/
 .codex
 .codex-local-skills/
 

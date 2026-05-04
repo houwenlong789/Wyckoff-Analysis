@@ -11,7 +11,6 @@ TABLE_USER_SETTINGS = "user_settings"
 TABLE_STOCK_HIST_CACHE = "stock_hist_cache"
 TABLE_MARKET_SIGNAL_DAILY = "market_signal_daily"
 TABLE_RECOMMENDATION_TRACKING = "recommendation_tracking"
-TABLE_JOB_USAGE = "job_usage"
 TABLE_SIGNAL_PENDING = "signal_pending"
 TABLE_PORTFOLIOS = "portfolios"
 TABLE_PORTFOLIO_POSITIONS = "portfolio_positions"
@@ -21,4 +20,5 @@ TABLE_TAIL_BUY_HISTORY = "tail_buy_history"
 
 # Local SQLite DB path
 from pathlib import Path as _Path
+
 LOCAL_DB_PATH = _Path.home() / ".wyckoff" / "wyckoff.db"

@@ -7,7 +7,8 @@
 [![PyPI](https://img.shields.io/pypi/v/youngcan-wyckoff-analysis?color=blue)](https://pypi.org/project/youngcan-wyckoff-analysis/)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
-[![Streamlit](https://img.shields.io/badge/demo-Streamlit-FF4B4B.svg)](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)
+[![Web App](https://img.shields.io/badge/Web-React%20App-0ea5e9.svg)](https://wyckoff-analysis.pages.dev/home)
+[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B.svg)](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)
 [![Homepage](https://img.shields.io/badge/homepage-Wyckoff%20Homepage-0ea5e9.svg)](https://youngcan-wang.github.io/wyckoff-homepage/)
 
 [English](docs/README_EN.md) | [日本語](docs/README_JA.md) | [Español](docs/README_ES.md) | [한국어](docs/README_KO.md) | [架构文档](docs/ARCHITECTURE.md)
@@ -16,17 +17,83 @@
 
 ---
 
-用自然语言和一位威科夫大师对话。他能调动 10 个专业工具 + 5 个通用能力，自主串联多步推理，给出"打还是不打"的结论。
+用自然语言和一位威科夫大师对话。系统把 A 股日线行情、威科夫结构识别、AI 研报、持仓风控、推荐跟踪和通知推送串成一条自动化链路。
 
-Web + CLI + MCP 三通道，Gemini / Claude / OpenAI 多模型切换，GitHub Actions 定时全自动。
+React Web、Streamlit 维护入口、CLI、MCP 与 GitHub Actions 共同组成当前产品形态；行情优先复用 Supabase 缓存，缺口再回源补拉并回写。
 
 项目主页：**[youngcan-wang.github.io/wyckoff-homepage](https://youngcan-wang.github.io/wyckoff-homepage/)**
 
-## 启动即用 — 一键配置 Agent
+---
 
-| 启动界面 | 持仓查询 |
+## 文档导航
+
+| 想了解 | 去哪里看 |
+|--------|----------|
+| 怎么使用、部署、配置 | 本 README |
+| 当前架构、Actions、数据表、缓存口径 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| 漏斗、AI 研报、OMS、回测逻辑 | [README_STRATEGY.md](README_STRATEGY.md) |
+| 术语速查 | [GLOSSARY.md](GLOSSARY.md) |
+| 方法论、研究笔记、运维排障 | [wiki_repo_new/Home.md](wiki_repo_new/Home.md) |
+
+---
+
+## 线上使用
+
+无需安装，注册即用。
+
+### Web App（React）
+
+现代 React SPA，AI Agent 对话 + 持仓管理 + 漏斗选股 + 数据导出，流式输出 + 工具调用可视化。
+
+在线地址：**[wyckoff-analysis.pages.dev](https://wyckoff-analysis.pages.dev/home)**
+
+| 读盘室 | 漏斗选股 |
 |:---:|:---:|
-| <img src="attach/cli-home.png" width="450" /> | <img src="attach/cli-running.png" width="450" /> |
+| <img src="docs/screenshots/web-chat.png" width="450" /> | <img src="docs/screenshots/web-screen.png" width="450" /> |
+
+| 推荐跟踪 | 持仓管理 |
+|:---:|:---:|
+| <img src="docs/screenshots/web-track.png" width="450" /> | <img src="docs/screenshots/web-portfolio.png" width="450" /> |
+
+### Streamlit（维护入口）
+
+Streamlit 框架支撑了项目早期 MVP。当前保留数据导出、单股分析、设置等历史入口；新功能优先进入 React Web 与 CLI。
+
+在线地址：**[wyckoff-analysis-youngcanphoenix.streamlit.app](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**
+
+| 读盘室 | 数据导出 |
+|:---:|:---:|
+| <img src="attach/web-chat.png" width="450" /> | <img src="attach/web-export.png" width="450" /> |
+
+---
+
+## 本地使用
+
+### CLI — 命令行 Agent ⭐ 强烈推荐
+
+终端原生交互，功能最全，支持后台任务、记忆系统、Skills 扩展、MCP Server。所有数据存本地 SQLite，无需联网即可使用。
+
+**安装：**
+
+```bash
+# 一键安装（推荐）
+curl -fsSL https://raw.githubusercontent.com/YoungCan-Wang/Wyckoff-Analysis/main/install.sh | bash
+
+# 或 Homebrew
+brew tap YoungCan-Wang/wyckoff && brew install wyckoff
+
+# 或 pip
+uv pip install youngcan-wyckoff-analysis
+```
+
+**启动：**
+
+```bash
+wyckoff          # 启动 Agent 对话
+wyckoff dashboard  # 启动本地可视化面板
+```
+
+**升级：** `wyckoff update`
 
 启动后只需两步：
 1. `/model` — 选择模型（Gemini / Claude / OpenAI），输入 API Key
@@ -38,14 +105,66 @@ Web + CLI + MCP 三通道，Gemini / Claude / OpenAI 多模型切换，GitHub Ac
 > 大盘现在什么水温
 ```
 
-> 💡 可选：`/login` 登录后持仓同步云端，多设备共享。不登录也能完整使用所有功能。
+> 可选：`/login` 登录后持仓同步云端，多设备共享。不登录也能完整使用所有功能。
+
+| 启动界面 | 持仓查询 |
+|:---:|:---:|
+| <img src="attach/cli-home.png" width="450" /> | <img src="attach/cli-running.png" width="450" /> |
+
+| 诊断报告 | 操作指令 |
+|:---:|:---:|
+| <img src="attach/cli-analysis.png" width="450" /> | <img src="attach/cli-result.png" width="450" /> |
+
+---
+
+### Web 本地版 ⭐ 优先推荐
+
+React SPA 本地部署，数据读写本地 SQLite（与 CLI 共享同一份数据），浏览器可视化体验。
+
+**安装 & 启动：**
+
+```bash
+cd web/apps/web
+pnpm install
+pnpm dev        # http://localhost:5173
+```
+
+功能：读盘室（AI Agent 对话）、持仓管理、推荐跟踪、漏斗选股、尾盘记录、数据导出、单股分析。
+
+---
+
+### 本地可视化面板（Dashboard）
+
+```bash
+wyckoff dashboard
+```
+
+一条命令启动本地 HTTP 面板（默认端口 8765），自动打开浏览器。全部数据存储在本地 SQLite，无需联网。
+
+功能页面：AI 推荐、信号池、持仓、Agent 记忆、配置、对话日志、Agent 日志、同步状态。支持暗色/亮色主题切换，中英双语。
+
+| 数据总览 | 对话日志 | Trace 详情 |
+|:---:|:---:|:---:|
+| <img src="attach/dashboard-overview.png" width="300" /> | <img src="attach/dashboard-chatlog.png" width="300" /> | <img src="attach/dashboard-chatlog-trace.png" width="300" /> |
+
+---
+
+### 回测网格
+
+18 组参数并行回测，自动输出最优参数组合、夏普矩阵和策略体检：
+
+| 最优参数 & 梯队表 | 参数矩阵 |
+|:---:|:---:|
+| <img src="attach/backtest-grid-1.png" width="450" /> | <img src="attach/backtest-grid-2.png" width="450" /> |
+
+---
 
 ## 功能一览
 
 | 能力 | 说明 |
 |------|------|
 | 对话式 Agent | 用自然语言触发诊断、筛选、研报，LLM 自主编排工具；还能读写文件、执行命令、抓取网页 |
-| Skills | 内置斜杠命令（`/screen`、`/checkup`、`/report`、`/strategy`、`/backtest`）一键复合工作流；用户可通过 `~/.wyckoff/skills/*.md` 扩展 |
+| Skills | 内置斜杠命令（`/screen`、`/checkup`、`/report`、`/strategy`、`/backtest`）一键复合工作流；用户可通过 `~/.wyckoff/skills/*.md` 扩展（如 DCF 估值） |
 | 上下文压缩 | 动态阈值（25% model context window）自动压缩，智能摘要保留工具关键数据，支持超长对话 |
 | 工具确认 | `exec_command`、`write_file`、`update_portfolio` 执行前弹窗确认，防止误操作 |
 | 五层漏斗筛选 | 全市场 ~4500 股 → ~30 候选，六通道 + 板块共振 + 微观狙击。基于历史量价结构发现潜力标的，不构成投资建议 |
@@ -58,94 +177,10 @@ Web + CLI + MCP 三通道，Gemini / Claude / OpenAI 多模型切换，GitHub Ac
 | 日线回测 | 回放漏斗命中后 N 日收益，输出胜率/Sharpe/最大回撤 |
 | 盘前风控 | A50 + VIX 监测，四档预警推送 |
 | 本地可视化面板 | `wyckoff dashboard` — 推荐、信号、持仓、Agent 记忆、对话日志，暗色/亮色主题，中英双语 |
-| Agent 记忆 | 跨会话记忆：自动提取对话结论，下次提问时注入相关上下文 |
+| Agent 记忆 | 跨会话记忆：FTS5 全文检索 + 时间衰减混合召回，自动提取对话结论，压缩前 Memory Flush 保护用户偏好 |
 | 通用 Agent 能力 | 执行命令、读写文件、抓取网页 — 发一个 CSV 路径即可分析，不只是股票工具 |
 | MCP Server | 10 个工具通过 MCP 协议对外暴露，Claude Code / Cursor / 任何 MCP Client 即插即用 |
 | 多通道推送 | 飞书 / 企微 / 钉钉 / Telegram |
-
-## 数据源
-
-个股日线自动降级：
-
-```
-tickflow → tushare → akshare → baostock → efinance
-```
-
-任一源不可用时自动切换，无需干预。
-
-> **推荐接入 TickFlow（高频/分时/实时能力更强）**  
-> 注册链接：[TickFlow注册链接](https://tickflow.org/auth/register?ref=5N4NKTCPL4)
-
-## 快速开始
-
-### 一键安装（推荐）
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/YoungCan-Wang/Wyckoff-Analysis/main/install.sh | bash
-```
-
-自动检测 Python、安装 uv、创建隔离环境，装完直接 `wyckoff` 启动。
-
-### Homebrew
-
-```bash
-brew tap YoungCan-Wang/wyckoff
-brew install wyckoff
-```
-
-### pip
-
-```bash
-uv venv && source .venv/bin/activate
-uv pip install youngcan-wyckoff-analysis
-wyckoff
-```
-
-升级：`wyckoff update`
-
-### CLI 效果
-
-| 诊断报告 | 操作指令 |
-|:---:|:---:|
-| <img src="attach/cli-analysis.png" width="450" /> | <img src="attach/cli-result.png" width="450" /> |
-
-### 本地可视化面板
-
-```bash
-wyckoff dashboard
-```
-
-一条命令启动本地 HTTP 面板（默认端口 8765），自动打开浏览器。全部数据存储在本地 SQLite，无需联网，安全可信。
-
-功能页面：AI 推荐、信号池、持仓、Agent 记忆、配置、对话日志、Agent 日志、同步状态。支持暗色/亮色主题切换，中英双语。
-
-| 数据总览 | 对话日志 |
-|:---:|:---:|
-| <img src="attach/dashboard-overview.png" width="450" /> | <img src="attach/dashboard-chatlog.png" width="450" /> |
-
-### 回测网格
-
-18 组参数并行回测，自动输出最优参数组合、夏普矩阵和策略体检：
-
-| 最优参数 & 梯队表 | 参数矩阵 |
-|:---:|:---:|
-| <img src="attach/backtest-grid-1.png" width="450" /> | <img src="attach/backtest-grid-2.png" width="450" /> |
-
-### Web
-
-```bash
-git clone https://github.com/YoungCan-Wang/Wyckoff-Analysis.git
-cd Wyckoff-Analysis
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-streamlit run streamlit_app.py
-```
-
-在线体验：**[wyckoff-analysis-youngcanphoenix.streamlit.app](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**
-
-| 读盘室 | 数据导出 |
-|:---:|:---:|
-| <img src="attach/web-chat.png" width="450" /> | <img src="attach/web-export.png" width="450" /> |
 
 ## 工具
 
@@ -181,6 +216,28 @@ Agent 的武器库 — 10 个量价工具 + 5 个通用能力：
 | L4 | 微观狙击 | Spring / LPS / SOS / EVR 四大触发信号 |
 | L5 | AI 审判 | LLM 三阵营分类：逻辑破产 / 储备 / 起跳板 |
 
+## 数据源
+
+个股日线先读统一行情仓库：
+
+1. 优先读取 Supabase `stock_hist_cache`。
+2. 区间缺口只补拉缺失日期。
+3. 合并去重后回写缓存，再返回给 Web、CLI、Step3 与回测。
+
+默认行情缓存按日期滑动保留约 320 个交易日窗口。实时回源按可用性自动降级：
+
+```
+tickflow → tushare → akshare → baostock → efinance
+```
+
+任一源不可用时自动切换，无需干预。
+
+> **数据源 API Key（解锁实时行情 + 分钟K线 + 盘中监控）**  
+> 购买链接：[TickFlow 注册](https://tickflow.org/auth/register?ref=5N4NKTCPL4)
+>
+> **大模型 API Key（支持 Gemini / Claude / OpenAI / DeepSeek 等）**  
+> 购买链接：[1Route 注册](https://www.1route.dev/register?aff=359904261)
+
 ## 每日自动化
 
 仓库内置 GitHub Actions 定时任务：
@@ -193,13 +250,13 @@ Agent 的武器库 — 10 个量价工具 + 5 个通用能力：
 | 涨停复盘 | 周一-周五 19:25 | 当日涨幅 ≥ 8% 复盘 |
 | 推荐跟踪重定价 | 周日-周四 23:00 | 同步收盘价 |
 | 回测网格 | 每月 1/15 日 04:00 | 18 并行参数格 → 聚合通知 |
-| 缓存维护 | 每天 23:05 | 清理过期行情缓存 |
+| 数据库维护 | 每天 23:05 | 清理过期行情、订单、信号、市场信号等滑动窗口数据 |
 
 ## 模型支持
 
 **CLI**：Gemini / Claude / OpenAI，`/model` 一键切换，支持任意 OpenAI 兼容端点。
 
-**Web / Pipeline**：Gemini / OpenAI / DeepSeek / Qwen / Kimi / 智谱 / 火山引擎 / Minimax，共 8 家。
+**Web / Pipeline**：1Route / Gemini / OpenAI / 智谱 / Minimax / DeepSeek / Qwen / 火山引擎；Kimi 等 OpenAI 兼容服务可通过自定义 `base_url` 或 `custom_providers` 接入。
 
 ## 配置
 
@@ -216,7 +273,7 @@ Agent 的武器库 — 10 个量价工具 + 5 个通用能力：
 | `FEISHU_WEBHOOK_URL` | 飞书推送 | 可选 |
 | `TG_BOT_TOKEN` + `TG_CHAT_ID` | Telegram 推送 | 可选 |
 
-> Tushare 注册推荐：[此链接注册](https://tushare.pro/weborder/#/login?reg=955650)，双方可提升数据权益。
+> 数据源购买：[TickFlow →](https://tickflow.org/auth/register?ref=5N4NKTCPL4) ｜ 大模型购买：[1Route →](https://www.1route.dev/register?aff=359904261)
 
 完整配置项和 GitHub Actions Secrets 说明见 [架构文档](docs/ARCHITECTURE.md)。
 
@@ -258,9 +315,9 @@ claude mcp add wyckoff -- wyckoff-mcp
 
 ## 交流
 
-| 飞书群 | 飞书个人 |
-|:---:|:---:|
-| <img src="attach/飞书群二维码.png" width="200" /> | <img src="attach/飞书个人二维码.png" width="200" /> |
+| 飞书群 | QQ群 | 飞书个人 |
+|:---:|:---:|:---:|
+| <img src="attach/飞书群二维码.png" width="200" /> | <img src="attach/QQ群二维码.jpg" width="200" /><br/>群号: 761348919 | <img src="attach/飞书个人二维码.png" width="200" /> |
 
 ## 赞助
 

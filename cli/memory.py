@@ -1,7 +1,7 @@
-# -*- coding: utf-8 -*-
 """
 Agent 跨会话记忆 — 会话摘要提取 + 记忆注入。
 """
+
 from __future__ import annotations
 
 import re
@@ -19,8 +19,24 @@ _CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 _CJK_RE = re.compile(r"[一-鿿]{2,4}")
 _STOPWORDS = frozenset(
     list("的了吗呢啊哦呀吧嘛是不在有我你他它这那都也就要会")
-    + ["可以", "一个", "什么", "怎么", "如何", "看看", "一下", "帮我",
-       "请问", "能否", "可否", "这个", "那个", "我的", "你的", "现在"]
+    + [
+        "可以",
+        "一个",
+        "什么",
+        "怎么",
+        "如何",
+        "看看",
+        "一下",
+        "帮我",
+        "请问",
+        "能否",
+        "可否",
+        "这个",
+        "那个",
+        "我的",
+        "你的",
+        "现在",
+    ]
 )
 
 
@@ -62,11 +78,13 @@ def save_session_summary(messages: list[dict], provider: Any) -> None:
                 lines.append(f"[{role}] {content}")
         dialog_text = "\n".join(lines[-40:])
 
-        chunks = list(provider.chat_stream(
-            [{"role": "user", "content": dialog_text}],
-            [],
-            _SESSION_SUMMARY_PROMPT,
-        ))
+        chunks = list(
+            provider.chat_stream(
+                [{"role": "user", "content": dialog_text}],
+                [],
+                _SESSION_SUMMARY_PROMPT,
+            )
+        )
         summary = "".join(c.get("text", "") for c in chunks if c.get("type") == "text_delta")
         if not summary or len(summary) < 10:
             return
@@ -95,33 +113,22 @@ def build_memory_context(user_message: str) -> str:
     try:
         from integrations.local_db import (
             get_recent_memories,
-            search_memory,
-            search_memory_by_keywords,
+            search_memory_hybrid,
         )
 
-        memories: list[dict] = []
-        seen_ids: set[int] = set()
-
-        def _add(items: list[dict]) -> None:
-            for m in items:
-                if m["id"] not in seen_ids:
-                    seen_ids.add(m["id"])
-                    memories.append(m)
-
-        # 1. 按股票代码检索
         codes = extract_stock_codes(user_message)
-        if codes:
-            _add(search_memory(codes=codes, limit=5))
-
-        # 2. 按关键词检索
         keywords = _extract_keywords(user_message)
-        if keywords and len(memories) < 5:
-            _add(search_memory_by_keywords(keywords, limit=5))
 
-        # 3. 最近会话记忆兜底
-        _add(get_recent_memories(memory_type="session", limit=3))
+        # Hybrid search: FTS5 + 代码 + 关键词 + 时间衰减
+        memories = search_memory_hybrid(
+            query_text=user_message,
+            codes=codes or None,
+            keywords=keywords or None,
+            limit=8,
+            decay_half_life_days=30.0,
+        )
 
-        # 4. 偏好记忆始终置顶
+        # 偏好记忆始终置顶（hybrid search 已包含，但确保完整性）
         prefs = get_recent_memories(memory_type="preference", limit=5)
 
         if not memories and not prefs:
