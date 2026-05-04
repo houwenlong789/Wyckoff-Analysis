@@ -33,6 +33,35 @@ const TONE_COLORS: Record<string, string> = {
   '恶劣': 'bg-red-50 text-red-700',
 }
 
+function mergeRows(data: Record<string, unknown>[]): { merged: Record<string, unknown>; mainDate: string; a50Date: string; vixDate: string } {
+  const merged: Record<string, unknown> = {}
+  let mainDate = '', a50Date = '', vixDate = ''
+  for (const row of data) {
+    for (const key of ['benchmark_regime', 'main_index_close', 'main_index_today_pct', 'main_index_ma50', 'main_index_ma200']) {
+      if (merged[key] == null && row[key] != null) {
+        merged[key] = row[key]
+        if (key === 'main_index_close') mainDate = (row.trade_date as string) || ''
+      }
+    }
+    for (const key of ['a50_close', 'a50_pct_chg']) {
+      if (merged[key] == null && row[key] != null) {
+        merged[key] = row[key]
+        if (key === 'a50_close' && !a50Date) a50Date = (row.a50_value_date as string) || (row.trade_date as string) || ''
+      }
+    }
+    for (const key of ['vix_close', 'vix_pct_chg']) {
+      if (merged[key] == null && row[key] != null) {
+        merged[key] = row[key]
+        if (key === 'vix_close' && !vixDate) vixDate = (row.vix_value_date as string) || (row.trade_date as string) || ''
+      }
+    }
+    for (const key of ['banner_title', 'banner_message', 'banner_tone']) {
+      if (!merged[key] && row[key]) merged[key] = row[key]
+    }
+  }
+  return { merged, mainDate, a50Date, vixDate }
+}
+
 async function fetchSignal(): Promise<MarketSignal | null> {
   const { data } = await supabase
     .from('market_signal_daily')
@@ -42,33 +71,7 @@ async function fetchSignal(): Promise<MarketSignal | null> {
 
   if (!data || data.length === 0) return null
 
-  const merged: Record<string, unknown> = {}
-  let mainDate = ''
-  let a50Date = ''
-  let vixDate = ''
-  for (const row of data) {
-    for (const key of ['benchmark_regime', 'main_index_close', 'main_index_today_pct', 'main_index_ma50', 'main_index_ma200']) {
-      if (merged[key] == null && row[key] != null) {
-        merged[key] = row[key]
-        if (key === 'main_index_close') mainDate = row.trade_date || ''
-      }
-    }
-    for (const key of ['a50_close', 'a50_pct_chg']) {
-      if (merged[key] == null && row[key] != null) {
-        merged[key] = row[key]
-        if (key === 'a50_close' && !a50Date) a50Date = row.a50_value_date || row.trade_date || ''
-      }
-    }
-    for (const key of ['vix_close', 'vix_pct_chg']) {
-      if (merged[key] == null && row[key] != null) {
-        merged[key] = row[key]
-        if (key === 'vix_close' && !vixDate) vixDate = row.vix_value_date || row.trade_date || ''
-      }
-    }
-    for (const key of ['banner_title', 'banner_message', 'banner_tone']) {
-      if (!merged[key] && row[key]) merged[key] = row[key]
-    }
-  }
+  const { merged, mainDate, a50Date, vixDate } = mergeRows(data)
 
   return {
     benchmark_regime: String(merged.benchmark_regime || 'NEUTRAL'),

@@ -22,52 +22,51 @@ interface AnalysisResult {
   klineData: KlineData[]
 }
 
+async function getTickFlowKey(userId: string): Promise<string | null> {
+  const { data } = await supabase
+    .from('user_settings')
+    .select('tickflow_api_key')
+    .eq('user_id', userId)
+    .single()
+  return data?.tickflow_api_key || null
+}
+
+async function fetchKline(code: string, apiKey: string): Promise<KlineData[]> {
+  const end = new Date()
+  end.setDate(end.getDate() - 1)
+  const start = new Date()
+  start.setDate(start.getDate() - 500)
+
+  const url = `https://api.tickflow.io/v1/stock/history?symbol=${code}&start_date=${fmt(start)}&end_date=${fmt(end)}&adjust=qfq&limit=320`
+
+  try {
+    const resp = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    })
+    if (!resp.ok) return []
+    const json = await resp.json()
+    const rows = json.data || json.records || json || []
+    if (!Array.isArray(rows)) return []
+
+    return rows.map((r: Record<string, unknown>) => ({
+      date: String(r.date || r.trade_date || '').replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3'),
+      open: Number(r.open || 0),
+      high: Number(r.high || 0),
+      low: Number(r.low || 0),
+      close: Number(r.close || 0),
+      volume: Number(r.volume || r.vol || 0),
+    })).filter((d: KlineData) => d.date && d.close > 0)
+  } catch {
+    return []
+  }
+}
+
 export function AnalysisPage() {
   const user = useAuthStore((s) => s.user)
   const [symbol, setSymbol] = useState('')
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<AnalysisResult | null>(null)
   const [error, setError] = useState('')
-
-  async function getTickFlowKey(): Promise<string | null> {
-    if (!user) return null
-    const { data } = await supabase
-      .from('user_settings')
-      .select('tickflow_api_key')
-      .eq('user_id', user.id)
-      .single()
-    return data?.tickflow_api_key || null
-  }
-
-  async function fetchKline(code: string, apiKey: string): Promise<KlineData[]> {
-    const end = new Date()
-    end.setDate(end.getDate() - 1)
-    const start = new Date()
-    start.setDate(start.getDate() - 500)
-
-    const url = `https://api.tickflow.io/v1/stock/history?symbol=${code}&start_date=${fmt(start)}&end_date=${fmt(end)}&adjust=qfq&limit=320`
-
-    try {
-      const resp = await fetch(url, {
-        headers: { 'Authorization': `Bearer ${apiKey}` },
-      })
-      if (!resp.ok) return []
-      const json = await resp.json()
-      const rows = json.data || json.records || json || []
-      if (!Array.isArray(rows)) return []
-
-      return rows.map((r: Record<string, unknown>) => ({
-        date: String(r.date || r.trade_date || '').replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3'),
-        open: Number(r.open || 0),
-        high: Number(r.high || 0),
-        low: Number(r.low || 0),
-        close: Number(r.close || 0),
-        volume: Number(r.volume || r.vol || 0),
-      })).filter((d: KlineData) => d.date && d.close > 0)
-    } catch {
-      return []
-    }
-  }
 
   async function handleAnalyze() {
     const code = symbol.trim().replace(/\D/g, '')
@@ -83,7 +82,7 @@ export function AnalysisPage() {
     try {
       const [config, tickflowKey] = await Promise.all([
         loadLLMConfig(user!.id),
-        getTickFlowKey(),
+        getTickFlowKey(user!.id),
       ])
       if (!config) {
         setError('请先在设置页配置 API Key')
