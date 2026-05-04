@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { supabase } from '@/lib/supabase'
 import { useAuthStore } from '@/stores/auth'
 import { WyckoffLoading } from '@/components/loading'
@@ -16,40 +17,26 @@ interface Portfolio {
   positions: Position[]
 }
 
+async function fetchPortfolio(userId: string): Promise<Portfolio> {
+  const portfolioId = `USER_LIVE:${userId}`
+  const [{ data: pf }, { data: positions }] = await Promise.all([
+    supabase.from('portfolios').select('free_cash').eq('portfolio_id', portfolioId).single(),
+    supabase.from('portfolio_positions').select('code, name, shares, cost_price, buy_dt').eq('portfolio_id', portfolioId).order('buy_dt', { ascending: false }),
+  ])
+  return { free_cash: pf?.free_cash || 0, positions: positions || [] }
+}
+
 export function PortfolioPage() {
   const user = useAuthStore((s) => s.user)
-  const [portfolio, setPortfolio] = useState<Portfolio | null>(null)
-  const [loading, setLoading] = useState(true)
+  const queryClient = useQueryClient()
   const [editingCash, setEditingCash] = useState(false)
   const [cashInput, setCashInput] = useState('')
 
-  useEffect(() => {
-    if (user) loadPortfolio()
-  }, [user])
-
-  async function loadPortfolio() {
-    if (!user) return
-    setLoading(true)
-    const portfolioId = `USER_LIVE:${user.id}`
-
-    const { data: pf } = await supabase
-      .from('portfolios')
-      .select('free_cash')
-      .eq('portfolio_id', portfolioId)
-      .single()
-
-    const { data: positions } = await supabase
-      .from('portfolio_positions')
-      .select('code, name, shares, cost_price, buy_dt')
-      .eq('portfolio_id', portfolioId)
-      .order('buy_dt', { ascending: false })
-
-    setPortfolio({
-      free_cash: pf?.free_cash || 0,
-      positions: positions || [],
-    })
-    setLoading(false)
-  }
+  const { data: portfolio, isLoading } = useQuery({
+    queryKey: ['portfolio', user?.id],
+    queryFn: () => fetchPortfolio(user!.id),
+    enabled: !!user,
+  })
 
   async function saveCash() {
     if (!user) return
@@ -62,7 +49,7 @@ export function PortfolioPage() {
       .upsert({ portfolio_id: portfolioId, free_cash: val })
 
     setEditingCash(false)
-    await loadPortfolio()
+    queryClient.invalidateQueries({ queryKey: ['portfolio', user.id] })
   }
 
   async function deletePosition(code: string) {
@@ -73,10 +60,10 @@ export function PortfolioPage() {
       .delete()
       .eq('portfolio_id', portfolioId)
       .eq('code', code)
-    await loadPortfolio()
+    queryClient.invalidateQueries({ queryKey: ['portfolio', user.id] })
   }
 
-  if (loading) {
+  if (isLoading) {
     return <WyckoffLoading />
   }
 

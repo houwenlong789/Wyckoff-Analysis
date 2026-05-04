@@ -81,14 +81,15 @@ export function AnalysisPage() {
     setResult(null)
 
     try {
-      const config = await loadLLMConfig(user!.id)
+      const [config, tickflowKey] = await Promise.all([
+        loadLLMConfig(user!.id),
+        getTickFlowKey(),
+      ])
       if (!config) {
         setError('请先在设置页配置 API Key')
         setLoading(false)
         return
       }
-
-      const tickflowKey = await getTickFlowKey()
 
       const [stockInfoResult, klineData] = await Promise.all([
         supabase.from('recommendation_tracking').select('name').eq('code', parseInt(code)).limit(1).single(),

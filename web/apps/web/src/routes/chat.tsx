@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, memo } from 'react'
 import { Send, RotateCcw, ChevronDown, ChevronRight, Wrench, Brain } from 'lucide-react'
 import { useAuthStore } from '@/stores/auth'
 import { loadLLMConfig, loadAllModels, runChatAgentStream, type LLMConfig, type ModelOption, type StepInfo } from '@/lib/chat-agent'
@@ -67,6 +67,31 @@ function StepsCollapsible({ steps }: { steps: StepInfo[] }) {
   )
 }
 
+const MessageBubble = memo(function MessageBubble({ msg }: { msg: Message }) {
+  return (
+    <div className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+      <div
+        className={`max-w-[80%] rounded-2xl px-4 py-2.5 text-sm ${
+          msg.role === 'user'
+            ? 'bg-primary text-primary-foreground whitespace-pre-wrap'
+            : msg.isError
+              ? 'bg-red-50 text-red-700 border border-red-200'
+              : 'bg-muted text-foreground'
+        }`}
+      >
+        {msg.role === 'user' ? (
+          msg.content
+        ) : (
+          <>
+            {msg.steps && msg.steps.length > 0 && <StepsCollapsible steps={msg.steps} />}
+            <MarkdownContent content={msg.content} />
+          </>
+        )}
+      </div>
+    </div>
+  )
+})
+
 export function ChatPage() {
   const user = useAuthStore((s) => s.user)
   const [messages, setMessages] = useState<Message[]>([])
@@ -81,6 +106,7 @@ export function ChatPage() {
   const scrollRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef(false)
   const pickerRef = useRef<HTMLDivElement>(null)
+  const scrollRafRef = useRef(0)
 
   useEffect(() => {
     if (user) {
@@ -100,14 +126,13 @@ export function ChatPage() {
   }, [])
 
   const scrollToBottom = useCallback(() => {
-    requestAnimationFrame(() => {
+    cancelAnimationFrame(scrollRafRef.current)
+    scrollRafRef.current = requestAnimationFrame(() => {
       scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
     })
   }, [])
 
-  useEffect(() => {
-    scrollToBottom()
-  }, [messages, liveSteps, streamingText, scrollToBottom])
+  useEffect(() => { scrollToBottom() }, [messages, liveSteps, scrollToBottom])
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -148,6 +173,7 @@ export function ChatPage() {
         onTextDelta: (delta) => {
           if (abortRef.current) return
           setStreamingText((prev) => prev + delta)
+          scrollToBottom()
         },
         onFinish: (finalText, steps) => {
           if (abortRef.current) return
@@ -188,7 +214,7 @@ export function ChatPage() {
             <div className="relative" ref={pickerRef}>
               <button
                 onClick={() => setShowModelPicker(!showModelPicker)}
-                className="flex items-center gap-1 rounded-full bg-green-50 px-2.5 py-0.5 text-[11px] text-green-700 hover:bg-green-100 transition-colors"
+                className="flex items-center gap-1 rounded-full bg-indigo-50 px-2.5 py-0.5 text-[11px] text-indigo-700 hover:bg-indigo-100 transition-colors"
               >
                 {llmConfig.model}
                 <ChevronDown size={10} />
@@ -258,29 +284,7 @@ export function ChatPage() {
         ) : (
           <div className="space-y-4">
             {messages.map((msg, i) => (
-              <div
-                key={i}
-                className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-              >
-                <div
-                  className={`max-w-[80%] rounded-2xl px-4 py-2.5 text-sm ${
-                    msg.role === 'user'
-                      ? 'bg-primary text-primary-foreground whitespace-pre-wrap'
-                      : msg.isError
-                        ? 'bg-red-50 text-red-700 border border-red-200'
-                        : 'bg-muted text-foreground'
-                  }`}
-                >
-                  {msg.role === 'user' ? (
-                    msg.content
-                  ) : (
-                    <>
-                      {msg.steps && msg.steps.length > 0 && <StepsCollapsible steps={msg.steps} />}
-                      <MarkdownContent content={msg.content} />
-                    </>
-                  )}
-                </div>
-              </div>
+              <MessageBubble key={i} msg={msg} />
             ))}
 
             {/* Live streaming */}

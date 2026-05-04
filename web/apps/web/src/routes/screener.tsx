@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { Filter, RefreshCw } from 'lucide-react'
 import { supabase } from '@/lib/supabase'
 
@@ -12,55 +13,46 @@ interface ScreenerRow {
   current_price: number | null
 }
 
+async function fetchDates(): Promise<number[]> {
+  const { data } = await supabase
+    .from('recommendation_tracking')
+    .select('recommend_date')
+    .eq('is_ai_recommended', true)
+    .order('recommend_date', { ascending: false })
+    .limit(200)
+  if (!data || data.length === 0) return []
+  return [...new Set(data.map(r => r.recommend_date))].sort((a, b) => b - a)
+}
+
+async function fetchRows(date: number): Promise<ScreenerRow[]> {
+  const { data } = await supabase
+    .from('recommendation_tracking')
+    .select('code, name, recommend_date, funnel_score, change_pct, initial_price, current_price')
+    .eq('is_ai_recommended', true)
+    .eq('recommend_date', date)
+    .order('funnel_score', { ascending: false })
+  return data || []
+}
+
 export function ScreenerPage() {
-  const [rows, setRows] = useState<ScreenerRow[]>([])
-  const [loading, setLoading] = useState(true)
-  const [latestDate, setLatestDate] = useState<number | null>(null)
-  const [allDates, setAllDates] = useState<number[]>([])
   const [selectedDate, setSelectedDate] = useState<number | null>(null)
 
-  useEffect(() => {
-    loadDates()
-  }, [])
+  const { data: allDates = [] } = useQuery({
+    queryKey: ['screener-dates'],
+    queryFn: fetchDates,
+  })
 
-  useEffect(() => {
-    if (selectedDate) loadRows(selectedDate)
-  }, [selectedDate])
+  const activeDate = selectedDate ?? allDates[0] ?? null
+  const latestDate = allDates[0] ?? null
 
-  async function loadDates() {
-    const { data } = await supabase
-      .from('recommendation_tracking')
-      .select('recommend_date')
-      .eq('is_ai_recommended', true)
-      .order('recommend_date', { ascending: false })
-      .limit(200)
-
-    if (!data || data.length === 0) {
-      setLoading(false)
-      return
-    }
-
-    const uniqueDates = [...new Set(data.map(r => r.recommend_date))].sort((a, b) => b - a)
-    setAllDates(uniqueDates)
-    setLatestDate(uniqueDates[0]!)
-    setSelectedDate(uniqueDates[0]!)
-  }
-
-  async function loadRows(date: number) {
-    setLoading(true)
-    const { data } = await supabase
-      .from('recommendation_tracking')
-      .select('code, name, recommend_date, funnel_score, change_pct, initial_price, current_price')
-      .eq('is_ai_recommended', true)
-      .eq('recommend_date', date)
-      .order('funnel_score', { ascending: false })
-
-    setRows(data || [])
-    setLoading(false)
-  }
+  const { data: rows = [], isLoading: loading, refetch } = useQuery({
+    queryKey: ['screener-rows', activeDate],
+    queryFn: () => fetchRows(activeDate!),
+    enabled: !!activeDate,
+  })
 
   function handleRefresh() {
-    if (selectedDate) loadRows(selectedDate)
+    refetch()
   }
 
   const fmtDate = (d: number) => {
@@ -94,7 +86,7 @@ export function ScreenerPage() {
               key={d}
               onClick={() => setSelectedDate(d)}
               className={`rounded-full px-3 py-1 text-xs transition-colors ${
-                selectedDate === d
+                activeDate === d
                   ? 'bg-primary text-primary-foreground'
                   : 'border border-border text-muted-foreground hover:bg-muted/50'
               }`}

@@ -1,4 +1,5 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useMemo } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { supabase } from '@/lib/supabase'
 import { WyckoffLoading } from '@/components/loading'
 
@@ -15,28 +16,24 @@ interface Recommendation {
   recommend_reason: string | null
 }
 
+async function fetchTracking(): Promise<Recommendation[]> {
+  const { data } = await supabase
+    .from('recommendation_tracking')
+    .select('*')
+    .order('recommend_date', { ascending: false })
+    .limit(2000)
+  return data || []
+}
+
 export function TrackingPage() {
-  const [data, setData] = useState<Recommendation[]>([])
-  const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [onlyAI, setOnlyAI] = useState(false)
   const [sortBy, setSortBy] = useState<'date' | 'change' | 'score'>('date')
 
-  useEffect(() => {
-    loadData()
-  }, [])
-
-  async function loadData() {
-    setLoading(true)
-    const { data: rows } = await supabase
-      .from('recommendation_tracking')
-      .select('*')
-      .order('recommend_date', { ascending: false })
-      .limit(2000)
-
-    setData(rows || [])
-    setLoading(false)
-  }
+  const { data = [], isLoading: loading } = useQuery({
+    queryKey: ['tracking'],
+    queryFn: fetchTracking,
+  })
 
   const filtered = useMemo(() => {
     let result = data
@@ -59,10 +56,13 @@ export function TrackingPage() {
 
   const stats = useMemo(() => {
     if (data.length === 0) return null
-    const avg = data.reduce((s, r) => s + r.change_pct, 0) / data.length
-    const best = Math.max(...data.map((r) => r.change_pct))
-    const worst = Math.min(...data.map((r) => r.change_pct))
-    return { count: data.length, avg, best, worst }
+    let sum = 0, best = -Infinity, worst = Infinity
+    for (const r of data) {
+      sum += r.change_pct
+      if (r.change_pct > best) best = r.change_pct
+      if (r.change_pct < worst) worst = r.change_pct
+    }
+    return { count: data.length, avg: sum / data.length, best, worst }
   }, [data])
 
   if (loading) {
@@ -129,7 +129,7 @@ export function TrackingPage() {
                 <th className="px-3 py-2 text-center font-medium">AI</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody style={{ contentVisibility: 'auto', containIntrinsicSize: '0 40000px' }}>
               {filtered.map((r, i) => (
                 <tr key={`${r.code}-${r.recommend_date}-${i}`} className="border-t border-border hover:bg-muted/20">
                   <td className="px-3 py-2 font-mono">{String(r.code).padStart(6, '0')}</td>
@@ -142,7 +142,7 @@ export function TrackingPage() {
                   </td>
                   <td className="px-3 py-2 text-right">{r.funnel_score?.toFixed(1)}</td>
                   <td className="px-3 py-2 text-center">
-                    {r.is_ai_recommended && <span className="inline-block h-2 w-2 rounded-full bg-green-500" />}
+                    {r.is_ai_recommended && <span className="inline-block h-2 w-2 rounded-full bg-indigo-500" />}
                   </td>
                 </tr>
               ))}

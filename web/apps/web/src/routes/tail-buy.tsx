@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { supabase } from '@/lib/supabase'
 import { WyckoffLoading } from '@/components/loading'
 
@@ -13,27 +13,22 @@ interface TailBuyRecord {
   llm_reason: string
 }
 
+async function fetchTailBuy(): Promise<TailBuyRecord[]> {
+  const { data } = await supabase
+    .from('tail_buy_history')
+    .select('code, name, run_date, signal_type, rule_score, priority_score, llm_decision, llm_reason')
+    .order('run_date', { ascending: false })
+    .limit(200)
+  return data || []
+}
+
 export function TailBuyPage() {
-  const [data, setData] = useState<TailBuyRecord[]>([])
-  const [loading, setLoading] = useState(true)
+  const { data = [], isLoading } = useQuery({
+    queryKey: ['tail-buy'],
+    queryFn: fetchTailBuy,
+  })
 
-  useEffect(() => {
-    loadData()
-  }, [])
-
-  async function loadData() {
-    setLoading(true)
-    const { data: rows } = await supabase
-      .from('tail_buy_history')
-      .select('code, name, run_date, signal_type, rule_score, priority_score, llm_decision, llm_reason')
-      .order('run_date', { ascending: false })
-      .limit(200)
-
-    setData(rows || [])
-    setLoading(false)
-  }
-
-  if (loading) {
+  if (isLoading) {
     return <WyckoffLoading />
   }
 
