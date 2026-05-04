@@ -154,7 +154,7 @@
   "web/apps/web/src/components/kline-chart.tsx::KlineChart": 84,
   "web/apps/web/src/components/market-bar.tsx::MarketBar": 133,
   "web/apps/web/src/routes/analysis.tsx::AnalysisPage": 158,
-  "web/apps/web/src/routes/chat.tsx::ChatPage": 273,
+  "web/apps/web/src/routes/chat.tsx::ChatPage": 281,
   "web/apps/web/src/routes/export.tsx::ExportPage": 221,
   "web/apps/web/src/routes/layout.tsx::AppLayout": 72,
   "web/apps/web/src/routes/login.tsx::LoginPage": 91,
