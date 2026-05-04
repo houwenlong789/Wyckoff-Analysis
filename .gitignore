@@ -23,18 +23,14 @@ build/
 *.egg-info/
 uv.lock
 
-data/*.csv
-# data/stock_list_cache.json
-data/trade_dates_cache.json
-data/sector_map_cache.json
-data/market_cap_cache.json
-data/funnel_snapshots/*
+data/
 !data/funnel_snapshots/.gitkeep
 logs/
 *.csv
 *.xlsx
 *.xls
 .env
+
 
 # 回测产物与快照缓存（体积大，本地生成即可）
 analysis/backtest/
@@ -43,3 +39,10 @@ analysis/
 test-results/
 .traces/
 wiki_repo_new/
+.codex
+.codex-local-skills/
+
+
+.github/*
+.codex-run/*
+.kiro/*
