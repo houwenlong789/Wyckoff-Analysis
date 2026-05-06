@@ -505,6 +505,44 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);line-height:
 .code-panel{font-size:13px;line-height:1.6;color:var(--text);white-space:pre-wrap;word-break:break-all;padding:13px;background:color-mix(in srgb,var(--bg3) 68%,var(--bg2) 32%);border:1px solid var(--border);border-radius:6px;overflow-y:auto}
 .summary-row{font-size:14px;font-weight:700;cursor:pointer;padding:9px 0;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;color:var(--text)}
 
+/* ─── Pro mode: claude-tap style ─── */
+.pro-tok-bar{display:flex;gap:14px;font-size:11px;padding:6px 0 10px;flex-wrap:wrap;margin-bottom:6px}
+.pro-tok-item{display:flex;align-items:center;gap:5px}
+.pro-tok-dot{width:7px;height:7px;border-radius:50%}
+.pro-tok-val{font-weight:600;font-family:var(--font)}
+.pro-section{margin-bottom:8px;border:1px solid var(--border);border-radius:7px;overflow:hidden;background:var(--card)}
+.pro-section-hd{display:flex;align-items:center;padding:8px 12px;cursor:pointer;user-select:none;gap:8px;transition:background .1s}
+.pro-section-hd:hover{background:var(--hover-bg)}
+.pro-section-hd .chev{font-size:10px;color:var(--text-dim);transition:transform .2s;width:12px}
+.pro-section-hd .chev.open{transform:rotate(90deg)}
+.pro-section-hd .title{font-size:13px;font-weight:600;color:var(--text)}
+.pro-section-hd .badge{font-size:11px;padding:2px 8px;border-radius:10px;background:var(--bg3);color:var(--text-dim);font-weight:500;margin-left:auto}
+.pro-section-bd{padding:0 14px 14px;display:none;overflow-x:auto}
+.pro-section-bd.open{display:block}
+.pro-msg{margin-bottom:8px;border-radius:6px;padding:10px 14px;font-size:12px;line-height:1.6;border:1px solid var(--border)}
+.pro-msg.user{background:rgba(56,189,248,.08);border-color:rgba(56,189,248,.25)}
+.pro-msg.assistant{background:rgba(34,197,94,.06);border-color:rgba(34,197,94,.22)}
+.pro-msg.tool{background:rgba(167,139,250,.07);border-color:rgba(167,139,250,.22)}
+.pro-msg.system{background:rgba(251,191,36,.06);border-color:rgba(251,191,36,.22)}
+.pro-msg-role{display:inline-block;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;border-radius:3px;margin-bottom:6px}
+.pro-msg.user .pro-msg-role{background:var(--blue);color:#fff}
+.pro-msg.assistant .pro-msg-role{background:var(--green);color:#fff}
+.pro-msg.tool .pro-msg-role{background:var(--violet);color:#fff}
+.pro-msg.system .pro-msg-role{background:var(--amber);color:#000}
+.pro-tool-label{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:600;color:var(--cyan);background:rgba(34,211,238,.1);padding:2px 7px;border-radius:3px;margin-bottom:4px}
+.pro-thinking-label{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:600;color:var(--violet);background:rgba(167,139,250,.1);padding:2px 7px;border-radius:3px;margin-bottom:4px}
+.pro-pre{white-space:pre-wrap;word-break:break-word;font-family:var(--font);font-size:11px;background:var(--bg3);padding:10px 12px;border-radius:5px;line-height:1.5;border:1px solid var(--border);max-height:400px;overflow-y:auto;margin-top:6px}
+.pro-tool-block{border:1px solid var(--border);border-radius:5px;margin-bottom:4px;overflow:hidden;background:var(--card)}
+.pro-tool-block-hd{display:flex;align-items:center;gap:8px;padding:7px 10px;cursor:pointer;user-select:none;font-size:12px}
+.pro-tool-block-hd:hover{background:var(--hover-bg)}
+.pro-tool-block-hd .tb-name{color:var(--cyan);font-weight:600}
+.pro-tool-block-hd .tb-desc{color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px}
+.pro-tool-block-bd{display:none;padding:8px 10px;border-top:1px solid var(--border);font-size:11px}
+.pro-tool-block-bd.open{display:block}
+.pro-param{padding:6px 8px;margin-bottom:3px;border-radius:4px;background:var(--bg3);font-size:11px}
+.pro-pname{color:var(--blue);font-weight:600}
+.pro-ptype{font-size:9px;color:var(--amber);background:rgba(251,191,36,.12);padding:1px 5px;border-radius:3px;margin-left:6px}
+
 .cfg-row{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid var(--border);font-size:13px}
 .cfg-key{color:var(--text2)}.cfg-val{color:var(--accent);font-weight:600}.cfg-val.masked{color:var(--text-dim)}
 .mem-item{padding:12px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
@@ -876,7 +914,9 @@ async function renderBgTaskDetail(c,taskId){
 // ═══ Chat Log (Opik-style Tracing UI) ═══
 let _chatSessionId=null;
 let _chatSelectedIdx=0;
-let _chatViewMode='pretty';
+let _chatInputMode='pretty';
+let _chatOutputMode='pretty';
+let _chatViewLevel='simple';
 let _chatDetailTab='content';
 function toYaml(obj,indent=0){
   if(obj==null)return 'null';
@@ -891,9 +931,79 @@ function fmtContent(raw,structured,mode){
   if(mode==='yaml')return escHtml(toYaml(structured).trimStart());
   return escHtml(raw||'—');
 }
-function viewTabs(id){
+function viewTabs(section){
   const modes=['pretty','json','yaml'];
-  return modes.map(m=>`<button class="detail-tab ${_chatViewMode===m?'active':''}" onclick="_chatViewMode='${m}';loadPage('chatlog')" style="font-size:10px;padding:2px 8px">${m.toUpperCase()}</button>`).join('');
+  const cur=section==='input'?_chatInputMode:_chatOutputMode;
+  const varName=section==='input'?'_chatInputMode':'_chatOutputMode';
+  return modes.map(m=>`<button class="detail-tab ${cur===m?'active':''}" onclick="${varName}='${m}';loadPage('chatlog')" style="font-size:10px;padding:2px 8px">${m.toUpperCase()}</button>`).join('');
+}
+function proSection(title,content,open,badge){
+  const o=open?'open':'';
+  return `<div class="pro-section"><div class="pro-section-hd" onclick="this.querySelector('.chev').classList.toggle('open');this.nextElementSibling.classList.toggle('open')"><span class="chev ${o}">&#9654;</span><span class="title">${title}</span>${badge?`<span class="badge">${badge}</span>`:''}</div><div class="pro-section-bd ${o}">${content}</div></div>`;
+}
+function proTokenBar(u){
+  const items=[
+    {label:'Input',val:u.input||0,color:'var(--blue)'},
+    {label:'Output',val:u.output||0,color:'var(--green)'},
+    {label:'Cache Read',val:u.cache_read||0,color:'var(--cyan)'},
+    {label:'Cache Write',val:u.cache_write||0,color:'var(--amber)'}
+  ].filter(i=>i.val>0);
+  return `<div class="pro-tok-bar">${items.map(i=>`<span class="pro-tok-item"><span class="pro-tok-dot" style="background:${i.color}"></span><span style="color:var(--text-dim)">${i.label}</span><span class="pro-tok-val" style="color:${i.color}">${i.val.toLocaleString()}</span></span>`).join('')}</div>`;
+}
+function proRenderContent(content){
+  if(!content)return '';
+  if(typeof content==='string')return `<div style="white-space:pre-wrap;word-break:break-word">${escHtml(content)}</div>`;
+  if(!Array.isArray(content))return `<pre class="pro-pre">${escHtml(JSON.stringify(content,null,2))}</pre>`;
+  return content.map(b=>{
+    if(b.type==='text'||b.type==='input_text'||b.type==='output_text'){const t=b.text||'';return t.trim()?`<div style="white-space:pre-wrap;word-break:break-word;margin-top:6px">${escHtml(t)}</div>`:'';}
+    if(b.type==='thinking'){const t=b.thinking||b.text||'';return t.trim()?`<div style="margin-top:6px"><span class="pro-thinking-label">thinking</span><pre class="pro-pre" style="max-height:200px">${escHtml(t)}</pre></div>`:'';}
+    if(b.type==='tool_use')return `<div style="margin-top:6px"><span class="pro-tool-label">${escHtml(b.name||'tool_use')}</span><pre class="pro-pre" style="max-height:200px">${escHtml(JSON.stringify(b.input||{},null,2))}</pre></div>`;
+    if(b.type==='tool_result'){const rc=typeof b.content==='string'?b.content:JSON.stringify(b.content,null,2);return `<div style="margin-top:6px"><span class="pro-tool-label">result${b.tool_use_id?' ('+b.tool_use_id.slice(0,8)+')':''}</span><pre class="pro-pre" style="max-height:200px">${escHtml(rc)}</pre></div>`;}
+    return `<pre class="pro-pre">${escHtml(JSON.stringify(b,null,2))}</pre>`;
+  }).join('');
+}
+function proRenderMessages(msgs){
+  if(!msgs||!msgs.length)return '<div style="color:var(--text-dim);font-size:12px">No messages</div>';
+  return msgs.map(m=>{
+    const role=m.role||'unknown';
+    const cls=role==='user'?'user':role==='assistant'?'assistant':role==='tool'?'tool':'system';
+    let inner=proRenderContent(m.content);
+    if(m.tool_calls&&Array.isArray(m.tool_calls)){inner+=m.tool_calls.map(tc=>`<div style="margin-top:6px"><span class="pro-tool-label">${escHtml(tc.name||'tool_use')}</span><pre class="pro-pre" style="max-height:150px">${escHtml(JSON.stringify(tc.args||{},null,2))}</pre></div>`).join('');}
+    if(m.reasoning_content){inner+=`<div style="margin-top:6px"><span class="pro-thinking-label">thinking</span><pre class="pro-pre" style="max-height:200px">${escHtml(m.reasoning_content)}</pre></div>`;}
+    return `<div class="pro-msg ${cls}"><div class="pro-msg-role">${escHtml(role)}</div>${inner}</div>`;
+  }).join('');
+}
+function proRenderTools(tools){
+  if(!tools||!tools.length)return '<div style="color:var(--text-dim);font-size:12px">No tools</div>';
+  return tools.map(td=>{
+    const name=td.name||'unknown',desc=(td.description||'').split('\n')[0].slice(0,100);
+    const schema=td.input_schema||td.parameters||{};
+    const props=schema.properties||{};
+    const required=new Set(schema.required||[]);
+    const keys=Object.keys(props);
+    let paramsHtml='';
+    if(keys.length){paramsHtml=keys.map(k=>{
+      const p=props[k],type=p.type||'';
+      return `<div class="pro-param"><span class="pro-pname">${escHtml(k)}</span>${type?`<span class="pro-ptype">${type}</span>`:''}${required.has(k)?'<span style="color:var(--red);font-size:9px;margin-left:4px">*</span>':''}${p.description?`<div style="color:var(--text-dim);margin-top:2px">${escHtml(p.description.slice(0,120))}</div>`:''}</div>`;
+    }).join('');}
+    return `<div class="pro-tool-block"><div class="pro-tool-block-hd" onclick="const bd=this.nextElementSibling;bd.classList.toggle('open')"><span class="tb-name">${escHtml(name)}</span><span class="tb-desc">${escHtml(desc)}</span></div><div class="pro-tool-block-bd">${paramsHtml||'<span style="color:var(--text-dim)">No parameters</span>'}</div></div>`;
+  }).join('');
+}
+function proRenderTimeline(rd){
+  if(!rd||!rd.length)return '';
+  const maxTok=Math.max(...rd.map(r=>(r.tokens_in||0)+(r.tokens_out||0)),1);
+  return rd.map(r=>{
+    const tok=(r.tokens_in||0)+(r.tokens_out||0);
+    const bar=Math.max(4,Math.min(100,tok/maxTok*100));
+    return `<div style="display:flex;align-items:center;gap:8px;padding:6px 8px;margin-bottom:3px;border-radius:5px;background:var(--bg3);border:1px solid var(--border)">
+      <span style="font-size:10px;color:var(--text2);min-width:40px;font-weight:700">T${r.round}</span>
+      <span style="font-size:10px;padding:1px 6px;border-radius:3px;background:var(--bg2);color:var(--text2);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(r.model||'')}</span>
+      <div style="flex:1;height:5px;background:var(--bg2);border-radius:3px;overflow:hidden"><div style="width:${bar}%;height:100%;background:var(--accent);border-radius:3px"></div></div>
+      <span style="font-size:10px;min-width:55px;text-align:right;color:var(--text)">${tok.toLocaleString()}</span>
+      <span style="font-size:10px;min-width:35px;text-align:right;color:var(--text-dim)">${r.duration||0}s</span>
+      ${r.has_tool_calls?`<span class="pill pill-blue" style="font-size:9px">${(r.tool_names||[]).join(',')}</span>`:''}
+    </div>`;
+  }).join('');
 }
 async function renderChatLog(c){
   if(_chatSessionId)return renderChatSession(c,_chatSessionId);
@@ -940,9 +1050,11 @@ async function renderChatSession(c,sid){
   let meta={};
   if(selTrace?.assistant?.metadata){try{meta=JSON.parse(selTrace.assistant.metadata)||{};}catch(e){}}
   const totalSpans=traces.reduce((a,tr)=>{try{const tc=tr.assistant?.tool_calls?JSON.parse(tr.assistant.tool_calls):[];return a+(Array.isArray(tc)?tc.length:0)}catch(e){return a}},0);
-  const inputStruct={role:'user',content:selTrace?.user?.content||''};
-  const outputStruct={role:'assistant',content:selTrace?.assistant?.content||'',model:selLog?.model||'',provider:selLog?.provider||'',usage:{input:selLog?.tokens_in||0,output:selLog?.tokens_out||0,cache_read:meta.cache_read||0,cache_write:meta.cache_write||0,total:(selLog?.tokens_in||0)+(selLog?.tokens_out||0)+(meta.cache_read||0)},elapsed_s:selLog?.elapsed_s||0,stop_reason:meta.stop_reason||'stop',rounds:meta.rounds||1};
-  if(toolSpans.length)outputStruct.tool_calls=toolSpans.map(s=>({name:s.name||s.tool||'tool',status:s.status||'ok'}));
+  const fullMessages=meta.messages||[];
+  const systemPrompt=meta.system_prompt||'';
+  const toolSchemas=meta.tools||[];
+  const inputBrief={role:'user',content:selTrace?.user?.content||''};
+  const outputBrief={role:'assistant',content:(selTrace?.assistant?.content||'').slice(0,500),model:selLog?.model||'',tokens_in:selLog?.tokens_in||0,tokens_out:selLog?.tokens_out||0};
   c.innerHTML=`<div class="fade-in" style="display:flex;height:calc(100vh - 120px);gap:0;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--bg2)">
     <!-- Left: Traces + Spans Tree -->
     <div class="chat-side">
@@ -983,7 +1095,7 @@ async function renderChatSession(c,sid){
     <!-- Right: Detail Panel -->
     <div style="flex:1;overflow-y:auto;padding:16px 20px">
       <div class="detail-tabs">
-        ${['content','runtime'].map(tb=>`<button class="detail-tab ${_chatDetailTab===tb?'active':''}" onclick="_chatDetailTab='${tb}';loadPage('chatlog')">${t('tab_'+tb)}</button>`).join('')}
+        ${['simple','opik','pro'].map(lv=>`<button class="detail-tab ${_chatViewLevel===lv?'active':''}" onclick="_chatViewLevel='${lv}';loadPage('chatlog')">${lv==='simple'?'Simple':lv==='opik'?'Opik':'PRO'}</button>`).join('')}
       </div>
       <div class="detail-head">
         <span class="pill pill-time">${localTime(selLog?.created_at)}</span>
@@ -993,20 +1105,30 @@ async function renderChatSession(c,sid){
         ${selLog?.tokens_in||selLog?.tokens_out?`<span class="pill pill-token">${((selLog.tokens_in||0)+(selLog.tokens_out||0)).toLocaleString()} tok</span>`:''}
         ${meta.rounds&&meta.rounds>1?`<span class="pill pill-cyan">${meta.rounds} rounds</span>`:''}
       </div>
-      ${_chatDetailTab==='content'?`
-      ${selLog?.error?`<div style="background:var(--red-bg,rgba(255,0,0,0.1));border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:12px;color:var(--red)">${escHtml(selLog.error)}</div>`:''}
+      ${selLog?.error?`<div style="background:rgba(255,91,106,.1);border:1px solid var(--red);border-radius:6px;padding:8px 12px;margin-bottom:12px;font-size:12px;color:var(--red)">${escHtml(selLog.error)}</div>`:''}
+      ${_chatViewLevel==='pro'?(()=>{
+        const usage={input:selLog?.tokens_in||0,output:selLog?.tokens_out||0,cache_read:meta.cache_read||0,cache_write:meta.cache_write||0};
+        let html=proTokenBar(usage);
+        if(systemPrompt)html+=proSection('System Prompt',`<pre class="pro-pre" style="max-height:300px">${escHtml(systemPrompt)}</pre>`,false);
+        if(fullMessages.length)html+=proSection('Messages',proRenderMessages(fullMessages),true,fullMessages.length+' msgs');
+        if(selTrace?.assistant?.content)html+=proSection('Response',proRenderContent(selTrace.assistant.content),true);
+        if(toolSchemas.length)html+=proSection('Tools',proRenderTools(toolSchemas),false,toolSchemas.length+' tools');
+        const rd=meta.rounds_detail;
+        if(rd&&rd.length>1)html+=proSection('Rounds Timeline',proRenderTimeline(rd),true,rd.length+' turns');
+        return html;
+      })():_chatViewLevel==='opik'?`
       <details open style="margin-bottom:12px"><summary class="summary-row">
-        <span>Input</span><span style="display:flex;gap:4px">${viewTabs('input')}</span>
+        <span>Input (system+messages+tools)</span><span style="display:flex;gap:4px">${viewTabs('input')}</span>
       </summary>
-        <pre class="code-panel" style="max-height:200px">${fmtContent(selTrace?.user?.content,inputStruct,_chatViewMode)}</pre>
+        <pre class="code-panel" style="max-height:none">${fmtContent(selTrace?.user?.content,{system_prompt:systemPrompt,messages:fullMessages,tools:toolSchemas},_chatInputMode)}</pre>
       </details>
       <details open style="margin-bottom:12px"><summary class="summary-row">
         <span>Output</span><span style="display:flex;gap:4px">${viewTabs('output')}</span>
       </summary>
-        <pre class="code-panel" style="max-height:300px">${fmtContent(selTrace?.assistant?.content,outputStruct,_chatViewMode)}</pre>
+        <pre class="code-panel" style="max-height:none">${fmtContent(selTrace?.assistant?.content,{role:'assistant',content:selTrace?.assistant?.content||'',model:selLog?.model||'',provider:selLog?.provider||'',usage:{input:selLog?.tokens_in||0,output:selLog?.tokens_out||0,cache_read:meta.cache_read||0,cache_write:meta.cache_write||0,total:(selLog?.tokens_in||0)+(selLog?.tokens_out||0)+(meta.cache_read||0)},elapsed_s:selLog?.elapsed_s||0,stop_reason:meta.stop_reason||'stop',rounds:meta.rounds||1,tool_calls:toolSpans.length?toolSpans.map(s=>({name:s.name||s.tool||'tool',status:s.status||'ok',args:s.args||undefined,result:s.result||undefined})):undefined},_chatOutputMode)}</pre>
       </details>
       ${toolSpans.length?`<details open style="margin-bottom:12px"><summary class="summary-row"><span>Spans (${toolSpans.length})</span></summary>
-        <div style="padding:12px 0">${toolSpans.map((sp,si)=>{
+        <div style="padding:12px 0">${toolSpans.map(sp=>{
           const statusIcon=sp.status==='error'?'<span style="color:var(--red)">✗</span>':sp.status==='background'?'<span style="color:var(--blue)">↗</span>':'<span style="color:var(--accent)">✓</span>';
           return `<div style="padding:8px 10px;margin-bottom:6px;border-radius:6px;background:var(--card);border:1px solid var(--border)">
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">${statusIcon}<span class="pill pill-blue" style="font-size:10px">${escHtml(sp.name||sp.tool||'tool')}</span>${sp.status?`<span class="pill ${sp.status==='error'?'pill-red':sp.status==='background'?'pill-cyan':'pill-green'}" style="font-size:10px">${escHtml(sp.status)}</span>`:''}</div>
@@ -1023,37 +1145,22 @@ async function renderChatSession(c,sid){
           <div><span style="color:var(--accent)">total_tokens</span>: ${((selLog.tokens_in||0)+(selLog.tokens_out||0)+(meta.cache_read||0)).toLocaleString()}</div>
         </div></details>`:''}
       ${Object.keys(meta).length?`<details style="margin-bottom:12px"><summary class="summary-row"><span>Metadata</span></summary>
-        <pre class="code-panel" style="font-size:11px;color:var(--text2);max-height:260px">${escHtml(JSON.stringify(meta,null,2))}</pre></details>`:''}
-      `:`
-      ${(()=>{
-        const rd=meta.rounds_detail;
-        if(!rd||!rd.length)return `<div class="empty" style="margin-top:24px">${t('no_runtime')}${meta.rounds>1?` (${meta.rounds} rounds)`:''}</div>`;
-        const totalTok=rd.reduce((a,r)=>a+(r.tokens_in||0)+(r.tokens_out||0),0);
-        const totalDur=rd.reduce((a,r)=>a+(r.duration||0),0);
-        const modelCounts={};rd.forEach(r=>{const m=r.model||'unknown';modelCounts[m]=(modelCounts[m]||0)+1;});
-        const modelSummary=Object.entries(modelCounts).map(([m,c])=>`${m} ×${c}`).join('  ');
-        const modelColors=['var(--accent)','#a78bfa','#f59e0b','#ef4444','#38bdf8'];
-        const modelList=Object.keys(modelCounts);
-        const mColor=(m)=>modelColors[modelList.indexOf(m)%modelColors.length];
-        return `<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
-          <span class="pill pill-cyan">${rd.length} turns</span>
-          <span class="pill pill-token">${totalTok.toLocaleString()} tokens</span>
-          <span class="pill pill-time">${totalDur.toFixed(1)}s</span>
-          <span class="pill pill-model">${modelSummary}</span>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:4px">${rd.map((r,i)=>{
-          const tok=(r.tokens_in||0)+(r.tokens_out||0);
-          const bar=Math.max(4,Math.min(100,tok/Math.max(...rd.map(x=>(x.tokens_in||0)+(x.tokens_out||0)),1)*100));
-          return `<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:6px;background:var(--card);border:1px solid var(--border)">
-            <span style="font-size:11px;color:var(--text2);min-width:48px;font-weight:700">Turn ${r.round}</span>
-            <span style="font-size:10px;padding:2px 8px;border-radius:3px;background:color-mix(in srgb, ${mColor(r.model)} 15%, transparent);color:${mColor(r.model)};white-space:nowrap;max-width:200px;overflow:hidden;text-overflow:ellipsis">${escHtml(r.model||'—')}</span>
-            <div style="flex:1;height:6px;background:var(--bg3);border-radius:3px;overflow:hidden"><div style="width:${bar}%;height:100%;background:${mColor(r.model)};border-radius:3px"></div></div>
-            <span style="font-size:11px;color:var(--text);min-width:60px;text-align:right">${tok.toLocaleString()} tok</span>
-            <span style="font-size:11px;color:var(--text2);min-width:40px;text-align:right">${r.duration||0}s</span>
-            ${r.has_tool_calls?`<span class="pill pill-blue" style="font-size:9px">${(r.tool_names||[]).join(', ')}</span>`:''}
-          </div>`}).join('')}</div>`;
-      })()}
-      `}
+        <pre class="code-panel" style="font-size:11px;color:var(--text2);max-height:260px">${escHtml(JSON.stringify(meta,null,2))}</pre></details>`:''}`:`
+      <details open style="margin-bottom:12px"><summary class="summary-row">
+        <span>Input</span><span style="display:flex;gap:4px">${viewTabs('input')}</span>
+      </summary>
+        <pre class="code-panel" style="max-height:200px">${fmtContent(selTrace?.user?.content,inputBrief,_chatInputMode)}</pre>
+      </details>
+      ${toolSpans.length?`<details open style="margin-bottom:12px"><summary class="summary-row"><span>Tool Calls (${toolSpans.length})</span></summary>
+        <div style="padding:12px 0">${toolSpans.map(sp=>{
+          const statusIcon=sp.status==='error'?'<span style="color:var(--red)">✗</span>':sp.status==='background'?'<span style="color:var(--blue)">↗</span>':'<span style="color:var(--accent)">✓</span>';
+          return `<div style="padding:6px 10px;margin-bottom:4px;border-radius:5px;background:var(--card);border:1px solid var(--border);display:flex;align-items:center;gap:8px;flex-wrap:wrap">${statusIcon}<span class="pill pill-blue" style="font-size:10px">${escHtml(sp.name||sp.tool||'tool')}</span>${sp.args_brief?`<span style="font-size:10px;color:var(--text-dim)">${escHtml(sp.args_brief)}</span>`:''}</div>`}).join('')}</div></details>`:''}
+      <details open style="margin-bottom:12px"><summary class="summary-row">
+        <span>Output</span><span style="display:flex;gap:4px">${viewTabs('output')}</span>
+      </summary>
+        <pre class="code-panel" style="max-height:300px">${fmtContent(selTrace?.assistant?.content,outputBrief,_chatOutputMode)}</pre>
+      </details>
+      ${selLog?.tokens_in||selLog?.tokens_out?`<div style="font-size:11px;color:var(--text-dim);margin-top:4px">↑${(selLog.tokens_in||0).toLocaleString()} ↓${(selLog.tokens_out||0).toLocaleString()} · ${selLog.elapsed_s||0}s</div>`:''}`}
     </div>
   </div>`}
 

@@ -1,14 +1,55 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { supabase } from '@/lib/supabase'
+import { useAuthStore } from '@/stores/auth'
 
 export function LoginPage() {
   const navigate = useNavigate()
+  const setAuth = useAuthStore((s) => s.setAuth)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [isRegister, setIsRegister] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [checkingSession, setCheckingSession] = useState(true)
+
+  useEffect(() => {
+    let active = true
+
+    supabase.auth
+      .getSession()
+      .then(({ data: { session } }) => {
+        if (!active) {
+          return
+        }
+        if (session) {
+          setAuth(session.user, session)
+          navigate('/', { replace: true })
+          return
+        }
+        setCheckingSession(false)
+      })
+      .catch(() => {
+        if (active) {
+          setCheckingSession(false)
+        }
+      })
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (_event, session) => {
+        if (!active || !session) {
+          return
+        }
+        setAuth(session.user, session)
+        navigate('/', { replace: true })
+      },
+    )
+
+    return () => {
+      active = false
+      subscription.unsubscribe()
+    }
+  }, [navigate, setAuth])
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -20,8 +61,11 @@ export function LoginPage() {
         const { error } = await supabase.auth.signUp({ email, password })
         if (error) throw error
       } else {
-        const { error } = await supabase.auth.signInWithPassword({ email, password })
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password })
         if (error) throw error
+        if (data.session) {
+          setAuth(data.user, data.session)
+        }
       }
       navigate('/', { replace: true })
     } catch (err: unknown) {
@@ -29,6 +73,14 @@ export function LoginPage() {
     } finally {
       setLoading(false)
     }
+  }
+
+  if (checkingSession) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-slate-50 via-blue-50/30 to-purple-50/20">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+      </div>
+    )
   }
 
   return (

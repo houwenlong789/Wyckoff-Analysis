@@ -122,11 +122,11 @@ def login_form():
     with col2:
         st.markdown(
             """
-<div style="text-align: center; margin-bottom: 2rem;">
-    <h1>🔐</h1>
-    <h2>欢迎回来</h2>
-    <p style="color: #666;">请登录以继续使用 Wyckoff 智能投研平台</p>
-</div>
+    <div style="text-align: center; margin-bottom: 2rem;">
+        <h1>🔐</h1>
+        <h2>欢迎回来</h2>
+        <div style="margin-top: 1rem; padding: .85rem 1rem; border: 1px solid #dbe8ff; border-radius: 10px; background: #f4f7ff; color: #334155; font-size: .92rem; line-height: 1.65; text-align: left;">Streamlit 版受框架交互能力限制，后续仅保留必要维护；新增能力会集中迭代在读盘室。辛苦各位巴菲特移步 <a href="https://wyckoff-analysis.pages.dev/" target="_blank">Wyckoff 读盘室</a> 体验最新功能。</div>
+    </div>
             """,
             unsafe_allow_html=True,
         )

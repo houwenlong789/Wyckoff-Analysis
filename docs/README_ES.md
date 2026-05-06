@@ -7,7 +7,7 @@
 [![PyPI](https://img.shields.io/pypi/v/youngcan-wyckoff-analysis?color=blue)](https://pypi.org/project/youngcan-wyckoff-analysis/)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](../LICENSE)
-[![Web App](https://img.shields.io/badge/Web-React%20App-0ea5e9.svg)](https://wyckoff-analysis.pages.dev/home)
+[![Web App](https://img.shields.io/badge/Web-React%20App-0ea5e9.svg)](https://wyckoff-analysis.pages.dev/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B.svg)](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)
 
 [中文](../README.md) | [English](README_EN.md) | [日本語](README_JA.md) | [한국어](README_KO.md) | [Arquitectura](ARCHITECTURE.md)
@@ -19,6 +19,62 @@
 Conversa en lenguaje natural con un agente IA experto en el metodo Wyckoff. Despacha de forma autonoma 10 herramientas profesionales + 5 capacidades generales, encadena razonamientos de multiples pasos y te da conclusiones accionables de trading.
 
 Web + CLI + MCP triple canal, compatible con Gemini / Claude / OpenAI / DeepSeek, automatizacion completa via GitHub Actions.
+
+Pagina del proyecto: **[youngcan-wang.github.io/wyckoff-homepage](https://youngcan-wang.github.io/wyckoff-homepage/)**
+
+Entradas por palabra clave: **[Trading Agent](https://youngcan-wang.github.io/wyckoff-homepage/trading-agent/)** · **[Wyckoff Trading Agent](https://youngcan-wang.github.io/wyckoff-homepage/wyckoff-trading-agent/)** · **[AI Trading Agent](https://youngcan-wang.github.io/wyckoff-homepage/ai-trading-agent/)** · **[Stock Screener Agent](https://youngcan-wang.github.io/wyckoff-homepage/stock-screener-agent/)**
+
+> Aviso de riesgo: WyckoffAgent es una herramienta educativa, de investigacion e informacion. No ofrece asesoramiento de inversion, no cubre todas las circunstancias financieras personales y no garantiza resultados futuros.
+
+## Navegacion de documentos
+
+| Tema | Donde leer |
+|---|---|
+| Uso, despliegue, configuracion | Este README |
+| Arquitectura, Actions, tablas de datos, cache | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Embudo, reportes IA, OMS, backtesting | [../README_STRATEGY.md](../README_STRATEGY.md) |
+| Glosario | [../GLOSSARY.md](../GLOSSARY.md) |
+| Notas de investigacion y operaciones | [../wiki_repo_new/Home.md](../wiki_repo_new/Home.md) |
+
+## Special Thanks
+
+<table>
+  <tr>
+    <td width="150" align="center">
+      <a href="https://tickflow.org/auth/register?ref=5N4NKTCPL4">
+        <img src="../attach/tickflow-logo.png" alt="TickFlow" width="120" />
+      </a>
+    </td>
+    <td>
+      <strong><a href="https://tickflow.org/auth/register?ref=5N4NKTCPL4">TickFlow</a></strong><br />
+      Gracias a TickFlow por proporcionar a WyckoffAgent datos de alta calidad para acciones A, EE. UU. y Hong Kong.
+    </td>
+  </tr>
+</table>
+
+## Uso online
+
+No requiere instalacion.
+
+**React Web App**: **[wyckoff-analysis.pages.dev](https://wyckoff-analysis.pages.dev/)**
+
+SPA moderna con chat de AI Agent, gestion de cartera, screener de embudo, seguimiento de recomendaciones, exportacion de datos, streaming y visualizacion de llamadas a herramientas.
+
+| Sala de chat | Screener de embudo |
+|:---:|:---:|
+| <img src="screenshots/web-chat.png" width="450" /> | <img src="screenshots/web-screen.png" width="450" /> |
+
+| Seguimiento de recomendaciones | Cartera |
+|:---:|:---:|
+| <img src="screenshots/web-track.png" width="450" /> | <img src="screenshots/web-portfolio.png" width="450" /> |
+
+**Portal Streamlit de mantenimiento**: **[wyckoff-analysis-youngcanphoenix.streamlit.app](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**
+
+Streamlit sostuvo el MVP inicial y sigue disponible para exportacion de datos, analisis de acciones individuales y configuracion.
+
+| Sala de chat | Exportacion de datos |
+|:---:|:---:|
+| <img src="../attach/web-chat.png" width="450" /> | <img src="../attach/web-export.png" width="450" /> |
 
 ## Funcionalidades
 
@@ -53,10 +109,14 @@ tickflow → tushare → akshare → baostock → efinance
 
 Si una fuente no esta disponible, se cambia automaticamente a la siguiente sin intervencion manual.
 
-> **Recomendado: conectar TickFlow para capacidades mas fuertes en tiempo real / intradias**
+> **Recomendado: conectar TickFlow para datos mas fuertes en tiempo real e intradia de acciones A / EE. UU. / Hong Kong**
 > Registro: [Enlace de registro TickFlow](https://tickflow.org/auth/register?ref=5N4NKTCPL4)
 
-## Inicio rapido
+## Uso local
+
+### CLI — recomendado
+
+Flujo nativo de terminal con el conjunto de funciones mas completo. Soporta tareas en segundo plano, memoria, Skills, MCP Server y almacenamiento local SQLite.
 
 ### Instalacion en una linea (recomendado)
 
@@ -97,6 +157,28 @@ Solo dos pasos tras el inicio:
 
 Actualizar: `wyckoff update`
 
+| Pantalla inicial | Consulta de cartera |
+|:---:|:---:|
+| <img src="../attach/cli-home.png" width="450" /> | <img src="../attach/cli-running.png" width="450" /> |
+
+| Reporte de diagnostico | Instrucciones de operacion |
+|:---:|:---:|
+| <img src="../attach/cli-analysis.png" width="450" /> | <img src="../attach/cli-result.png" width="450" /> |
+
+### Panel local
+
+```bash
+wyckoff dashboard
+```
+
+Inicia un panel HTTP local (puerto 8765 por defecto) y abre el navegador automaticamente. Todos los datos quedan en SQLite local.
+
+Incluye recomendaciones, senales, cartera, memoria del agente, configuracion, logs de chat, logs del agente y estado de sincronizacion. Soporta tema oscuro/claro y UI bilingue CN/EN.
+
+| Resumen | Logs de chat | Detalle de trace |
+|:---:|:---:|:---:|
+| <img src="../attach/dashboard-overview.png" width="300" /> | <img src="../attach/dashboard-chatlog.png" width="300" /> | <img src="../attach/dashboard-chatlog-trace.png" width="300" /> |
+
 ### Grid de backtest
 
 18 combinaciones de parametros en paralelo, salida de parametros optimos, matriz Sharpe y revision de estrategia:
@@ -105,7 +187,17 @@ Actualizar: `wyckoff update`
 |:---:|:---:|
 | <img src="../attach/backtest-grid-1.png" width="450" /> | <img src="../attach/backtest-grid-2.png" width="450" /> |
 
-### Web
+### Web local
+
+React SPA local, compartiendo la misma base SQLite local con CLI:
+
+```bash
+cd web/apps/web
+pnpm install
+pnpm dev
+```
+
+Ejecucion local legacy de Streamlit:
 
 ```bash
 git clone https://github.com/YoungCan-Wang/Wyckoff-Analysis.git
@@ -115,7 +207,7 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-Web App: **[wyckoff-analysis.pages.dev](https://wyckoff-analysis.pages.dev/home)**
+Web App: **[wyckoff-analysis.pages.dev](https://wyckoff-analysis.pages.dev/)**
 
 Streamlit: **[wyckoff-analysis-youngcanphoenix.streamlit.app](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**
 
@@ -175,7 +267,7 @@ Tareas programadas con GitHub Actions integradas en el repositorio:
 
 ## Configuracion
 
-**Zero configuracion para empezar** — solo lanza y `/model add` cualquier API Key de LLM. Los datos de cartera se guardan localmente por defecto.
+**Cero configuracion para empezar** — solo lanza y `/model add` cualquier API Key de LLM. Los datos de cartera se guardan localmente por defecto.
 
 Configuracion avanzada (archivo `.env` o GitHub Actions Secrets):
 
@@ -187,6 +279,8 @@ Configuracion avanzada (archivo `.env` o GitHub Actions Secrets):
 | `TICKFLOW_API_KEY` | TickFlow en tiempo real / intradias | Opcional |
 | `FEISHU_WEBHOOK_URL` | Push Feishu | Opcional |
 | `TG_BOT_TOKEN` + `TG_CHAT_ID` | Push Telegram | Opcional |
+
+> Fuente de datos: [TickFlow →](https://tickflow.org/auth/register?ref=5N4NKTCPL4) | API LLM: [1Route →](https://www.1route.dev/register?aff=359904261)
 
 Consulta la configuracion completa y los secretos de GitHub Actions en la [documentacion de arquitectura](ARCHITECTURE.md).
 
@@ -225,6 +319,20 @@ Una vez registrado, solo pregunta "diagnostica 000001" en Claude Code / Cursor p
 Reutilizacion ligera de la capacidad de analisis Wyckoff: [`YoungCan-Wang/wyckoff_skill`](https://github.com/YoungCan-Wang/wyckoff_skill.git)
 
 Ideal para dar a cualquier asistente IA una rapida "perspectiva Wyckoff."
+
+## Comunidad
+
+| Grupo Feishu | Grupo QQ | Contacto Feishu |
+|:---:|:---:|:---:|
+| <img src="../attach/飞书群二维码.png" width="200" /> | <img src="../attach/QQ群二维码.jpg" width="200" /><br/>Grupo: 761348919 | <img src="../attach/飞书个人二维码.png" width="200" /> |
+
+## Patrocinio
+
+Si el proyecto te ayuda, una Star se agradece. Si te ayuda a ganar dinero, invita al autor a una hamburguesa.
+
+| Alipay | WeChat |
+|:---:|:---:|
+| <img src="../attach/支付宝收款码.jpg" width="200" /> | <img src="../attach/微信收款码.png" width="200" /> |
 
 ## Aviso de riesgo
 

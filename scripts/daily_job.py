@@ -29,7 +29,7 @@ from integrations.supabase_recommendation import (
     mark_ai_recommendations,
     upsert_recommendations,
 )
-from utils.trading_clock import resolve_end_calendar_day
+from utils.trading_clock import next_trading_day, resolve_end_calendar_day
 
 TZ = ZoneInfo("Asia/Shanghai")
 STEP3_REASON_MAP = {
@@ -63,6 +63,31 @@ def _log(msg: str, logs_path: str | None = None) -> None:
         os.makedirs(os.path.dirname(logs_path) or ".", exist_ok=True)
         with open(logs_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
+
+
+def _notify_skip(msg: str, feishu: str = "", wecom: str = "", dingtalk: str = "") -> None:
+    """非交易日跳过时，通过已配置的 IM 渠道发送通知。"""
+    if feishu:
+        try:
+            from utils.feishu import send_feishu_notification
+
+            send_feishu_notification(feishu, "定时任务跳过", msg)
+        except Exception:
+            pass
+    if wecom:
+        try:
+            from utils.notify import send_wecom_notification
+
+            send_wecom_notification(wecom, "定时任务跳过", msg)
+        except Exception:
+            pass
+    if dingtalk:
+        try:
+            from utils.notify import send_dingtalk_notification
+
+            send_dingtalk_notification(dingtalk, "定时任务跳过", msg)
+        except Exception:
+            pass
 
 
 class _TeeStream:
@@ -193,6 +218,15 @@ def main() -> int:
 
     if args.dry_run:
         _log("--dry-run: 配置校验通过，退出", logs_path)
+        return 0
+
+    # 非交易日跳过：检查下一个交易日是否在 2 天内（周日跑 → 周一应该开盘）
+    today = datetime.now(TZ).date()
+    nxt = next_trading_day(today)
+    if nxt and (nxt - today).days > 2:
+        skip_msg = f"📅 下一交易日 {nxt} 距今超过 2 天，任务跳过"
+        _log(skip_msg, logs_path)
+        _notify_skip(skip_msg, webhook, wecom_webhook, dingtalk_webhook)
         return 0
 
     if provider in OPENAI_COMPATIBLE_BASE_URLS:

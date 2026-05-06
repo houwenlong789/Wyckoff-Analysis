@@ -51,6 +51,7 @@ from integrations.tickflow_client import TickFlowClient, normalize_cn_symbol
 from integrations.tickflow_notice import TICKFLOW_LIMIT_HINT, is_tickflow_rate_limited_error
 from utils.feishu import send_feishu_notification, send_tail_buy_card
 from utils.notify import send_to_telegram
+from utils.trading_clock import is_a_share_trading_day
 
 TZ = ZoneInfo("Asia/Shanghai")
 TICKFLOW_UPGRADE_HINT = TICKFLOW_LIMIT_HINT
@@ -1302,6 +1303,16 @@ def main() -> int:
     feishu_webhook = os.getenv("FEISHU_WEBHOOK_URL", "").strip()
     tg_bot_token = os.getenv("TG_BOT_TOKEN", "").strip()
     tg_chat_id = os.getenv("TG_CHAT_ID", "").strip()
+
+    if not is_a_share_trading_day():
+        skip_msg = f"📅 今日 {started_at.strftime('%Y-%m-%d')} 非交易日，尾盘任务跳过"
+        _log(skip_msg, logs_path)
+        if feishu_webhook:
+            send_feishu_notification(feishu_webhook, "尾盘任务跳过", skip_msg)
+        if tg_bot_token and tg_chat_id:
+            send_to_telegram(skip_msg, tg_bot_token=tg_bot_token, tg_chat_id=tg_chat_id)
+        return 0
+
     provider = os.getenv("DEFAULT_LLM_PROVIDER", "gemini").strip().lower() or "gemini"
     api_key = (os.getenv(f"{provider.upper()}_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
     model = (

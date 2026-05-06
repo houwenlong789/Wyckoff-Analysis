@@ -13,7 +13,7 @@ import threading
 from datetime import datetime, timedelta
 from typing import Any
 
-from core.constants import LOCAL_DB_PATH
+from core import constants as core_constants
 
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
@@ -176,8 +176,9 @@ def get_db() -> sqlite3.Connection:
     with _lock:
         if _conn is not None:
             return _conn
-        LOCAL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(LOCAL_DB_PATH), check_same_thread=False)
+        db_path = core_constants.LOCAL_DB_PATH
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=3000")
@@ -498,12 +499,28 @@ def upsert_local_position(
     _ensure_local_portfolio(portfolio_id)
     conn = get_db()
     with conn:
-        conn.execute(
-            """INSERT OR REPLACE INTO portfolio_position
-               (portfolio_id, code, name, shares, cost_price, buy_dt, synced_at)
-               VALUES (?, ?, ?, ?, ?, ?, datetime('now'))""",
-            (portfolio_id, code, name, shares, cost_price, buy_dt),
-        )
+        if buy_dt:
+            conn.execute(
+                """INSERT INTO portfolio_position
+                   (portfolio_id, code, name, shares, cost_price, buy_dt, synced_at)
+                   VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+                   ON CONFLICT(portfolio_id, code) DO UPDATE SET
+                   name=excluded.name, shares=excluded.shares,
+                   cost_price=excluded.cost_price, buy_dt=excluded.buy_dt,
+                   synced_at=excluded.synced_at""",
+                (portfolio_id, code, name, shares, cost_price, buy_dt),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO portfolio_position
+                   (portfolio_id, code, name, shares, cost_price, synced_at)
+                   VALUES (?, ?, ?, ?, ?, datetime('now'))
+                   ON CONFLICT(portfolio_id, code) DO UPDATE SET
+                   name=excluded.name, shares=excluded.shares,
+                   cost_price=excluded.cost_price,
+                   synced_at=excluded.synced_at""",
+                (portfolio_id, code, name, shares, cost_price),
+            )
 
 
 def delete_local_position(portfolio_id: str, code: str) -> None:
@@ -530,6 +547,14 @@ def update_local_free_cash(portfolio_id: str, free_cash: float) -> None:
 # ---------------------------------------------------------------------------
 
 
+_MEMORY_KEEP_LIMITS: dict[str, int] = {
+    "preference": 50,
+    "stock_opinion": 30,
+    "decision": 30,
+    "market_view": 20,
+}
+
+
 def save_memory(memory_type: str, content: str, codes: str = "") -> int:
     conn = get_db()
     with conn:
@@ -537,6 +562,14 @@ def save_memory(memory_type: str, content: str, codes: str = "") -> int:
             """INSERT INTO agent_memory (memory_type, content, codes)
                VALUES (?, ?, ?)""",
             (memory_type, content, codes),
+        )
+        limit = _MEMORY_KEEP_LIMITS.get(memory_type, 50)
+        conn.execute(
+            """DELETE FROM agent_memory WHERE memory_type = ? AND id NOT IN (
+                   SELECT id FROM agent_memory WHERE memory_type = ?
+                   ORDER BY created_at DESC LIMIT ?
+               )""",
+            (memory_type, memory_type, limit),
         )
         return cur.lastrowid or 0
 

@@ -5,6 +5,7 @@ import json
 from cli.compaction import (
     COMPACT_RATIO,
     TAIL_KEEP,
+    _expand_tail_for_tool_refs,
     _summarize_tool_result,
     compact_messages,
     estimate_tokens,
@@ -161,3 +162,64 @@ class TestCompactMessages:
         result, compacted = compact_messages(msgs, FailProvider(), "deepseek")
         assert not compacted
         assert result is msgs
+
+    def test_tool_call_refs_preserved(self):
+        """tail 中 tool 消息引用的 call_id 对应 assistant 也被保留。"""
+        msgs = self._make_messages(20)
+        # 在倒数第5、6条位置插入 tool_call/tool 对
+        msgs.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "call_abc", "name": "analyze_stock", "args": {"code": "000001"}}],
+            }
+        )
+        msgs.append({"role": "tool", "name": "analyze_stock", "content": '{"ok":true}', "tool_call_id": "call_abc"})
+        msgs.append({"role": "assistant", "content": "分析完成"})
+        msgs.append({"role": "user", "content": "谢谢"})
+        # TAIL_KEEP=4 → 原始 tail 从 -4 开始，tool msg (倒数第3) 在 tail 内
+        # 但对应 assistant tool_call (倒数第4) 不在原始 tail → 需要扩展
+        result, compacted = compact_messages(msgs, self.FakeProvider(), "deepseek")
+        assert compacted
+        # 验证 call_id 引用完整性
+        call_ids_defined = set()
+        call_ids_referenced = set()
+        for m in result:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    if tc.get("id"):
+                        call_ids_defined.add(tc["id"])
+            if m.get("role") == "tool" and m.get("tool_call_id"):
+                call_ids_referenced.add(m["tool_call_id"])
+        assert call_ids_referenced <= call_ids_defined
+
+
+class TestExpandTailForToolRefs:
+    def test_no_tool_refs(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "bye"},
+            {"role": "assistant", "content": "cya"},
+        ]
+        assert _expand_tail_for_tool_refs(msgs, 2) == 2
+
+    def test_expands_to_include_assistant_with_tool_call(self):
+        msgs = [
+            {"role": "user", "content": "分析"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "t", "args": {}}]},
+            {"role": "tool", "name": "t", "content": "ok", "tool_call_id": "c1"},
+            {"role": "assistant", "content": "done"},
+        ]
+        # tail_start=2 → tail has tool msg referencing c1, assistant at idx 1 must be included
+        assert _expand_tail_for_tool_refs(msgs, 2) == 1
+
+    def test_no_expansion_when_ref_already_in_tail(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "name": "t", "args": {}}]},
+            {"role": "tool", "name": "t", "content": "ok", "tool_call_id": "c1"},
+            {"role": "assistant", "content": "done"},
+        ]
+        # tail_start=1 → assistant with tool_call already in tail
+        assert _expand_tail_for_tool_refs(msgs, 1) == 1

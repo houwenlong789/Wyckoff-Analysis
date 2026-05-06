@@ -13,12 +13,19 @@ from integrations.supabase_recommendation import load_recommendation_tracking
 
 setup_page(page_title="推荐跟踪", page_icon="🎯")
 
+RECOMMENDATION_KEEP_DATES = 30
+AVG_WINDOWS = (5, 10, 15, 20, 25, 30)
+
 
 def _format_pct(val):
-    if val is None:
+    if val is None or pd.isna(val):
         return "-"
-    color = "red" if val > 0 else "green" if val < 0 else "gray"
-    return f":{color}[{val:+.2f}%]"
+    return f"{val:+.2f}%"
+
+
+def _latest_recommend_dates(df: pd.DataFrame, limit: int) -> list[int]:
+    dates = pd.to_numeric(df.get("recommend_date"), errors="coerce").dropna().astype(int)
+    return sorted({d for d in dates.tolist() if d > 0}, reverse=True)[:limit]
 
 
 content_col = show_right_nav()
@@ -26,6 +33,9 @@ content_col = show_right_nav()
 with content_col:
     st.title("🎯 推荐跟踪")
     st.markdown("记录每日定时任务生成的威科夫推荐股票，并跟踪其后续的表现。数据在每日定时任务后自动刷新。")
+    st.info(
+        "此页仅展示推荐表中最新 30 个推荐交易日的数据；这 30 个日期按数据库实际存在的推荐日计算，不按连续自然日补齐。"
+    )
 
     # 1. 加载数据
     loading = show_page_loading(title="思考中...", subtitle="从数据库加载推荐历史")
@@ -67,6 +77,24 @@ with content_col:
         df["recommend_count"] = 1
     df["recommend_count"] = pd.to_numeric(df.get("recommend_count"), errors="coerce").fillna(1).astype(int)
     df["recommend_date"] = pd.to_numeric(df.get("recommend_date"), errors="coerce").fillna(0).astype(int)
+    latest_dates = _latest_recommend_dates(df, RECOMMENDATION_KEEP_DATES)
+    if latest_dates:
+        df = df[df["recommend_date"].isin(latest_dates)].copy()
+    else:
+        st.info("目前暂无有效推荐日期，请等待下一次定时任务运行。")
+        st.stop()
+
+    st.markdown("### 🔎 推荐交易日窗口")
+    selected_window = st.selectbox(
+        "统计与列表窗口",
+        options=AVG_WINDOWS,
+        index=len(AVG_WINDOWS) - 1,
+        format_func=lambda v: f"近{v}个推荐交易日",
+        help="按推荐表中实际存在的推荐日期倒序取样，不按连续自然日补齐。",
+    )
+    active_dates = latest_dates[:selected_window]
+    df = df[df["recommend_date"].isin(active_dates)].copy()
+    stats_df = df.copy()
 
     # 格式化日期 (INT YYYYMMDD -> YYYY-MM-DD str)
     def _parse_date(v: int):
@@ -116,6 +144,7 @@ with content_col:
 
     # 3. 统计指标 (KPIs)
     st.markdown("### 📊 表现摘要")
+    st.caption(f"当前窗口覆盖 {len(active_dates)} 个推荐交易日，{len(stats_df)} 条推荐记录。")
     col1, col2, col3, col4, col5 = st.columns(5)
     avg_change = df["change_pct"].mean()
     max_change = df["change_pct"].max()
@@ -123,9 +152,9 @@ with content_col:
     total_recommend_events = int(df["recommend_count"].sum())
 
     col1.metric("覆盖股票数", f"{len(df)} 支")
-    col2.metric("平均表现", f"{avg_change:+.2f}%")
-    col3.metric("最高涨幅", f"{max_change:+.2f}%")
-    col4.metric("最大跌幅", f"{min_change:+.2f}%")
+    col2.metric(f"近{selected_window}个推荐交易日平均涨幅", _format_pct(avg_change))
+    col3.metric("最高涨幅", _format_pct(max_change))
+    col4.metric("最大跌幅", _format_pct(min_change))
     col5.metric("总推荐次数", f"{total_recommend_events} 次")
 
     st.divider()

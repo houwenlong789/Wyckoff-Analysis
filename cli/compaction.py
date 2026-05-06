@@ -221,10 +221,14 @@ def flush_memory_before_compaction(
         all_text = " ".join(m.get("content", "") or "" for m in messages)
         codes = extract_stock_codes(all_text)
 
+        _skip_phrases = ("摘要", "压缩", "总结", "对话历史", "分析讨论", "上下文")
         for line in result.strip().split("\n"):
             line = line.strip().lstrip("- ").strip()
-            if line and len(line) >= 5 and "无" not in line[:3]:
-                save_memory("preference", line, codes=",".join(codes[:10]))
+            if not line or len(line) < 5 or "无" in line[:3]:
+                continue
+            if any(p in line for p in _skip_phrases):
+                continue
+            save_memory("preference", line, codes=",".join(codes[:10]))
     except Exception:
         pass
 
@@ -247,6 +251,36 @@ COMPACTION_PROMPT = """请将以下对话历史总结为简洁的上下文摘要
 # ---------------------------------------------------------------------------
 
 
+def _expand_tail_for_tool_refs(messages: list[dict[str, Any]], tail_start: int) -> int:
+    """向前扩展 tail 边界，确保 tail 中 tool 消息引用的 call_id 对应的 assistant 消息也在 tail 内。"""
+    tail_tool_call_ids: set[str] = set()
+    for m in messages[tail_start:]:
+        if m.get("role") == "tool" and m.get("tool_call_id"):
+            tail_tool_call_ids.add(m["tool_call_id"])
+    if not tail_tool_call_ids:
+        return tail_start
+
+    for i in range(tail_start - 1, -1, -1):
+        m = messages[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            ids_in_msg = {tc.get("id") for tc in m["tool_calls"] if tc.get("id")}
+            if ids_in_msg & tail_tool_call_ids:
+                tail_start = i
+                tail_tool_call_ids -= ids_in_msg
+                # 继续检查新纳入的 tool 消息是否又引入新依赖
+                for j in range(i + 1, len(messages)):
+                    mj = messages[j]
+                    if mj.get("role") == "tool" and mj.get("tool_call_id"):
+                        tail_tool_call_ids.add(mj["tool_call_id"])
+                    if mj.get("role") == "assistant" and mj.get("tool_calls"):
+                        for tc in mj["tool_calls"]:
+                            if tc.get("id"):
+                                tail_tool_call_ids.discard(tc["id"])
+        if not tail_tool_call_ids:
+            break
+    return tail_start
+
+
 def compact_messages(
     messages: list[dict[str, Any]],
     provider: Any,
@@ -260,8 +294,12 @@ def compact_messages(
     if len(messages) <= TAIL_KEEP + 2 or estimate_tokens(messages) <= threshold:
         return messages, False
 
-    head = messages[:-TAIL_KEEP]
-    tail = messages[-TAIL_KEEP:]
+    tail_start = _expand_tail_for_tool_refs(messages, len(messages) - TAIL_KEEP)
+    if tail_start <= 2:
+        return messages, False
+
+    head = messages[:tail_start]
+    tail = messages[tail_start:]
 
     # 压缩前先提取持久偏好到记忆
     flush_memory_before_compaction(head, provider)

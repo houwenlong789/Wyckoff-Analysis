@@ -4,21 +4,37 @@ import { supabase } from '@/lib/supabase'
 import { useAuthStore } from '@/stores/auth'
 
 export function AuthGuard() {
-  const { user, loading, setAuth, setLoading } = useAuthStore()
+  const { user, loading, setAuth } = useAuthStore()
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setAuth(session?.user ?? null, session)
-    })
+    let active = true
+
+    supabase.auth
+      .getSession()
+      .then(({ data: { session } }) => {
+        if (active) {
+          setAuth(session?.user ?? null, session)
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setAuth(null, null)
+        }
+      })
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
       (_event, session) => {
-        setAuth(session?.user ?? null, session)
+        if (active) {
+          setAuth(session?.user ?? null, session)
+        }
       },
     )
 
-    return () => subscription.unsubscribe()
-  }, [setAuth, setLoading])
+    return () => {
+      active = false
+      subscription.unsubscribe()
+    }
+  }, [setAuth])
 
   if (loading) {
     return (
