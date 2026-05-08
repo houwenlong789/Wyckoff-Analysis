@@ -301,12 +301,16 @@ def check_doom_loop(
         return True
 
     # 语义相似匹配：检查同工具的参数是否"换汤不换药"
+    # 短参数（< 50字符）跳过 Jaccard——短 JSON 天然高相似度导致误判批量调用
     if recent_args_texts is not None:
         args_text = _json.dumps(args, sort_keys=True, ensure_ascii=False)
-        same_tool_texts = [t for (n, _), t in zip(recent_calls, recent_args_texts) if n == name]
-        similar_count = sum(1 for t in same_tool_texts if _jaccard_similarity(args_text, t) >= similarity_threshold)
-        if similar_count >= DOOM_LOOP_THRESHOLD:
-            return True
+        if len(args_text) >= 50:
+            same_tool_texts = [t for (n, _), t in zip(recent_calls, recent_args_texts) if n == name]
+            similar_count = sum(
+                1 for t in same_tool_texts if _jaccard_similarity(args_text, t) >= similarity_threshold
+            )
+            if similar_count >= DOOM_LOOP_THRESHOLD:
+                return True
         recent_args_texts.append(args_text)
         if len(recent_args_texts) > DOOM_LOOP_WINDOW:
             recent_args_texts.pop(0)

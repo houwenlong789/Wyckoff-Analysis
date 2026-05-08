@@ -66,6 +66,7 @@ class FunnelConfig:
     require_cn_main_or_chinext: bool = True
     min_market_cap_yi: float = 35.0
     min_avg_amount_wan: float = 5000.0
+    l1_cap_bypass_amount_wan: float = 8000.0  # 市值不足但日均额 >= 此值可放行
     amount_avg_window: int = 20
 
     # Layer 2
@@ -82,12 +83,19 @@ class FunnelConfig:
     enable_rps_filter: bool = True
     rps_window_fast: int = 50
     rps_window_slow: int = 120
-    rps_fast_min: float = 75.0
+    rps_fast_min: float = 65.0
     rps_slow_min: float = 70.0
+    rps_slow_strong_bypass: float = 80.0  # 中期极强时 RPS50 只需 >= 50 即通过
+    rps_fast_bypass_min: float = 50.0
     rps_slope_window: int = 10  # 计算 RPS 斜率的窗口（交易日）
     rps_slope_min: float = 0.5  # RPS 斜率最小值（%/day），用于判断 RPS 是否还在上升
     require_bench_latest_alignment: bool = False
     momentum_bias_200_max: float = 0.25  # 防止主升通道选出离 200 日线太远的鱼尾老妖股
+    # Layer 2 预点火观察池
+    enable_pre_ignition_watch: bool = True
+    pre_ignition_bias_max: float = 0.20
+    pre_ignition_rps_slow_min: float = 60.0
+    pre_ignition_vol_ratio_min: float = 0.6
     # Layer 2 潜伏通道（长强短弱）
     enable_ambush_channel: bool = True
     ambush_rps_fast_max: float = 45.0
@@ -345,7 +353,13 @@ def layer1_filter(
         if cap_available:
             cap = market_cap_map.get(sym, 0.0)
             if cap < cfg.min_market_cap_yi:
-                continue
+                df_tmp = df_map.get(sym)
+                if df_tmp is not None and not df_tmp.empty and "amount" in df_tmp.columns:
+                    avg_a = _sorted_if_needed(df_tmp)["amount"].tail(cfg.amount_avg_window).mean()
+                    if not (pd.notna(avg_a) and avg_a >= cfg.l1_cap_bypass_amount_wan * 10000):
+                        continue
+                else:
+                    continue
         df = df_map.get(sym)
         if df is None or df.empty:
             continue
@@ -381,15 +395,14 @@ def layer2_strength_detailed(
     cfg: FunnelConfig,
     *,
     rps_universe: list[str] | None = None,
-) -> tuple[list[str], dict[str, str]]:
+) -> tuple[list[str], dict[str, str], list[str]]:
     """
-    Layer2 双通道：
-    1) 主升通道：MA50>MA200（或大盘连跌时守住MA20）+ RS/RPS 强势过滤
-    2) 潜伏通道：长强短弱（RPS120高、RPS50低）且回到年线附近
+    Layer2 多通道强弱甄别。
 
     返回：
     - passed: 通过 Layer2 的股票
-    - channel_map: code -> 主升通道/潜伏通道/双通道
+    - channel_map: code -> 通道标签
+    - pre_ignition_list: 预点火观察池（未通过六通道但结构接近）
     """
 
     def _cum_return_pct_from_series(pct_series: pd.Series) -> float | None:
@@ -467,6 +480,7 @@ def layer2_strength_detailed(
 
     passed: list[str] = []
     channel_map: dict[str, str] = {}
+    pre_ignition_list: list[str] = []
     for sym in symbols:
         df = df_map.get(sym)
         if df is None or len(df) < cfg.ma_long:
@@ -540,9 +554,10 @@ def layer2_strength_detailed(
             momentum_rps_ok = (
                 rps_fast is not None
                 and rps_slow is not None
-                and rps_fast >= cfg.rps_fast_min
-                and rps_slow >= cfg.rps_slow_min
-                and rps_slope_ok  # 加入 RPS 斜率判断
+                and (
+                    (rps_fast >= cfg.rps_fast_min and rps_slow >= cfg.rps_slow_min and rps_slope_ok)
+                    or (rps_slow >= cfg.rps_slow_strong_bypass and rps_fast >= cfg.rps_fast_bypass_min)
+                )
             )
             ambush_rps_ok = (
                 rps_fast is not None
@@ -722,7 +737,24 @@ def layer2_strength_detailed(
             if not labels:
                 labels.append("点火破局")
             channel_map[sym] = "+".join(labels)
-    return passed, channel_map
+        elif cfg.enable_pre_ignition_watch:
+            _pre_ign = False
+            if pd.notna(last_ma_long) and float(last_ma_long) > 0 and pd.notna(last_close):
+                _bias = (float(last_close) - float(last_ma_long)) / float(last_ma_long)
+                _has_structure = (bullish_alignment or holding_ma20) and _bias <= cfg.pre_ignition_bias_max
+                _has_rps = rps_slow is not None and rps_slow >= cfg.pre_ignition_rps_slow_min
+                _has_vol = False
+                if len(df_sorted) >= 2 and "volume" in df_sorted.columns:
+                    vol_tail = df_sorted["volume"].tail(cfg.sos_vol_window)
+                    if len(vol_tail) > 1:
+                        prev_vol = float(df_sorted["volume"].iloc[-2])
+                        avg_vol = float(vol_tail.iloc[:-1].mean())
+                        if avg_vol > 0:
+                            _has_vol = (prev_vol / avg_vol) >= cfg.pre_ignition_vol_ratio_min
+                _pre_ign = _has_structure and _has_rps and _has_vol
+            if _pre_ign:
+                pre_ignition_list.append(sym)
+    return passed, channel_map, pre_ignition_list
 
 
 # Layer 3: 板块共振
@@ -1557,7 +1589,7 @@ def run_funnel(
     }
 
     l1 = layer1_filter(all_symbols, name_map, market_cap_map, prepared_df_map, cfg)
-    l2, channel_map = layer2_strength_detailed(
+    l2, channel_map, _pre_ign = layer2_strength_detailed(
         l1,
         prepared_df_map,
         bench_df,
@@ -1652,6 +1684,8 @@ def allocate_ai_candidates(
 
     def _is_blocked_exit(code: str) -> bool:
         sig = str((result.exit_signals.get(code, {}) or {}).get("signal", "")).strip()
+        if sig == "stop_loss" and code in sos_hit_set:
+            return False
         return sig in blocked_exit_signals
 
     def _is_accum_stage_candidate(code: str) -> bool:

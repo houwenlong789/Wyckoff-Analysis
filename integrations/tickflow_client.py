@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,11 +26,14 @@ TICKFLOW_TIMEOUT_SECONDS = max(int(os.getenv("TICKFLOW_TIMEOUT_SECONDS", "12")),
 TICKFLOW_MAX_RETRIES = max(int(os.getenv("TICKFLOW_MAX_RETRIES", "3")), 1)
 TICKFLOW_RETRY_BACKOFF_SECONDS = max(float(os.getenv("TICKFLOW_RETRY_BACKOFF_SECONDS", "1.5")), 0.1)
 TICKFLOW_RATE_LIMIT_MAX_SLEEP_SECONDS = max(float(os.getenv("TICKFLOW_RATE_LIMIT_MAX_SLEEP_SECONDS", "90")), 1.0)
+TICKFLOW_KLINE_RATE_LIMIT_PER_MIN = max(int(os.getenv("TICKFLOW_KLINE_RATE_LIMIT_PER_MIN", "0")), 0)
 
 _PERIOD_SET = {"1m", "5m", "10m", "15m", "30m", "60m", "1d", "1w", "1M", "1Q", "1Y"}
 _CN_TZ = "Asia/Shanghai"
 _ADJUST_SET = {"none", "forward", "backward", "forward_additive", "backward_additive"}
 _RATE_LIMIT_WAIT_RE = re.compile(r"请\s*(\d+(?:\.\d+)?)\s*(ms|毫秒|s|秒)?\s*后重试", re.IGNORECASE)
+_KLINE_CALL_TIMES: deque[float] = deque()
+_KLINE_RATE_LOCK = threading.Lock()
 _TICKFLOW_LOG_VERBOSE = os.getenv("TICKFLOW_LOG_VERBOSE", "0").strip().lower() in {
     "1",
     "true",
@@ -77,6 +82,24 @@ def _rate_limit_delay_seconds(body: str, retry_after: str | None) -> float | Non
     if unit in {"ms", "毫秒"}:
         value /= 1000.0
     return min(max(value + 0.5, 0.1), TICKFLOW_RATE_LIMIT_MAX_SLEEP_SECONDS)
+
+
+def _throttle_kline_request(path: str) -> None:
+    limit = TICKFLOW_KLINE_RATE_LIMIT_PER_MIN
+    if limit <= 0 or not path.startswith("/v1/klines"):
+        return
+
+    while True:
+        now = time.monotonic()
+        with _KLINE_RATE_LOCK:
+            while _KLINE_CALL_TIMES and now - _KLINE_CALL_TIMES[0] >= 60.0:
+                _KLINE_CALL_TIMES.popleft()
+            if len(_KLINE_CALL_TIMES) < limit:
+                _KLINE_CALL_TIMES.append(now)
+                return
+            sleep_s = max(60.0 - (now - _KLINE_CALL_TIMES[0]) + 0.05, 0.1)
+        _tf_log(f"client_rate_limit_sleep path={path} sleep_s={sleep_s:.1f} limit={limit}/min", always=True)
+        time.sleep(sleep_s)
 
 
 def normalize_cn_symbol(raw: str) -> str:
@@ -155,6 +178,7 @@ class TickFlowClient:
         for attempt in range(1, self.max_retries + 1):
             started = time.monotonic()
             try:
+                _throttle_kline_request(path)
                 resp = requests.get(
                     url,
                     headers=headers,

@@ -164,7 +164,7 @@ def diagnose_one_stock(
     l2_channel = "未入选"
     try:
         diag_cfg = replace(cfg, enable_rps_filter=False)
-        passed, channel_map = layer2_strength_detailed([code], {code: df_s}, bench_df, diag_cfg)
+        passed, channel_map, _ = layer2_strength_detailed([code], {code: df_s}, bench_df, diag_cfg)
         if code in channel_map:
             l2_channel = channel_map[code]
     except Exception:

@@ -258,6 +258,7 @@ def search_stock_by_name(keyword: str, tool_context: ToolContext) -> list[dict]:
 
 def _enrich_search_results(items: list[dict]) -> None:
     """为搜索结果前几条附加行情、市值、新闻。"""
+    import concurrent.futures
     from datetime import datetime
 
     try:
@@ -285,17 +286,30 @@ def _enrich_search_results(items: list[dict]) -> None:
                 pass
         if cap_map:
             item["market_cap_yi"] = cap_map.get(code)
-        try:
-            import akshare as ak
-            import pandas as pd
+        item["news"] = _fetch_news_with_timeout(code)
 
-            df = ak.stock_news_em(symbol=code)
-            cutoff = datetime.now() - timedelta(days=7)
-            df["发布时间"] = pd.to_datetime(df["发布时间"])
-            recent = df[df["发布时间"] >= cutoff]
-            item["news"] = recent["新闻标题"].head(5).tolist()
-        except Exception:
-            item["news"] = []
+
+def _fetch_news_with_timeout(code: str, timeout: float = 5.0) -> list[str]:
+    import concurrent.futures
+
+    def _fetch():
+        from datetime import datetime, timedelta
+
+        import akshare as ak
+        import pandas as pd
+
+        df = ak.stock_news_em(symbol=code)
+        cutoff = datetime.now() - timedelta(days=7)
+        df["发布时间"] = pd.to_datetime(df["发布时间"])
+        recent = df[df["发布时间"] >= cutoff]
+        return recent["新闻标题"].head(5).tolist()
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_fetch)
+            return future.result(timeout=timeout)
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------

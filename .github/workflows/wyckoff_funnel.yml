@@ -15,8 +15,15 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONUNBUFFERED: "1"
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
       TICKFLOW_API_KEY: ${{ secrets.TICKFLOW_API_KEY }}
+      # TickFlow 日K上限为 300/min；主漏斗用线程模式共享客户端限速器，并留出安全余量。
+      TICKFLOW_KLINE_RATE_LIMIT_PER_MIN: "240"
+      FUNNEL_EXECUTOR_MODE: "thread"
+      FUNNEL_MAX_WORKERS: "4"
+      FUNNEL_BATCH_SIZE: "120"
+      FUNNEL_BATCH_SLEEP: "6"
       DEFAULT_LLM_PROVIDER: ${{ secrets.DEFAULT_LLM_PROVIDER }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}

@@ -689,43 +689,11 @@ def _load_signal_pending_candidates(target_signal_date: str, logs_path: str | No
     return picked
 
 
-def _load_recommendation_tracking_candidates(
+def _parse_rec_rows(
+    rows: list[dict[str, Any]],
+    target_yyyymmdd: str,
     target_signal_date: str,
-    logs_path: str | None = None,
 ) -> list[TailBuyCandidate]:
-    if not is_admin_configured():
-        raise RuntimeError("Supabase 凭据未配置，无法读取 recommendation_tracking")
-
-    client = create_admin_client()
-    target_yyyymmdd = target_signal_date.replace("-", "")
-    rows: list[dict[str, Any]] = []
-    try:
-        rows = (
-            client.table(TABLE_RECOMMENDATION_TRACKING)
-            .select("code,name,recommend_date,funnel_score,is_ai_recommended")
-            .eq("recommend_date", int(target_yyyymmdd))
-            .limit(5000)
-            .execute()
-            .data
-            or []
-        )
-    except Exception as e:
-        _log(f"recommendation_tracking 精确查询失败，尝试宽松查询: {e}", logs_path)
-
-    if not rows:
-        try:
-            rows = (
-                client.table(TABLE_RECOMMENDATION_TRACKING)
-                .select("code,name,recommend_date,funnel_score,is_ai_recommended")
-                .order("recommend_date", desc=True)
-                .limit(10000)
-                .execute()
-                .data
-                or []
-            )
-        except Exception as e:
-            raise RuntimeError(f"读取 recommendation_tracking 失败: {e}") from e
-
     picked_map: dict[str, TailBuyCandidate] = {}
     for row in rows:
         if not isinstance(row, dict):
@@ -753,9 +721,49 @@ def _load_recommendation_tracking_candidates(
         new_rank = 1 if candidate.status == "confirmed" else 0
         if (new_rank, candidate.signal_score) > (old_rank, old.signal_score):
             picked_map[code] = candidate
-
     picked = list(picked_map.values())
     picked.sort(key=lambda x: (x.status != "confirmed", -x.signal_score, x.code))
+    return picked
+
+
+def _load_recommendation_tracking_candidates(
+    target_signal_date: str,
+    logs_path: str | None = None,
+    *,
+    springboard_only: bool = False,
+) -> list[TailBuyCandidate]:
+    if not is_admin_configured():
+        raise RuntimeError("Supabase 凭据未配置，无法读取 recommendation_tracking")
+
+    client = create_admin_client()
+    target_yyyymmdd = target_signal_date.replace("-", "")
+    rows: list[dict[str, Any]] = []
+    try:
+        q = (
+            client.table(TABLE_RECOMMENDATION_TRACKING)
+            .select("code,name,recommend_date,funnel_score,is_ai_recommended")
+            .eq("recommend_date", int(target_yyyymmdd))
+        )
+        if springboard_only:
+            q = q.eq("is_ai_recommended", True)
+        rows = q.limit(5000).execute().data or []
+    except Exception as e:
+        _log(f"recommendation_tracking 精确查询失败，尝试宽松查询: {e}", logs_path)
+
+    if not rows:
+        try:
+            q_fallback = (
+                client.table(TABLE_RECOMMENDATION_TRACKING)
+                .select("code,name,recommend_date,funnel_score,is_ai_recommended")
+                .order("recommend_date", desc=True)
+            )
+            if springboard_only:
+                q_fallback = q_fallback.eq("is_ai_recommended", True)
+            rows = q_fallback.limit(10000).execute().data or []
+        except Exception as e:
+            raise RuntimeError(f"读取 recommendation_tracking 失败: {e}") from e
+
+    picked = _parse_rec_rows(rows, target_yyyymmdd, target_signal_date)
     _log(
         f"recommendation_tracking 候选加载: raw={len(rows)}, picked={len(picked)}, recommend_date={target_yyyymmdd}",
         logs_path,
@@ -763,40 +771,23 @@ def _load_recommendation_tracking_candidates(
     return picked
 
 
-def _merge_tail_candidates(
-    signal_pending_candidates: list[TailBuyCandidate],
-    recommendation_candidates: list[TailBuyCandidate],
-) -> tuple[list[TailBuyCandidate], int]:
-    merged: dict[str, TailBuyCandidate] = {}
-    for item in signal_pending_candidates or []:
-        if item.code:
-            merged[item.code] = item
-
-    appended = 0
-    for rec in recommendation_candidates or []:
-        if not rec.code:
-            continue
-        old = merged.get(rec.code)
-        if old is None:
-            merged[rec.code] = rec
-            appended += 1
-            continue
-        old.signal_score = max(_safe_float(old.signal_score), _safe_float(rec.signal_score))
-        if old.status != "confirmed" and rec.status == "confirmed":
-            old.status = "confirmed"
-        if (not old.name or old.name == old.code) and rec.name:
-            old.name = rec.name
-
-    out = list(merged.values())
-    out.sort(key=lambda x: (x.status != "confirmed", -x.signal_score, x.code))
-    return out, appended
-
-
 def _load_tail_candidates(target_signal_date: str, logs_path: str | None = None) -> tuple[list[TailBuyCandidate], str]:
+    """加载尾盘候选池。优先使用 T-1 日的起跳板（is_ai_recommended）作为主池，
+    signal_pending 中未被起跳板覆盖的票作为补充。"""
+    springboard: list[TailBuyCandidate] = []
     pending: list[TailBuyCandidate] = []
-    recs: list[TailBuyCandidate] = []
+    springboard_err = ""
     pending_err = ""
-    rec_err = ""
+
+    try:
+        springboard = _load_recommendation_tracking_candidates(
+            target_signal_date,
+            logs_path,
+            springboard_only=True,
+        )
+    except Exception as e:
+        springboard_err = str(e)
+        _log(f"起跳板候选加载失败（降级继续）: {e}", logs_path)
 
     try:
         pending = _load_signal_pending_candidates(target_signal_date, logs_path)
@@ -804,24 +795,25 @@ def _load_tail_candidates(target_signal_date: str, logs_path: str | None = None)
         pending_err = str(e)
         _log(f"signal_pending 加载失败（降级继续）: {e}", logs_path)
 
-    try:
-        recs = _load_recommendation_tracking_candidates(target_signal_date, logs_path)
-    except Exception as e:
-        rec_err = str(e)
-        _log(f"recommendation_tracking 加载失败（降级继续）: {e}", logs_path)
+    if springboard_err and pending_err:
+        raise RuntimeError(f"候选池双源都失败: springboard={springboard_err}; signal_pending={pending_err}")
 
-    if pending_err and rec_err:
-        raise RuntimeError(f"候选池双源都失败: signal_pending={pending_err}; recommendation_tracking={rec_err}")
+    springboard_codes = {c.code for c in springboard}
+    supplement = [c for c in pending if c.code not in springboard_codes]
 
-    merged, rec_added = _merge_tail_candidates(pending, recs)
+    for c in springboard:
+        c.status = "confirmed"
+
+    merged = springboard + supplement
+    merged.sort(key=lambda x: (x.status != "confirmed", -x.signal_score, x.code))
+
     source_desc = (
-        "signal_pending + recommendation_tracking "
-        f"(signal_date/recommend_date={target_signal_date}; rec_only={rec_added})"
+        f"springboard={len(springboard)} + signal_pending_supplement={len(supplement)} "
+        f"(recommend_date/signal_date={target_signal_date})"
     )
     _log(
-        "候选池加载完成: "
-        f"signal_pending={len(pending)}, recommendation_tracking={len(recs)}, "
-        f"merged={len(merged)}, signal_date={target_signal_date}",
+        f"候选池加载完成: 起跳板={len(springboard)}, signal_pending补充={len(supplement)}, "
+        f"合计={len(merged)}, target_date={target_signal_date}",
         logs_path,
     )
     return merged, source_desc
@@ -1102,6 +1094,7 @@ def _run_llm_overlay(
     route_hits: dict[str, int] = {}
     llm_error_counter: Counter[str] = Counter()
     max_workers = max(1, int(llm_concurrency))
+    verbose_llm_errors = _env_flag("TAIL_BUY_LOG_LLM_PER_SYMBOL_ERRORS", True)
 
     def _judge_one(item: TailBuyCandidate) -> tuple[str, dict | None, str | None]:
         di = (depth_map or {}).get(item.code)
@@ -1132,7 +1125,8 @@ def _run_llm_overlay(
                 last_err = f"{route_name}:llm_parse_failed"
             except Exception as e:
                 last_err = f"{route_name}:{e}"
-                _log(f"LLM路由失败: code={item.code}, route={route_name}, err={e}", logs_path)
+                if verbose_llm_errors:
+                    _log(f"LLM路由失败: code={item.code}, route={route_name}, err={e}", logs_path)
                 continue
         return item.code, None, last_err or "all_routes_failed"
 
@@ -1151,10 +1145,12 @@ def _run_llm_overlay(
                         route_hits[route] = route_hits.get(route, 0) + 1
                     elif err:
                         llm_error_counter[str(err)] += 1
-                        _log(f"LLM二判失败: {code}, err={err}", logs_path)
+                        if verbose_llm_errors:
+                            _log(f"LLM二判失败: {code}, err={err}", logs_path)
                 except Exception as e:
                     llm_error_counter[f"FutureException:{type(e).__name__}"] += 1
-                    _log(f"LLM二判异常: {code}, err={e}", logs_path)
+                    if verbose_llm_errors:
+                        _log(f"LLM二判异常: {code}, err={e}", logs_path)
         except FutureTimeout:
             _log("LLM 二判触发 deadline 保护：停止等待剩余结果。", logs_path)
             for fut, code in futures.items():
@@ -1162,7 +1158,8 @@ def _run_llm_overlay(
                     continue
                 fut.cancel()
                 llm_error_counter["deadline_cancelled"] += 1
-                _log(f"LLM二判取消: {code}", logs_path)
+                if verbose_llm_errors:
+                    _log(f"LLM二判取消: {code}", logs_path)
 
     if llm_error_counter:
         top_err = " | ".join([f"{k} x{v}" for k, v in llm_error_counter.most_common(5)])

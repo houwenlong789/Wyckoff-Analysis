@@ -399,7 +399,7 @@ def run_funnel_job(
     l1_passed = layer1_filter(l1_input, name_map, market_cap_map, all_df_map, cfg, financial_map=financial_map)
 
     # Layer 2
-    l2_passed, l2_channel_map = layer2_strength_detailed(
+    l2_passed, l2_channel_map, l2_pre_ignition = layer2_strength_detailed(
         l1_passed,
         all_df_map,
         bench_df,

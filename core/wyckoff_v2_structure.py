@@ -324,7 +324,7 @@ def run_structure_funnel(
         cfg,
         financial_map=financial_map,
     )
-    l2, channel_map = layer2_strength_detailed(
+    l2, channel_map, _pre_ign = layer2_strength_detailed(
         l1,
         prepared_df_map,
         bench_df,
