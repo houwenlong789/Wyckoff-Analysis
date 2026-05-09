@@ -145,6 +145,23 @@ export function SettingsPage() {
         </div>
       )}
 
+      {/* Account */}
+      {user && (
+        <section className="mb-8">
+          <h2 className="mb-3 text-sm font-medium text-muted-foreground">{t('settings.account')}</h2>
+          <div className="space-y-2 rounded-lg border border-border px-4 py-3 text-sm">
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">Email</span>
+              <span>{user.email}</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">User ID</span>
+              <span className="font-mono text-xs select-all">{user.id}</span>
+            </div>
+          </div>
+        </section>
+      )}
+
       {/* Data Sources */}
       <section className="mb-8">
         <h2 className="mb-3 text-sm font-medium text-muted-foreground">{t('settings.dataSources')}</h2>
