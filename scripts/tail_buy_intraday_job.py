@@ -1287,6 +1287,7 @@ def main() -> int:
         default=_default_tail_buy_portfolio_id(),
     )
     parser.add_argument("--logs", default=None, help="日志路径")
+    parser.add_argument("--user-id", default=os.getenv("SUPABASE_USER_ID", "").strip(), help="目标用户ID")
     args = parser.parse_args()
 
     started_at = _now()
@@ -1540,7 +1541,7 @@ def main() -> int:
         if buy_rows:
             from integrations.supabase_tail_buy import save_tail_buy_to_supabase
 
-            n_sb = save_tail_buy_to_supabase(buy_rows)
+            n_sb = save_tail_buy_to_supabase(buy_rows, user_id=args.user_id)
             _log(f"已写入 {n_sb} 条 BUY 到 Supabase", logs_path)
     except Exception as e:
         _log(f"写入 SQLite 失败（不影响推送）: {e}", logs_path)

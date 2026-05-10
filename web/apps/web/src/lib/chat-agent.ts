@@ -183,14 +183,32 @@ function createReasoningFetch(): typeof globalThis.fetch {
       throw new Error(msg)
     }
 
-    const clone = res.clone()
-    clone.json().then((data: Record<string, unknown>) => {
-      const choices = data?.choices as Array<{ message?: { reasoning_content?: string } }> | undefined
-      const rc = choices?.[0]?.message?.reasoning_content
-      if (rc) cache.push(rc)
-    }).catch(() => {})
+    const contentType = res.headers.get('content-type') || ''
+    if (!contentType.includes('text/event-stream') || !res.body) return res
 
-    return res
+    let reasoning = ''
+    const original = res.body
+    const transformed = original.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        controller.enqueue(chunk)
+        const text = new TextDecoder().decode(chunk)
+        for (const line of text.split('\n')) {
+          if (!line.startsWith('data: ') || line === 'data: [DONE]') continue
+          try {
+            const evt = JSON.parse(line.slice(6))
+            const rc = evt?.choices?.[0]?.delta?.reasoning_content
+            if (rc) reasoning += rc
+          } catch {}
+        }
+      },
+      flush() { if (reasoning) cache.push(reasoning) },
+    }))
+
+    return new Response(transformed, {
+      status: res.status,
+      statusText: res.statusText,
+      headers: res.headers,
+    })
   }
 }
 
