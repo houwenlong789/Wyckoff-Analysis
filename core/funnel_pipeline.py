@@ -1,6 +1,6 @@
 """Wyckoff 漏斗管线的 tools 层公共 API 转发。"""
 
-from core.wyckoff_engine import run_funnel  # noqa: F401
+from scripts.wyckoff_funnel import run as run_funnel  # noqa: F401
 from tools.candidate_ranker import (  # noqa: F401
     TRIGGER_LABELS,
     rank_l3_candidates,
