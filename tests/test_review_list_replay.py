@@ -3,9 +3,12 @@ from __future__ import annotations
 from collections import Counter
 from datetime import date
 
+import pandas as pd
+
 from scripts.review_list_replay import (
     _build_focus_lines,
     _build_report_lines,
+    _find_big_gainers,
     _format_recommendation_history,
     _normalize_code6,
     _short_code_list,
@@ -24,6 +27,28 @@ def test_short_code_list_limits_output():
     ]
 
     assert _short_code_list(rows, limit=2) == "000001平安银行、000002万科A、等3只"
+
+
+def test_find_big_gainers_derives_pct_from_close():
+    df = pd.DataFrame(
+        {
+            "date": ["2026-05-12", "2026-05-13"],
+            "close": [10.0, 10.9],
+            "pct_chg": [0.0, 0.0],
+        }
+    )
+
+    codes = _find_big_gainers({"000001": df}, {"000001": "平安银行"}, threshold=8.0)
+
+    assert codes == ["000001"]
+
+
+def test_find_big_gainers_falls_back_to_pct_chg():
+    df = pd.DataFrame({"date": ["2026-05-13"], "close": [10.9], "pct_chg": [8.2]})
+
+    codes = _find_big_gainers({"000001": df}, {"000001": "平安银行"}, threshold=8.0)
+
+    assert codes == ["000001"]
 
 
 def test_build_focus_lines_highlights_actionable_buckets():

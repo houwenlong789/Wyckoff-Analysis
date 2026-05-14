@@ -10,6 +10,7 @@ MAX_TOOL_ROUNDS = 15
 MAX_INCOMPLETE_TOOL_RETRIES = 2
 DOOM_LOOP_WINDOW = 6
 DOOM_LOOP_THRESHOLD = 3
+DOOM_LOOP_EXEMPT = frozenset({"check_background_tasks"})
 
 
 @dataclass(frozen=True)
@@ -289,12 +290,20 @@ def check_doom_loop(
     appears >= ``DOOM_LOOP_THRESHOLD`` times in the window,
     OR when similar args (Jaccard >= threshold) appear >= threshold times.
     """
+    if name in DOOM_LOOP_EXEMPT:
+        return False
     import json as _json
 
-    args_hash = hash(_json.dumps(args, sort_keys=True, ensure_ascii=False))
+    args_text = _json.dumps(args, sort_keys=True, ensure_ascii=False)
+    args_hash = hash(args_text)
     recent_calls.append((name, args_hash))
     if len(recent_calls) > DOOM_LOOP_WINDOW:
         recent_calls.pop(0)
+
+    if recent_args_texts is not None:
+        recent_args_texts.append(args_text)
+        if len(recent_args_texts) > DOOM_LOOP_WINDOW:
+            recent_args_texts.pop(0)
 
     # 精确匹配
     if recent_calls.count((name, args_hash)) >= DOOM_LOOP_THRESHOLD:
@@ -302,17 +311,10 @@ def check_doom_loop(
 
     # 语义相似匹配：检查同工具的参数是否"换汤不换药"
     # 短参数（< 50字符）跳过 Jaccard——短 JSON 天然高相似度导致误判批量调用
-    if recent_args_texts is not None:
-        args_text = _json.dumps(args, sort_keys=True, ensure_ascii=False)
-        if len(args_text) >= 50:
-            same_tool_texts = [t for (n, _), t in zip(recent_calls, recent_args_texts) if n == name]
-            similar_count = sum(
-                1 for t in same_tool_texts if _jaccard_similarity(args_text, t) >= similarity_threshold
-            )
-            if similar_count >= DOOM_LOOP_THRESHOLD:
-                return True
-        recent_args_texts.append(args_text)
-        if len(recent_args_texts) > DOOM_LOOP_WINDOW:
-            recent_args_texts.pop(0)
+    if recent_args_texts is not None and len(args_text) >= 50:
+        same_tool_texts = [t for (n, _), t in zip(recent_calls, recent_args_texts) if n == name]
+        similar_count = sum(1 for t in same_tool_texts if _jaccard_similarity(args_text, t) >= similarity_threshold)
+        if similar_count >= DOOM_LOOP_THRESHOLD:
+            return True
 
     return False

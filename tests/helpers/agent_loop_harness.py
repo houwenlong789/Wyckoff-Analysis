@@ -82,6 +82,7 @@ class StubToolRegistry:
                 "analyze_stock",
                 "portfolio",
                 "get_market_overview",
+                "get_market_history",
                 "query_history",
             }
         )

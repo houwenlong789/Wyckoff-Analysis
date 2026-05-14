@@ -10,12 +10,20 @@ ADK 的 FunctionTool 会自动解析为工具 schema。
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import math
 import os
+import pathlib
+import re
+import shlex
+import socket
 import threading
 import time
+from contextlib import suppress
 from datetime import date, timedelta
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     from google.adk.tools import ToolContext
@@ -28,11 +36,297 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_MARKET_HISTORY_INDEXES = {
+    "sse": ("000001.SH", "上证指数"),
+    "csi300": ("000300.SH", "沪深300"),
+    "szse": ("399001.SZ", "深证成指"),
+    "chinext": ("399006.SZ", "创业板指"),
+    "sse50": ("000016.SH", "上证50"),
+    "csi500": ("000905.SH", "中证500"),
+}
+_MARKET_HISTORY_ALIASES = {
+    "sh": "sse",
+    "上证": "sse",
+    "上证指数": "sse",
+    "沪指": "sse",
+    "沪深300": "csi300",
+    "300": "csi300",
+    "sz": "szse",
+    "深证": "szse",
+    "深成指": "szse",
+    "深证成指": "szse",
+    "创业板": "chinext",
+    "创业板指": "chinext",
+    "上证50": "sse50",
+    "中证500": "csi500",
+}
 _NAME_MAP: dict[str, str] | None = None
+_MAX_AGENT_FILE_BYTES = 50 * 1024 * 1024
+_MAX_AGENT_TEXT_WRITE_BYTES = 2 * 1024 * 1024
+_MAX_AGENT_WEB_BYTES = 1024 * 1024
+
+_SENSITIVE_KEY_RE = re.compile(
+    r"(api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|secret|credential|authorization|cookie|session)",
+    re.IGNORECASE,
+)
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|secret|authorization|cookie)\b"
+    r"\s*[:=]\s*([\"']?)[^\s\"',;]+"
+)
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}")
+_COMMON_SECRET_VALUE_RE = re.compile(r"\b(?:sk|ak|pk|ghp|gho|github_pat|glpat|xoxb|xoxp|AIza)[A-Za-z0-9_\-]{12,}\b")
+_BLOCKED_PATH_PARTS = {
+    ".ssh",
+    ".aws",
+    ".azure",
+    ".config/gcloud",
+    ".gnupg",
+    ".kube",
+    ".docker",
+    ".npm",
+}
+_BLOCKED_FILE_NAMES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+}
+_ALLOWED_WYCKOFF_SUBDIRS = {"tool-results", "scratchpad", "exports", "reports"}
+_BLOCKED_SYSTEM_ROOTS = (
+    pathlib.Path("/bin"),
+    pathlib.Path("/etc"),
+    pathlib.Path("/Library"),
+    pathlib.Path("/private/etc"),
+    pathlib.Path("/sbin"),
+    pathlib.Path("/System"),
+    pathlib.Path("/usr"),
+    pathlib.Path("/var"),
+)
+_BLOCKED_COMMANDS = {
+    "bash",
+    "chflags",
+    "chmod",
+    "chown",
+    "curl",
+    "dd",
+    "ftp",
+    "env",
+    "kill",
+    "launchctl",
+    "mkfs",
+    "nc",
+    "ncat",
+    "osascript",
+    "pkill",
+    "printenv",
+    "rm",
+    "rmdir",
+    "rsync",
+    "scp",
+    "sh",
+    "shred",
+    "ssh",
+    "su",
+    "sudo",
+    "wget",
+    "zsh",
+}
+_INLINE_CODE_COMMANDS = {"python", "python3", "node", "ruby", "perl", "php"}
+_SHELL_META_RE = re.compile(r"[\n\r;&|<>`]|(?<!\\)\$\(")
+_SAFE_WRITE_SUFFIXES = {
+    ".csv",
+    ".html",
+    ".json",
+    ".jsonl",
+    ".log",
+    ".md",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+_SAFE_WEB_CONTENT_TYPES = (
+    "application/json",
+    "application/xml",
+    "application/xhtml+xml",
+    "text/",
+)
+
+
+def _security_error(message: str) -> dict:
+    return {"error": f"安全拦截: {message}"}
+
+
+def _redact_sensitive_text(text: str) -> str:
+    """Redact obvious credentials before model-facing tool output is returned."""
+
+    if not text:
+        return text
+    redacted = _SECRET_ASSIGNMENT_RE.sub(lambda m: f"{m.group(1)}={m.group(2)}***REDACTED***", text)
+    redacted = _BEARER_RE.sub("Bearer ***REDACTED***", redacted)
+    redacted = _COMMON_SECRET_VALUE_RE.sub("***REDACTED***", redacted)
+    return redacted
+
+
+def _redact_sensitive_columns(df: Any) -> Any:
+    """Mask sensitive dataframe columns while preserving table shape."""
+
+    try:
+        out = df.copy()
+        for col in out.columns:
+            if _SENSITIVE_KEY_RE.search(str(col)):
+                out[col] = "***REDACTED***"
+        return out
+    except Exception:
+        return df
+
+
+def _path_parts_lower(path: pathlib.Path) -> list[str]:
+    return [part.lower() for part in path.parts]
+
+
+def _is_allowed_wyckoff_path(parts: list[str]) -> bool:
+    if ".wyckoff" not in parts:
+        return False
+    idx = parts.index(".wyckoff")
+    return len(parts) > idx + 1 and parts[idx + 1] in _ALLOWED_WYCKOFF_SUBDIRS
+
+
+def _is_under_path(path: pathlib.Path, root: pathlib.Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _validate_agent_path(path: str, *, for_write: bool = False) -> pathlib.Path | dict:
+    if not path or not str(path).strip():
+        return _security_error("文件路径不能为空")
+
+    try:
+        p = pathlib.Path(path).expanduser().resolve()
+    except Exception as e:
+        return _security_error(f"文件路径无效: {e}")
+
+    parts = _path_parts_lower(p)
+    joined = "/".join(parts)
+    name = p.name.lower()
+    allowed_wyckoff_path = _is_allowed_wyckoff_path(parts)
+
+    if any(_is_under_path(p, root) for root in _BLOCKED_SYSTEM_ROOTS):
+        return _security_error("禁止访问系统目录")
+
+    user_library = pathlib.Path.home().expanduser() / "Library"
+    if _is_under_path(p, user_library):
+        return _security_error("禁止访问用户 Library 配置目录")
+
+    if ".wyckoff" in parts and not allowed_wyckoff_path:
+        return _security_error("禁止读取或写入 Wyckoff 凭据、会话和配置目录")
+
+    if any(part in parts for part in _BLOCKED_PATH_PARTS) or any(part in joined for part in _BLOCKED_PATH_PARTS):
+        return _security_error("禁止访问凭据、密钥或云配置目录")
+
+    hidden_parts = [part for part in parts if part.startswith(".") and part not in {".", "..", ".wyckoff"}]
+    if hidden_parts and not allowed_wyckoff_path:
+        return _security_error("禁止访问隐藏文件或隐藏目录")
+
+    if name in _BLOCKED_FILE_NAMES or name.startswith(".env"):
+        return _security_error("禁止访问环境变量或密钥文件")
+
+    if _SENSITIVE_KEY_RE.search(name):
+        return _security_error("文件名疑似包含凭据或会话数据")
+
+    if for_write:
+        suffix = p.suffix.lower()
+        if suffix not in _SAFE_WRITE_SUFFIXES:
+            allowed = ", ".join(sorted(_SAFE_WRITE_SUFFIXES))
+            return _security_error(f"只允许写入文本/报告类文件: {allowed}")
+    return p
+
+
+def _validate_agent_command(command: str) -> list[str] | dict:
+    raw = str(command or "").strip()
+    if not raw:
+        return _security_error("命令不能为空")
+    if len(raw) > 500:
+        return _security_error("命令过长，请拆成更小的只读操作")
+    if _SHELL_META_RE.search(raw):
+        return _security_error("禁止使用 shell 控制符、管道、重定向、命令替换或多条命令")
+
+    try:
+        args = shlex.split(raw)
+    except ValueError as e:
+        return _security_error(f"命令解析失败: {e}")
+    if not args:
+        return _security_error("命令不能为空")
+
+    executable = pathlib.Path(args[0]).name.lower()
+    if executable in _BLOCKED_COMMANDS:
+        return _security_error(f"禁止通过 Agent 执行高风险命令: {executable}")
+    if executable in _INLINE_CODE_COMMANDS and any(arg in {"-c", "-e"} for arg in args[1:]):
+        return _security_error("禁止通过 Agent 执行内联代码")
+    for arg in args[1:]:
+        lowered = arg.lower()
+        touches_wyckoff_config = ".wyckoff" in lowered and not any(
+            f".wyckoff/{subdir}" in lowered for subdir in _ALLOWED_WYCKOFF_SUBDIRS
+        )
+        if _SENSITIVE_KEY_RE.search(arg) or ".ssh" in lowered or ".env" in lowered or touches_wyckoff_config:
+            return _security_error("命令参数疑似访问凭据、会话或密钥")
+    return args
+
+
+def _validate_public_http_url(url: str) -> str | dict:
+    raw = str(url or "").strip()
+    if not raw:
+        return _security_error("URL 不能为空")
+
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"}:
+        return _security_error("只允许抓取 http/https URL")
+    if parsed.username or parsed.password:
+        return _security_error("URL 中禁止携带用户名或密码")
+    if not parsed.hostname:
+        return _security_error("URL 缺少主机名")
+    if parsed.port and parsed.port not in {80, 443}:
+        return _security_error("禁止抓取非标准端口，避免访问内网服务")
+
+    host = parsed.hostname.strip().lower().rstrip(".")
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        return _security_error("禁止抓取本机或本地域名")
+
+    try:
+        infos = socket.getaddrinfo(
+            host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM
+        )
+    except socket.gaierror:
+        return _security_error("URL 主机无法解析")
+
+    for info in infos:
+        ip_text = info[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_text)
+        except ValueError:
+            return _security_error("URL 解析到无效地址")
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return _security_error("禁止抓取内网、本机、链路本地或保留地址")
+    return raw
 
 
 def _code_to_name(code: str) -> str:
-    """根据股票代码查名称，基于 get_all_stocks() 缓存。"""
+    """根据股票代码查名称，基于 get_all_stocks() + ETF 池缓存。"""
     global _NAME_MAP
     if _NAME_MAP is None:
         try:
@@ -41,7 +335,36 @@ def _code_to_name(code: str) -> str:
             _NAME_MAP = {s["code"]: s["name"] for s in get_all_stocks()}
         except Exception:
             _NAME_MAP = {}
+        _NAME_MAP.update(_load_etf_name_map())
     return _NAME_MAP.get(code, code)
+
+
+def _load_etf_name_map() -> dict[str, str]:
+    """从 ETF meta 加载 ETF 代码→名称映射。"""
+    from pathlib import Path
+
+    try:
+        from tools.market_universe_meta import load_symbol_name_map
+
+        meta_map = load_symbol_name_map(("etf_cn",))
+        out = {code: name for code, name in meta_map.items() if len(code) == 6 and code.isdigit()}
+        if out:
+            return out
+    except Exception:
+        logger.debug("failed to load ETF name map from symbol metadata", exc_info=True)
+
+    path = Path(__file__).resolve().parent.parent / "data" / "market_universes" / "etf_cn.txt"
+    if not path.is_file():
+        return {}
+    result: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) == 2 and len(parts[0]) == 6 and parts[0].isdigit():
+            result[parts[0]] = f"{parts[1]}ETF"
+    return result
 
 
 def _collect_tickflow_limit_hints_from_df(df: Any) -> list[str]:
@@ -76,10 +399,8 @@ def _hist_metadata(df: Any) -> dict[str, Any]:
         clean = [str(x) for x in upstream_sources if str(x or "").strip()]
         if clean:
             meta["upstream_sources"] = clean
-    try:
+    with suppress(Exception):
         meta["row_count"] = int(len(df))
-    except Exception:
-        pass
     return meta
 
 
@@ -172,7 +493,7 @@ def _get_credential(tool_context: ToolContext | None, key: str, env_fallback: st
         if local_val:
             return local_val
     except Exception:
-        pass
+        logger.debug("failed to load credential '%s' from local config", key, exc_info=True)
     # 兜底：环境变量（适用于本地开发 / 未登录场景）
     if env_fallback:
         return os.getenv(env_fallback, "").strip()
@@ -192,12 +513,12 @@ def _resolve_llm_config(tool_context) -> tuple[str, str, str, str]:
         cfg = next((c for c in configs if c["id"] == default_id), None)
         if cfg and cfg.get("api_key"):
             prov = cfg.get("provider_name", "openai")
-            from integrations.llm_client import OPENAI_COMPATIBLE_BASE_URLS
+            from integrations._llm_types import OPENAI_COMPATIBLE_BASE_URLS
 
             base = cfg.get("base_url", "") or OPENAI_COMPATIBLE_BASE_URLS.get(prov, "")
             return prov, cfg["api_key"], cfg.get("model", ""), base
     except Exception:
-        pass
+        logger.debug("failed to load LLM provider config from local config", exc_info=True)
     api_key = _get_credential(tool_context, "gemini_api_key", "GEMINI_API_KEY")
     model = _get_credential(tool_context, "gemini_model", "GEMINI_MODEL") or "gemini-2.0-flash"
     base_url = _get_credential(tool_context, "gemini_base_url", "")
@@ -221,10 +542,10 @@ def _ensure_tushare_token(tool_context: ToolContext | None) -> None:
 
 
 def search_stock_by_name(keyword: str, tool_context: ToolContext) -> list[dict]:
-    """根据关键词搜索 A 股股票，支持名称和代码双向模糊搜索。
+    """根据关键词搜索 A 股 / ETF / 美股 / 港股，支持名称和代码双向模糊搜索。
 
     Args:
-        keyword: 搜索关键词，如 "宁德" 或 "300750" 或 "600519"
+        keyword: 搜索关键词，如 "宁德"、"300750"、"纳指100"、"苹果"、"AAPL.US" 或 "00700.HK"
 
     Returns:
         匹配的股票列表，每项包含 code、name、price、pct_chg、market_cap、news 字段。最多返回 10 条。
@@ -232,12 +553,9 @@ def search_stock_by_name(keyword: str, tool_context: ToolContext) -> list[dict]:
     try:
         from integrations.fetch_a_share_csv import get_all_stocks
 
-        stocks = get_all_stocks()
-        if not stocks:
-            return [{"error": "无法获取股票列表"}]
-
         kw = keyword.strip()
-        results = []
+        stocks = get_all_stocks()
+        results: list[dict] = []
         for s in stocks:
             code = s.get("code", "")
             name = s.get("name", "")
@@ -246,21 +564,44 @@ def search_stock_by_name(keyword: str, tool_context: ToolContext) -> list[dict]:
                 if len(results) >= 10:
                     break
 
+        _enrich_search_results(results[:3])
+        if len(results) < 10:
+            results.extend(_search_market_universe_meta(kw, 10 - len(results)))
         if not results:
             return [{"message": f"未找到与 '{kw}' 匹配的股票"}]
-
-        _enrich_search_results(results[:3])
         return results
     except Exception as e:
         logger.exception("search_stock_by_name error")
         return [{"error": str(e)}]
 
 
+def _search_market_universe_meta(keyword: str, limit: int) -> list[dict]:
+    """搜索结构化市场 meta，补充 ETF / 美股 / 港股结果。"""
+    try:
+        from tools.market_universe_meta import search_market_meta
+
+        rows = search_market_meta(keyword, limit=max(limit, 0))
+    except Exception:
+        return []
+    out: list[dict] = []
+    for row in rows:
+        symbol = str(row.get("symbol", "") or "")
+        code = str(row.get("code", "") or "")
+        out.append(
+            {
+                "code": code,
+                "symbol": symbol,
+                "name": str(row.get("name", "") or symbol or code),
+                "market": str(row.get("market", "") or ""),
+                "asset_type": str(row.get("asset_type", "") or ""),
+                "currency": str(row.get("currency", "") or ""),
+            }
+        )
+    return out
+
+
 def _enrich_search_results(items: list[dict]) -> None:
     """为搜索结果前几条附加行情、市值、新闻。"""
-    import concurrent.futures
-    from datetime import datetime
-
     try:
         from integrations.data_source import fetch_stock_spot_snapshot
     except Exception:
@@ -272,7 +613,7 @@ def _enrich_search_results(items: list[dict]) -> None:
 
         cap_map = fetch_market_cap_map()
     except Exception:
-        pass
+        logger.debug("failed to fetch market cap map", exc_info=True)
 
     for item in items:
         code = item["code"]
@@ -283,7 +624,7 @@ def _enrich_search_results(items: list[dict]) -> None:
                     item["price"] = snap.get("close")
                     item["pct_chg"] = snap.get("pct_chg")
             except Exception:
-                pass
+                logger.debug("failed to fetch spot snapshot for %s", code, exc_info=True)
         if cap_map:
             item["market_cap_yi"] = cap_map.get(code)
         item["news"] = _fetch_news_with_timeout(code)
@@ -344,7 +685,7 @@ def analyze_stock(
         if mode == "price":
             days = min(max(days, 1), 250)
             start_date = end_date - timedelta(days=int(days * 1.6))
-            df = get_stock_hist(code, start_date, end_date)
+            df = get_stock_hist(code, start_date, end_date, user_id=_get_user_id(tool_context))
             if df is None or df.empty:
                 return {"error": f"无法获取 {code} 的行情数据"}
             hist_hints = _collect_tickflow_limit_hints_from_df(df)
@@ -380,7 +721,7 @@ def analyze_stock(
         from core.holding_diagnostic import diagnose_one_stock, format_diagnostic_text
 
         start_date = end_date - timedelta(days=500)
-        df = get_stock_hist(code, start_date, end_date)
+        df = get_stock_hist(code, start_date, end_date, user_id=_get_user_id(tool_context))
         if df is None or df.empty:
             return {"error": f"无法获取 {code} 的行情数据"}
         hist_hints = _collect_tickflow_limit_hints_from_df(df)
@@ -442,15 +783,11 @@ def portfolio(mode: str = "view", tool_context: ToolContext = None) -> dict:
         portfolio_id = build_user_live_portfolio_id(user_id)
         state = None
 
-        # local-first
-        try:
-            from integrations.local_db import load_portfolio
+        from core.cache_whitelist import is_user_in_cache_whitelist
 
-            state = load_portfolio(portfolio_id)
-        except Exception:
-            pass
+        use_remote = is_user_in_cache_whitelist(user_id) and _has_cloud(tool_context)
 
-        if state is None and _has_cloud(tool_context):
+        if use_remote:
             from integrations.supabase_portfolio import load_portfolio_state
 
             _client = _get_user_client(tool_context)
@@ -475,7 +812,15 @@ def portfolio(mode: str = "view", tool_context: ToolContext = None) -> dict:
                         ],
                     )
                 except Exception:
-                    pass
+                    logger.warning("failed to cache portfolio %s locally", portfolio_id, exc_info=True)
+
+        if state is None:
+            try:
+                from integrations.local_db import load_portfolio
+
+                state = load_portfolio(portfolio_id)
+            except Exception:
+                logger.warning("failed to load portfolio %s from local DB", portfolio_id, exc_info=True)
 
         if state is None:
             return {"message": "未找到持仓记录，可通过 update_portfolio 添加", "positions": [], "free_cash": 0}
@@ -527,7 +872,7 @@ def portfolio(mode: str = "view", tool_context: ToolContext = None) -> dict:
             pos_name = pos.get("name", pos_code)
             pos_cost = float(pos.get("cost", pos.get("cost_price", 0)) or 0)
             try:
-                df = get_stock_hist(pos_code, start_date, end_date)
+                df = get_stock_hist(pos_code, start_date, end_date, user_id=_get_user_id(tool_context))
                 if df is None or df.empty:
                     failed_count += 1
                     results.append({"code": pos_code, "name": pos_name, "error": "无行情数据"})
@@ -713,12 +1058,172 @@ def get_market_overview(tool_context: ToolContext) -> dict:
         return {"error": str(e)}
 
 
+def _resolve_market_history_index(index: str) -> tuple[str, str, str]:
+    raw = str(index or "sse").strip()
+    key = _MARKET_HISTORY_ALIASES.get(raw, _MARKET_HISTORY_ALIASES.get(raw.lower(), raw.lower()))
+    if key in _MARKET_HISTORY_INDEXES:
+        symbol, name = _MARKET_HISTORY_INDEXES[key]
+        return key, symbol, name
+    code = raw.upper()
+    for item_key, (symbol, name) in _MARKET_HISTORY_INDEXES.items():
+        if code in {symbol, symbol.split(".", 1)[0]}:
+            return item_key, symbol, name
+    symbol, name = _MARKET_HISTORY_INDEXES["sse"]
+    return "sse", symbol, name
+
+
+def _json_float(value: Any, digits: int = 2) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    return round(out, digits)
+
+
+def _prepare_market_history_frame(df: Any, days: int) -> Any:
+    import pandas as pd
+
+    out = df.copy()
+    for col in ("open", "high", "low", "close", "volume", "amount", "prev_close"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    if "date" not in out.columns and "datetime" in out.columns:
+        out["date"] = pd.to_datetime(out["datetime"], errors="coerce").dt.strftime("%Y-%m-%d")
+    if "pct_chg" not in out.columns:
+        basis = out["prev_close"] if "prev_close" in out.columns else out["close"].shift(1)
+        out["pct_chg"] = (out["close"] / basis - 1.0) * 100.0
+    out["pct_chg"] = pd.to_numeric(out["pct_chg"], errors="coerce")
+    cols = ["date", "open", "high", "low", "close", "volume", "amount", "pct_chg"]
+    for col in cols:
+        if col not in out.columns:
+            out[col] = None
+    for col in ("open", "high", "low", "close", "volume", "amount", "pct_chg"):
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=["date", "close"]).sort_values("date").tail(days)
+    return out[cols].reset_index(drop=True)
+
+
+def _fetch_market_history_frame(symbol: str, days: int, tool_context: ToolContext | None) -> tuple[Any, str, list[str]]:
+    errors: list[str] = []
+    api_key = _get_credential(tool_context, "tickflow_api_key", "TICKFLOW_API_KEY")
+    if api_key:
+        try:
+            from integrations.tickflow_client import TickFlowClient
+
+            client = TickFlowClient(api_key=api_key)
+            return client.get_klines(symbol, period="1d", count=days, adjust="none"), "tickflow", errors
+        except Exception as e:
+            errors.append(f"tickflow: {e}")
+    else:
+        errors.append("tickflow: TICKFLOW_API_KEY 未配置")
+    try:
+        _ensure_tushare_token(tool_context)
+        from integrations.data_source import fetch_index_hist
+
+        end = date.today()
+        start = end - timedelta(days=int(days * 2.4) + 30)
+        return fetch_index_hist(symbol, start, end), "tushare/akshare", errors
+    except Exception as e:
+        errors.append(f"tushare/akshare: {e}")
+    raise RuntimeError("; ".join(errors))
+
+
+def _market_history_summary(df: Any) -> dict[str, Any]:
+    close = df["close"]
+    volume = df["volume"]
+    latest = df.iloc[-1]
+    roll_max = close.cummax()
+    drawdown = ((close / roll_max) - 1.0) * 100.0
+    tail20 = df.tail(min(len(df), 20))
+    prior = df.iloc[:-20] if len(df) > 20 else df.iloc[:0]
+    prior_volume = prior["volume"].mean() if len(prior) else None
+    recent_volume = tail20["volume"].mean()
+    period_return = (float(close.iloc[-1]) / float(close.iloc[0]) - 1.0) * 100.0
+    recent_return = (float(tail20["close"].iloc[-1]) / float(tail20["close"].iloc[0]) - 1.0) * 100.0
+    return {
+        "latest_date": str(latest["date"]),
+        "latest_close": _json_float(latest["close"]),
+        "latest_pct_chg": _json_float(latest["pct_chg"]),
+        "period_return_pct": _json_float(period_return),
+        "recent_20d_return_pct": _json_float(recent_return),
+        "latest_volume_ratio_20d": _json_float(
+            float(latest["volume"]) / float(recent_volume) if recent_volume else None
+        ),
+        "recent_20d_volume_vs_prior": _json_float(float(recent_volume) / float(prior_volume) if prior_volume else None),
+        "max_drawdown_pct": _json_float(drawdown.min()),
+        "up_days": int((df["pct_chg"] > 0).sum()),
+        "down_days": int((df["pct_chg"] < 0).sum()),
+        "price_up_volume_up_days": int(((df["pct_chg"] > 0) & (volume > volume.shift(1))).sum()),
+        "price_down_volume_up_days": int(((df["pct_chg"] < 0) & (volume > volume.shift(1))).sum()),
+    }
+
+
+def _market_history_rows(df: Any) -> list[dict[str, Any]]:
+    rows = []
+    for row in df.to_dict("records"):
+        rows.append(
+            {
+                "date": str(row.get("date", "")),
+                "open": _json_float(row.get("open")),
+                "high": _json_float(row.get("high")),
+                "low": _json_float(row.get("low")),
+                "close": _json_float(row.get("close")),
+                "pct_chg": _json_float(row.get("pct_chg")),
+                "volume": _json_float(row.get("volume"), 0),
+            }
+        )
+    return rows
+
+
+def get_market_history(days: int = 100, index: str = "sse", tool_context: ToolContext = None) -> dict:
+    """回看 A 股主要指数过去 N 个交易日的日线量价关系。
+
+    Args:
+        days: 回看交易日数量，默认 100，最大 320。
+        index: 指数别名或代码，支持 sse/csi300/szse/chinext/sse50/csi500。
+
+    Returns:
+        历史大盘日线摘要、最近 N 个交易日量价切片和数据源。
+    """
+    try:
+        requested_days = max(1, min(int(days or 100), 320))
+        lookback = max(20, requested_days)
+        key, symbol, name = _resolve_market_history_index(index)
+        raw, source, errors = _fetch_market_history_frame(symbol, lookback, tool_context)
+        df = _prepare_market_history_frame(raw, lookback).tail(requested_days).reset_index(drop=True)
+        if df.empty:
+            return {"error": f"{name} {symbol} 没有可用历史 K 线", "source": source}
+        return {
+            "ok": True,
+            "index": {"key": key, "symbol": symbol, "name": name},
+            "requested_days": requested_days,
+            "returned_days": int(len(df)),
+            "source": source,
+            "fallback_errors": errors,
+            "summary": _market_history_summary(df),
+            "rows": _market_history_rows(df),
+        }
+    except Exception as e:
+        logger.exception("get_market_history error")
+        return {"error": str(e)}
+
+
 # ---------------------------------------------------------------------------
 # Tool 6: Wyckoff 漏斗筛选
 # ---------------------------------------------------------------------------
 
 _VALID_BOARDS = {"all", "main", "chinext"}
-_BOARD_ALIAS = {"gem": "chinext", "创业板": "chinext", "主板": "main", "全部": "all"}
+_BOARD_ALIAS = {
+    "gem": "chinext",
+    "创业板": "chinext",
+    "主板": "main",
+    "全部": "all",
+    "main_chinext": "all",
+    "main-chinext": "all",
+    "main+chinext": "all",
+}
 
 
 def screen_stocks(board: str = "all", tool_context: ToolContext = None) -> dict:
@@ -750,7 +1255,7 @@ def screen_stocks(board: str = "all", tool_context: ToolContext = None) -> dict:
         # CLI 后台线程中 fork 子进程会触发 Python 3.13+ fds_to_keep 错误，强制用 thread
         os.environ["FUNNEL_EXECUTOR_MODE"] = "thread"
 
-        from core.funnel_pipeline import run_funnel
+        from scripts.wyckoff_funnel import run as run_funnel
 
         try:
             ok, symbols, bench_ctx, details = run_funnel(
@@ -960,10 +1465,10 @@ def generate_strategy_decision(tool_context: ToolContext) -> dict:
 
 
 def query_history(source: str, status: str = "all", run_date: str = "", decision: str = "", limit: int = 20) -> dict:
-    """查询历史记录：AI 推荐追踪、信号确认池或尾盘买入记录。
+    """查询历史记录：形态复盘、信号确认池或尾盘买入记录。
 
     Args:
-        source: "recommendation" 查推荐追踪；"signal" 查信号确认池；"tail_buy" 查尾盘买入记录
+        source: "recommendation" 查形态复盘；"signal" 查信号确认池；"tail_buy" 查尾盘买入记录
         status: 仅 signal 源使用，"all"/"pending"/"confirmed"/"expired"
         run_date: 仅 tail_buy 源使用，按日期过滤（YYYY-MM-DD）
         decision: 仅 tail_buy 源使用，按决策过滤（BUY/WATCH 等）
@@ -992,7 +1497,7 @@ def _query_recommendation(limit: int) -> dict:
 
             records = load_recommendations(limit=limit)
         except Exception:
-            pass
+            logger.warning("failed to load recommendations from local DB", exc_info=True)
         if not records:
             from integrations.supabase_recommendation import load_recommendation_tracking
 
@@ -1003,9 +1508,9 @@ def _query_recommendation(limit: int) -> dict:
 
                     save_recommendations(records)
                 except Exception:
-                    pass
+                    logger.warning("failed to cache recommendations locally", exc_info=True)
         if not records:
-            return {"message": "暂无推荐跟踪记录", "records": []}
+            return {"message": "暂无复盘记录", "records": []}
         simplified = [
             {
                 "code": str(r.get("code", "")),
@@ -1036,7 +1541,7 @@ def _query_signal(status: str, limit: int) -> dict:
             st = status if status in ("pending", "confirmed", "expired") else None
             rows = load_signals(status=st, limit=limit)
         except Exception:
-            pass
+            logger.warning("failed to load signals from local DB", exc_info=True)
         if not rows:
             from core.constants import TABLE_SIGNAL_PENDING
             from integrations.supabase_base import create_admin_client, is_admin_configured
@@ -1054,7 +1559,7 @@ def _query_signal(status: str, limit: int) -> dict:
 
                     save_signals(rows)
                 except Exception:
-                    pass
+                    logger.warning("failed to cache signals locally", exc_info=True)
         if not rows:
             status_label = {"pending": "待确认", "confirmed": "已确认", "expired": "已过期"}.get(status, "")
             return {"message": f"暂无{status_label}信号记录", "records": []}
@@ -1338,7 +1843,7 @@ def update_portfolio(
                         ],
                     )
             except Exception:
-                pass
+                logger.warning("failed to cache portfolio %s locally after update", portfolio_id, exc_info=True)
 
         # 读本地最新状态返回
         from integrations.local_db import load_portfolio
@@ -1467,14 +1972,8 @@ def run_backtest(
 
         _ensure_tushare_token(tool_context)
 
-        if start:
-            start_dt = date.fromisoformat(str(start).strip()[:10])
-        else:
-            start_dt = date.today() - timedelta(days=180)
-        if end:
-            end_dt = date.fromisoformat(str(end).strip()[:10])
-        else:
-            end_dt = date.today() - timedelta(days=1)
+        start_dt = date.fromisoformat(str(start).strip()[:10]) if start else date.today() - timedelta(days=180)
+        end_dt = date.fromisoformat(str(end).strip()[:10]) if end else date.today() - timedelta(days=1)
 
         hold_days = max(1, min(int(hold_days), 60))
         top_n = max(0, min(int(top_n), 20))
@@ -1523,10 +2022,10 @@ def run_backtest(
 
 
 def exec_command(command: str, timeout: int = 30, tool_context: ToolContext = None) -> dict:
-    """在用户本地执行 shell 命令并返回输出。
+    """在用户本地执行单条低风险命令并返回输出。
 
     Args:
-        command: 要执行的 shell 命令
+        command: 要执行的命令；禁止 shell 控制符、管道、重定向和高风险命令
         timeout: 超时秒数，默认 30
 
     Returns:
@@ -1534,19 +2033,25 @@ def exec_command(command: str, timeout: int = 30, tool_context: ToolContext = No
     """
     import subprocess
 
+    args = _validate_agent_command(command)
+    if isinstance(args, dict):
+        return args
+
     timeout = max(1, min(int(timeout), 120))
     try:
         r = subprocess.run(
-            command,
-            shell=True,
+            args,
+            shell=False,
             capture_output=True,
             text=True,
             timeout=timeout,
             cwd=os.path.expanduser("~"),
         )
+        stdout = _redact_sensitive_text(r.stdout)
+        stderr = _redact_sensitive_text(r.stderr)
         return {
-            "stdout": r.stdout[:8000] + ("...(截断)" if len(r.stdout) > 8000 else ""),
-            "stderr": r.stderr[:2000] + ("...(截断)" if len(r.stderr) > 2000 else ""),
+            "stdout": stdout[:8000] + ("...(截断)" if len(stdout) > 8000 else ""),
+            "stderr": stderr[:2000] + ("...(截断)" if len(stderr) > 2000 else ""),
             "returncode": r.returncode,
         }
     except subprocess.TimeoutExpired:
@@ -1565,47 +2070,41 @@ def read_file(path: str, encoding: str = "utf-8", tool_context: ToolContext = No
     Returns:
         包含 path, size, content 的 dict。CSV 返回 markdown 表格预览。
     """
-    import pathlib
-
-    p = pathlib.Path(path).expanduser().resolve()
+    p = _validate_agent_path(path, for_write=False)
+    if isinstance(p, dict):
+        return p
     if not p.exists():
         return {"error": f"文件不存在: {p}"}
     if not p.is_file():
         return {"error": f"不是文件: {p}"}
     size = p.stat().st_size
-    if size > 50 * 1024 * 1024:
+    if size > _MAX_AGENT_FILE_BYTES:
         return {"error": f"文件过大 ({size / 1024 / 1024:.1f}MB)，上限 50MB"}
 
     suffix = p.suffix.lower()
     try:
-        if suffix == ".csv":
+        if suffix == ".csv" or suffix in (".xls", ".xlsx"):
             import pandas as pd
 
-            df = pd.read_csv(p, encoding=encoding, nrows=50)
-            preview = df.to_markdown(index=False)
-            return {"path": str(p), "size": size, "rows_total": "≤50(预览)", "content": preview}
-        elif suffix in (".xls", ".xlsx"):
-            import pandas as pd
-
-            df = pd.read_excel(p, nrows=50)
-            preview = df.to_markdown(index=False)
-            return {"path": str(p), "size": size, "rows_total": "≤50(预览)", "content": preview}
+            df = pd.read_csv(p, encoding=encoding, nrows=50) if suffix == ".csv" else pd.read_excel(p, nrows=50)
+            preview = _redact_sensitive_columns(df).to_markdown(index=False)
+            return {"path": str(p), "size": size, "rows_total": "≤50(预览)", "content": _redact_sensitive_text(preview)}
         elif suffix == ".json":
             import json as _json
 
             text = p.read_text(encoding=encoding)[:10000]
             try:
-                obj = _json.loads(text)
-                content = _json.dumps(obj, ensure_ascii=False, indent=2)[:10000]
+                content = _json.dumps(_json.loads(text), ensure_ascii=False, indent=2)[:10000]
             except _json.JSONDecodeError:
                 content = text
-            return {"path": str(p), "size": size, "content": content}
+            return {"path": str(p), "size": size, "content": _redact_sensitive_text(content)}
         else:
             text = p.read_text(encoding=encoding)
+            content = _redact_sensitive_text(text)
             return {
                 "path": str(p),
                 "size": size,
-                "content": text[:10000] + ("...(截断)" if len(text) > 10000 else ""),
+                "content": content[:10000] + ("...(截断)" if len(content) > 10000 else ""),
             }
     except Exception as e:
         return {"error": f"读取失败: {e}"}
@@ -1622,9 +2121,15 @@ def write_file(path: str, content: str, encoding: str = "utf-8", tool_context: T
     Returns:
         包含 path, size 的 dict。
     """
-    import pathlib
-
-    p = pathlib.Path(path).expanduser().resolve()
+    p = _validate_agent_path(path, for_write=True)
+    if isinstance(p, dict):
+        return p
+    try:
+        content_bytes = str(content).encode(encoding)
+    except LookupError:
+        return {"error": f"写入失败: 不支持的编码 {encoding}"}
+    if len(content_bytes) > _MAX_AGENT_TEXT_WRITE_BYTES:
+        return _security_error("写入内容过大，上限 2MB")
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding=encoding)
@@ -1642,24 +2147,45 @@ def web_fetch(url: str, tool_context: ToolContext = None) -> dict:
     Returns:
         包含 url, status, content 的 dict。
     """
-    import re
-
     import requests
 
+    safe_url = _validate_public_http_url(url)
+    if isinstance(safe_url, dict):
+        return safe_url
+
     try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "Wyckoff-Agent/1.0"})
+        resp = requests.get(
+            safe_url,
+            timeout=(3, 15),
+            headers={"User-Agent": "Wyckoff-Agent/1.0"},
+            stream=True,
+        )
         resp.raise_for_status()
-        ctype = resp.headers.get("content-type", "")
+        ctype = resp.headers.get("content-type", "").lower()
+        if ctype and not any(ctype.startswith(prefix) for prefix in _SAFE_WEB_CONTENT_TYPES):
+            return _security_error(f"拒绝抓取非文本内容: {ctype}")
+
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in resp.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _MAX_AGENT_WEB_BYTES:
+                return _security_error("网页响应过大，上限 1MB")
+        body = b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
+
         if "json" in ctype:
-            text = resp.text[:8000]
+            text = body[:8000]
         elif "html" in ctype:
-            text = re.sub(r"<script[^>]*>.*?</script>", "", resp.text, flags=re.DOTALL | re.IGNORECASE)
+            text = re.sub(r"<script[^>]*>.*?</script>", "", body, flags=re.DOTALL | re.IGNORECASE)
             text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
             text = re.sub(r"<[^>]+>", " ", text)
             text = re.sub(r"\s+", " ", text).strip()[:8000]
         else:
-            text = resp.text[:8000]
-        return {"url": url, "status": resp.status_code, "content": text}
+            text = body[:8000]
+        return {"url": safe_url, "status": resp.status_code, "content": _redact_sensitive_text(text)}
     except Exception as e:
         return {"error": f"抓取失败: {e}"}
 
@@ -1673,6 +2199,7 @@ WYCKOFF_TOOLS = [
     analyze_stock,
     portfolio,
     get_market_overview,
+    get_market_history,
     screen_stocks,
     generate_ai_report,
     generate_strategy_decision,

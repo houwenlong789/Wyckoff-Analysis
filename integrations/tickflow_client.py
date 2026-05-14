@@ -27,6 +27,14 @@ TICKFLOW_MAX_RETRIES = max(int(os.getenv("TICKFLOW_MAX_RETRIES", "3")), 1)
 TICKFLOW_RETRY_BACKOFF_SECONDS = max(float(os.getenv("TICKFLOW_RETRY_BACKOFF_SECONDS", "1.5")), 0.1)
 TICKFLOW_RATE_LIMIT_MAX_SLEEP_SECONDS = max(float(os.getenv("TICKFLOW_RATE_LIMIT_MAX_SLEEP_SECONDS", "90")), 1.0)
 TICKFLOW_KLINE_RATE_LIMIT_PER_MIN = max(int(os.getenv("TICKFLOW_KLINE_RATE_LIMIT_PER_MIN", "0")), 0)
+TICKFLOW_QUOTES_BATCH_SIZE = max(int(os.getenv("TICKFLOW_QUOTES_BATCH_SIZE", "500")), 1)
+TICKFLOW_QUOTES_BATCH_SLEEP = max(float(os.getenv("TICKFLOW_QUOTES_BATCH_SLEEP", "0.25")), 0.0)
+TICKFLOW_KLINE_BATCH_SIZE = max(int(os.getenv("TICKFLOW_KLINE_BATCH_SIZE", "200")), 1)
+TICKFLOW_KLINE_BATCH_SLEEP = max(float(os.getenv("TICKFLOW_KLINE_BATCH_SLEEP", "0.55")), 0.0)
+TICKFLOW_INTRADAY_BATCH_SIZE = max(int(os.getenv("TICKFLOW_INTRADAY_BATCH_SIZE", "200")), 1)
+TICKFLOW_INTRADAY_BATCH_SLEEP = max(float(os.getenv("TICKFLOW_INTRADAY_BATCH_SLEEP", "1.05")), 0.0)
+TICKFLOW_FINANCIAL_BATCH_SIZE = max(int(os.getenv("TICKFLOW_FINANCIAL_BATCH_SIZE", "100")), 1)
+TICKFLOW_FINANCIAL_BATCH_SLEEP = max(float(os.getenv("TICKFLOW_FINANCIAL_BATCH_SLEEP", "2.1")), 0.0)
 
 _PERIOD_SET = {"1m", "5m", "10m", "15m", "30m", "60m", "1d", "1w", "1M", "1Q", "1Y"}
 _CN_TZ = "Asia/Shanghai"
@@ -52,17 +60,102 @@ def _summarize_params(params: dict[str, Any] | None) -> str:
         return "-"
     out: list[str] = []
     for key, value in params.items():
-        if key == "symbols":
-            items = [x.strip() for x in str(value or "").split(",") if x.strip()]
+        if key in {"symbols", "universes"}:
+            if isinstance(value, (list, tuple, set)):
+                items = [str(x).strip() for x in value if str(x).strip()]
+            else:
+                items = [x.strip() for x in str(value or "").split(",") if x.strip()]
             head = ",".join(items[:3])
             suffix = "..." if len(items) > 3 else ""
-            out.append(f"symbols={len(items)}[{head}{suffix}]")
+            out.append(f"{key}={len(items)}[{head}{suffix}]")
             continue
         text = str(value)
         if len(text) > 80:
             text = text[:77] + "..."
         out.append(f"{key}={text}")
     return "; ".join(out)
+
+
+def _chunks(items: list[str], size: int) -> list[list[str]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _sleep_between_chunks(index: int, total: int, sleep_s: float) -> None:
+    if index < total and sleep_s > 0:
+        time.sleep(sleep_s)
+
+
+def _send_http_request(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str],
+    params: dict[str, Any] | None,
+    json_body: dict[str, Any] | None,
+    timeout_seconds: int,
+) -> requests.Response:
+    if method == "POST":
+        return requests.post(url, headers=headers, json=json_body, timeout=timeout_seconds)
+    return requests.get(url, headers=headers, params=params, timeout=timeout_seconds)
+
+
+def _success_payload(
+    resp: requests.Response,
+    *,
+    path: str,
+    attempt: int,
+    max_retries: int,
+    started: float,
+    params_summary: str,
+) -> dict[str, Any]:
+    elapsed = (time.monotonic() - started) * 1000
+    prefix = f"recover ok path={path} attempt={attempt}/{max_retries}" if attempt > 1 else f"ok path={path}"
+    _tf_log(f"{prefix} elapsed_ms={elapsed:.0f} params={params_summary}", always=attempt > 1)
+    return resp.json()
+
+
+def _retry_or_raise_http(
+    resp: requests.Response,
+    *,
+    path: str,
+    attempt: int,
+    max_retries: int,
+    params_summary: str,
+    retry_backoff_seconds: float,
+) -> None:
+    body = (resp.text or "").strip()
+    if resp.status_code == 429 or "rate_limited" in body.lower():
+        record_tickflow_limit_event(body)
+        _tf_log(
+            f"rate_limited path={path} attempt={attempt}/{max_retries} params={params_summary} body={body[:160]}",
+            always=True,
+        )
+        delay = _rate_limit_delay_seconds(body, resp.headers.get("Retry-After"))
+        if attempt < max_retries and delay is not None:
+            _tf_log(
+                f"rate_limited_sleep path={path} attempt={attempt}/{max_retries} "
+                f"sleep_s={delay:.1f} params={params_summary}",
+                always=True,
+            )
+            time.sleep(delay)
+            return
+        raise RuntimeError(f"TickFlow HTTP 429: {body[:200]}（{TICKFLOW_LIMIT_HINT}）")
+
+    if attempt < max_retries and (resp.status_code >= 500 or "error code: 1010" in body.lower()):
+        _tf_log(
+            f"retryable_http path={path} status={resp.status_code} "
+            f"attempt={attempt}/{max_retries} params={params_summary}",
+            always=True,
+        )
+        time.sleep(retry_backoff_seconds * attempt)
+        return
+
+    _tf_log(
+        f"http_fail path={path} status={resp.status_code} "
+        f"attempt={attempt}/{max_retries} params={params_summary} body={body[:160]}",
+        always=True,
+    )
+    raise RuntimeError(f"TickFlow HTTP {resp.status_code}: {body[:200]}")
 
 
 def _rate_limit_delay_seconds(body: str, retry_after: str | None) -> float | None:
@@ -103,7 +196,7 @@ def _throttle_kline_request(path: str) -> None:
 
 
 def normalize_cn_symbol(raw: str) -> str:
-    """将 A 股 6 位代码标准化为 TickFlow 接口格式：XXXXXX.SH / XXXXXX.SZ。"""
+    """将 A 股 6 位代码标准化为 TickFlow 接口格式：.SH / .SZ / .BJ。"""
     s = str(raw or "").strip().upper()
     if not s:
         return ""
@@ -112,8 +205,10 @@ def normalize_cn_symbol(raw: str) -> str:
     digits = "".join(ch for ch in s if ch.isdigit())
     if len(digits) != 6:
         return s
-    if digits.startswith(("0", "3", "2")):
+    if digits.startswith(("0", "1", "2", "3")):
         return f"{digits}.SZ"
+    if digits.startswith(("4", "8", "9")):
+        return f"{digits}.BJ"
     return f"{digits}.SH"
 
 
@@ -168,68 +263,51 @@ class TickFlowClient:
         self.max_retries = max(int(self.max_retries), 1)
         self.retry_backoff_seconds = max(float(self.retry_backoff_seconds), 0.1)
         if not self.api_key:
-            raise ValueError("TICKFLOW_API_KEY 未配置，购买: https://tickflow.org/auth/register?ref=5N4NKTCPL4")
+            raise ValueError("TICKFLOW_API_KEY 未配置")
 
-    def _request(self, path: str, *, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request(
+        self,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        method: str = "GET",
+    ) -> dict[str, Any]:
         last_err: Exception | None = None
         url = f"{self.base_url}{path}"
-        headers = {"x-api-key": self.api_key}
-        params_summary = _summarize_params(params)
+        headers = {"x-api-key": self.api_key, **({"Content-Type": "application/json"} if json_body is not None else {})}
+        params_summary = _summarize_params(json_body if json_body is not None else params)
+        method_norm = str(method or "GET").strip().upper()
         for attempt in range(1, self.max_retries + 1):
             started = time.monotonic()
             try:
                 _throttle_kline_request(path)
-                resp = requests.get(
+                resp = _send_http_request(
+                    method_norm,
                     url,
                     headers=headers,
                     params=params,
-                    timeout=self.timeout_seconds,
+                    json_body=json_body,
+                    timeout_seconds=self.timeout_seconds,
                 )
                 if resp.status_code == 200:
-                    elapsed = (time.monotonic() - started) * 1000
-                    prefix = (
-                        f"recover ok path={path} attempt={attempt}/{self.max_retries}"
-                        if attempt > 1
-                        else f"ok path={path}"
+                    return _success_payload(
+                        resp,
+                        path=path,
+                        attempt=attempt,
+                        max_retries=self.max_retries,
+                        started=started,
+                        params_summary=params_summary,
                     )
-                    _tf_log(f"{prefix} elapsed_ms={elapsed:.0f} params={params_summary}", always=attempt > 1)
-                    return resp.json()
-                # Cloudflare 1010 / 临时网关错误等，走重试
-                body = (resp.text or "").strip()
-                if resp.status_code == 429 or "rate_limited" in body.lower():
-                    record_tickflow_limit_event(body)
-                    _tf_log(
-                        f"rate_limited path={path} attempt={attempt}/{self.max_retries} "
-                        f"params={params_summary} body={body[:160]}",
-                        always=True,
-                    )
-                    err = RuntimeError(f"TickFlow HTTP 429: {body[:200]}（{TICKFLOW_LIMIT_HINT}）")
-                    last_err = err
-                    delay = _rate_limit_delay_seconds(body, resp.headers.get("Retry-After"))
-                    if attempt < self.max_retries and delay is not None:
-                        _tf_log(
-                            f"rate_limited_sleep path={path} attempt={attempt}/{self.max_retries} "
-                            f"sleep_s={delay:.1f} params={params_summary}",
-                            always=True,
-                        )
-                        time.sleep(delay)
-                        continue
-                    raise err
-                if attempt < self.max_retries and (resp.status_code >= 500 or "error code: 1010" in body.lower()):
-                    _tf_log(
-                        f"retryable_http path={path} status={resp.status_code} "
-                        f"attempt={attempt}/{self.max_retries} params={params_summary}",
-                        always=True,
-                    )
-                    time.sleep(self.retry_backoff_seconds * attempt)
-                    continue
-                _tf_log(
-                    f"http_fail path={path} status={resp.status_code} "
-                    f"attempt={attempt}/{self.max_retries} params={params_summary} "
-                    f"body={body[:160]}",
-                    always=True,
+                _retry_or_raise_http(
+                    resp,
+                    path=path,
+                    attempt=attempt,
+                    max_retries=self.max_retries,
+                    params_summary=params_summary,
+                    retry_backoff_seconds=self.retry_backoff_seconds,
                 )
-                raise RuntimeError(f"TickFlow HTTP {resp.status_code}: {body[:200]}")
+                continue
             except Exception as e:  # requests.Timeout / requests.ConnectionError / RuntimeError
                 if is_tickflow_rate_limited_error(e):
                     record_tickflow_limit_event(e)
@@ -302,34 +380,31 @@ class TickFlowClient:
         if p not in _PERIOD_SET:
             raise ValueError(f"不支持的 period: {p}")
         clean = [normalize_cn_symbol(x) for x in symbols if str(x or "").strip()]
-        clean = sorted(set(x for x in clean if x))
+        clean = sorted({x for x in clean if x})
         if not clean:
             _tf_log("get_klines_batch skip: no valid symbols", always=True)
             return {}
-        params: dict[str, Any] = {
-            "symbols": ",".join(clean),
-            "period": p,
-            "count": max(int(count), 1),
-        }
-        if start_time_ms is not None:
-            params["start_time"] = int(start_time_ms)
-        if end_time_ms is not None:
-            params["end_time"] = int(end_time_ms)
-        if adjust is not None:
-            adj = str(adjust or "").strip().lower()
-            if adj not in _ADJUST_SET:
-                raise ValueError(f"不支持的 adjust: {adjust}")
-            params["adjust"] = adj
-        payload = self._request("/v1/klines/batch", params=params)
-        raw = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(raw, dict):
-            _tf_log("get_klines_batch empty payload", always=True)
-            return {}
         out: dict[str, pd.DataFrame] = {}
-        for sym, kline_payload in raw.items():
-            symbol = normalize_cn_symbol(str(sym or "").strip())
-            if symbol and isinstance(kline_payload, dict):
-                out[symbol] = parse_ohlcv_payload({"data": kline_payload})
+        chunks = _chunks(clean, TICKFLOW_KLINE_BATCH_SIZE)
+        for index, chunk in enumerate(chunks, start=1):
+            params: dict[str, Any] = {"symbols": ",".join(chunk), "period": p, "count": max(int(count), 1)}
+            if start_time_ms is not None:
+                params["start_time"] = int(start_time_ms)
+            if end_time_ms is not None:
+                params["end_time"] = int(end_time_ms)
+            if adjust is not None:
+                adj = str(adjust or "").strip().lower()
+                if adj not in _ADJUST_SET:
+                    raise ValueError(f"不支持的 adjust: {adjust}")
+                params["adjust"] = adj
+            payload = self._request("/v1/klines/batch", params=params)
+            raw = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(raw, dict):
+                for sym, kline_payload in raw.items():
+                    symbol = normalize_cn_symbol(str(sym or "").strip())
+                    if symbol and isinstance(kline_payload, dict):
+                        out[symbol] = parse_ohlcv_payload({"data": kline_payload})
+            _sleep_between_chunks(index, len(chunks), TICKFLOW_KLINE_BATCH_SLEEP)
         _tf_log(f"get_klines_batch done: received={len(out)}/{len(clean)}", always=True)
         return out
 
@@ -349,7 +424,7 @@ class TickFlowClient:
         if p not in _PERIOD_SET:
             raise ValueError(f"不支持的 period: {p}")
         clean = [normalize_cn_symbol(x) for x in symbols if str(x or "").strip()]
-        clean = sorted(set(x for x in clean if x))
+        clean = sorted({x for x in clean if x})
         if not clean:
             _tf_log("get_intraday_batch skip: no valid symbols", always=True)
             return {}
@@ -358,26 +433,20 @@ class TickFlowClient:
             always=True,
         )
 
-        payload = self._request(
-            "/v1/klines/intraday/batch",
-            params={
-                "symbols": ",".join(clean),
-                "period": p,
-                "count": max(int(count), 1),
-            },
-        )
-        raw = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(raw, dict):
-            _tf_log("get_intraday_batch empty payload", always=True)
-            return {}
-
         out: dict[str, pd.DataFrame] = {}
-        for sym, kline_payload in raw.items():
-            symbol = normalize_cn_symbol(str(sym or "").strip())
-            if not symbol or not isinstance(kline_payload, dict):
-                continue
-            df = parse_ohlcv_payload({"data": kline_payload})
-            out[symbol] = df
+        chunks = _chunks(clean, TICKFLOW_INTRADAY_BATCH_SIZE)
+        for index, chunk in enumerate(chunks, start=1):
+            payload = self._request(
+                "/v1/klines/intraday/batch",
+                params={"symbols": ",".join(chunk), "period": p, "count": max(int(count), 1)},
+            )
+            raw = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(raw, dict):
+                for sym, kline_payload in raw.items():
+                    symbol = normalize_cn_symbol(str(sym or "").strip())
+                    if symbol and isinstance(kline_payload, dict):
+                        out[symbol] = parse_ohlcv_payload({"data": kline_payload})
+            _sleep_between_chunks(index, len(chunks), TICKFLOW_INTRADAY_BATCH_SLEEP)
         _tf_log(f"get_intraday_batch done: received={len(out)}/{len(clean)}", always=True)
         return out
 
@@ -392,27 +461,25 @@ class TickFlowClient:
     def get_financial_metrics(self, symbols: list[str], *, latest: bool = True) -> dict[str, list[dict]]:
         """批量获取核心财务指标。返回 {symbol: [MetricsRecord]}"""
         clean = [normalize_cn_symbol(x) for x in symbols if str(x or "").strip()]
-        clean = sorted(set(x for x in clean if x))
+        clean = sorted({x for x in clean if x})
         if not clean:
             _tf_log("get_financial_metrics skip: no valid symbols", always=True)
             return {}
-        _tf_log(
-            f"get_financial_metrics request symbols={len(clean)} latest={latest}",
-            always=True,
-        )
-        resp = self._request(
-            "/v1/financials/metrics",
-            params={"symbols": ",".join(clean), "latest": "true" if latest else "false"},
-        )
-        data = resp.get("data") if isinstance(resp, dict) else None
-        if not isinstance(data, dict):
-            _tf_log("get_financial_metrics empty payload", always=True)
-            return {}
         out: dict[str, list[dict]] = {}
-        for sym, records in data.items():
-            key = normalize_cn_symbol(str(sym).strip())
-            if key and isinstance(records, list):
-                out[key] = records
+        chunks = _chunks(clean, TICKFLOW_FINANCIAL_BATCH_SIZE)
+        for index, chunk in enumerate(chunks, start=1):
+            _tf_log(f"get_financial_metrics request symbols={len(chunk)} latest={latest}", always=True)
+            resp = self._request(
+                "/v1/financials/metrics",
+                params={"symbols": ",".join(chunk), "latest": "true" if latest else "false"},
+            )
+            data = resp.get("data") if isinstance(resp, dict) else None
+            if isinstance(data, dict):
+                for sym, records in data.items():
+                    key = normalize_cn_symbol(str(sym).strip())
+                    if key and isinstance(records, list):
+                        out[key] = records
+            _sleep_between_chunks(index, len(chunks), TICKFLOW_FINANCIAL_BATCH_SLEEP)
         _tf_log(f"get_financial_metrics done: received={len(out)}/{len(clean)}", always=True)
         return out
 
@@ -423,28 +490,23 @@ class TickFlowClient:
         universes: list[str] | None = None,
     ) -> dict[str, dict[str, Any]]:
         clean = [normalize_cn_symbol(x) for x in symbols or [] if str(x or "").strip()]
-        clean = sorted(set(x for x in clean if x))
-        universe_ids = sorted(set(str(x).strip() for x in universes or [] if str(x).strip()))
+        clean = sorted({x for x in clean if x})
+        universe_ids = sorted({str(x).strip() for x in universes or [] if str(x).strip()})
         if not clean and not universe_ids:
             return {}
-        params: dict[str, Any] = {}
-        if clean:
-            params["symbols"] = ",".join(clean)
-        if universe_ids:
-            params["universes"] = ",".join(universe_ids)
-        payload = self._request(
-            "/v1/quotes",
-            params=params,
-        )
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, list):
-            return {}
         out: dict[str, dict[str, Any]] = {}
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-            sym = normalize_cn_symbol(str(row.get("symbol", "")).strip())
-            if not sym:
-                continue
-            out[sym] = row
+        bodies: list[dict[str, Any]] = []
+        if universe_ids:
+            bodies.append({"universes": universe_ids})
+        bodies.extend({"symbols": chunk} for chunk in _chunks(clean, TICKFLOW_QUOTES_BATCH_SIZE))
+        for index, body in enumerate(bodies, start=1):
+            payload = self._request("/v1/quotes", json_body=body, method="POST")
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, list):
+                for row in data:
+                    if isinstance(row, dict):
+                        sym = normalize_cn_symbol(str(row.get("symbol", "")).strip())
+                        if sym:
+                            out[sym] = row
+            _sleep_between_chunks(index, len(bodies), TICKFLOW_QUOTES_BATCH_SLEEP)
         return out

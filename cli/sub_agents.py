@@ -31,6 +31,7 @@ RESEARCH_AGENT = SubAgent(
         "search_stock_by_name",
         "analyze_stock",
         "get_market_overview",
+        "get_market_history",
         "query_history",
         "screen_stocks",
         "run_backtest",
@@ -46,6 +47,7 @@ ANALYSIS_AGENT = SubAgent(
         "analyze_stock",
         "portfolio",
         "get_market_overview",
+        "get_market_history",
         "generate_ai_report",
     ),
 )
@@ -60,6 +62,7 @@ TRADING_AGENT = SubAgent(
         "generate_strategy_decision",
         "analyze_stock",
         "get_market_overview",
+        "get_market_history",
     ),
 )
 

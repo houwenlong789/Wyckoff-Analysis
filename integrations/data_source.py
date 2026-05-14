@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import os
 import re
 import socket
@@ -19,6 +20,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from contextlib import suppress
 from datetime import date, datetime, timedelta, timezone
 from http.client import RemoteDisconnected
 from pathlib import Path
@@ -29,10 +31,13 @@ import pandas as pd
 
 from integrations.tickflow_notice import (
     TICKFLOW_LIMIT_HINT,
+    TICKFLOW_UPGRADE_URL,
     is_tickflow_rate_limited_error,
     record_tickflow_limit_event,
 )
 from integrations.mootdx_source import try_fetch_stock_mootdx
+
+logger = logging.getLogger(__name__)
 
 _BAOSTOCK_LOGGED = False
 _BAOSTOCK_EXIT_HOOKED = False
@@ -50,6 +55,24 @@ _DATA_SOURCE_DEBUG = os.getenv("DATA_SOURCE_DEBUG", "").strip().lower() in {
     "yes",
     "on",
 }
+_SH_PREFIXES = (
+    "600",
+    "601",
+    "603",
+    "605",
+    "688",
+    "510",
+    "511",
+    "512",
+    "513",
+    "515",
+    "516",
+    "518",
+    "560",
+    "561",
+    "562",
+    "563",
+)
 _BAOSTOCK_MAX_SECONDS = float(os.getenv("BAOSTOCK_MAX_SECONDS", "6.0"))
 _BAOSTOCK_SOCKET_TIMEOUT = float(os.getenv("BAOSTOCK_SOCKET_TIMEOUT", "3.0"))
 _BAOSTOCK_CIRCUIT_THRESHOLD = int(os.getenv("BAOSTOCK_CIRCUIT_THRESHOLD", "10"))
@@ -150,7 +173,7 @@ def _to_ts_code(symbol: str) -> str:
     s = str(symbol).strip()
     if "." in s:
         return s
-    if s.startswith(("600", "601", "603", "605", "688")):
+    if s.startswith(_SH_PREFIXES):
         return f"{s}.SH"
     return f"{s}.SZ"
 
@@ -298,68 +321,79 @@ def _normalize_spot_turnover(
     return (None, None, False)
 
 
+def _fetch_spot_dataframe():
+    import akshare as ak
+
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(ak.stock_zh_a_spot_em)
+        df = fut.result(timeout=max(_SPOT_SNAPSHOT_TIMEOUT_SECONDS, 1.0))
+    if df is None or df.empty:
+        raise RuntimeError("spot snapshot empty")
+    return df
+
+
+def _parse_spot_dataframe(df) -> dict[str, dict[str, float | None]]:
+    code_col = "代码"
+    if code_col not in df.columns:
+        fallback_cols = [c for c in df.columns if "代码" in str(c)]
+        if fallback_cols:
+            code_col = str(fallback_cols[0])
+        else:
+            raise RuntimeError("spot snapshot code column missing")
+
+    spot_map: dict[str, dict[str, float | None]] = {}
+    for _, row in df.iterrows():
+        symbol = _normalize_spot_symbol(row.get(code_col))
+        if not symbol:
+            continue
+        close_v = _to_float_or_none(_pick_first(row, ("最新价", "最新", "现价", "收盘")))
+        if close_v is None or close_v <= 0:
+            continue
+        open_v = _to_float_or_none(_pick_first(row, ("今开", "开盘")))
+        high_v = _to_float_or_none(_pick_first(row, ("最高",)))
+        low_v = _to_float_or_none(_pick_first(row, ("最低",)))
+        volume_raw = _to_float_or_none(_pick_first(row, ("成交量", "总手", "总量")))
+        amount_raw = _to_float_or_none(_pick_first(row, ("成交额", "金额")))
+        volume_v, amount_v, turnover_unit_ok = _normalize_spot_turnover(
+            close_v=close_v,
+            volume_v=volume_raw,
+            amount_v=amount_raw,
+        )
+        pct_v = _to_float_or_none(_pick_first(row, ("涨跌幅", "涨跌幅%")))
+        spot_map[symbol] = {
+            "open": open_v,
+            "high": high_v,
+            "low": low_v,
+            "close": close_v,
+            "volume": volume_v,
+            "amount": amount_v,
+            "pct_chg": pct_v,
+            "turnover_unit_ok": 1.0 if turnover_unit_ok else 0.0,
+        }
+    if not spot_map:
+        raise RuntimeError("spot snapshot parsed empty")
+    return spot_map
+
+
+def _spot_cache_valid(force_refresh: bool, now_ts: float) -> bool:
+    return (
+        not force_refresh
+        and bool(_SPOT_SNAPSHOT_MAP)
+        and (now_ts - _SPOT_SNAPSHOT_TS) < max(_SPOT_SNAPSHOT_TTL_SECONDS, 1)
+    )
+
+
 def _load_spot_snapshot_map(force_refresh: bool = False) -> dict[str, dict[str, float | None]]:
     global _SPOT_SNAPSHOT_TS, _SPOT_SNAPSHOT_MAP
-    now_ts = time.time()
+    if _spot_cache_valid(force_refresh, time.time()):
+        return _SPOT_SNAPSHOT_MAP
     with _SPOT_SNAPSHOT_LOCK:
-        if (
-            not force_refresh
-            and _SPOT_SNAPSHOT_MAP
-            and (now_ts - _SPOT_SNAPSHOT_TS) < max(_SPOT_SNAPSHOT_TTL_SECONDS, 1)
-        ):
+        now_ts = time.time()
+        if _spot_cache_valid(force_refresh, now_ts):
             return _SPOT_SNAPSHOT_MAP
-
         try:
-            import akshare as ak
-
-            with ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(ak.stock_zh_a_spot_em)
-                df = fut.result(timeout=max(_SPOT_SNAPSHOT_TIMEOUT_SECONDS, 1.0))
-            if df is None or df.empty:
-                raise RuntimeError("spot snapshot empty")
-
-            code_col = "代码"
-            if code_col not in df.columns:
-                fallback_cols = [c for c in df.columns if "代码" in str(c)]
-                if fallback_cols:
-                    code_col = str(fallback_cols[0])
-                else:
-                    raise RuntimeError("spot snapshot code column missing")
-
-            spot_map: dict[str, dict[str, float | None]] = {}
-            for _, row in df.iterrows():
-                symbol = _normalize_spot_symbol(row.get(code_col))
-                if not symbol:
-                    continue
-                close_v = _to_float_or_none(_pick_first(row, ("最新价", "最新", "现价", "收盘")))
-                if close_v is None or close_v <= 0:
-                    continue
-                open_v = _to_float_or_none(_pick_first(row, ("今开", "开盘")))
-                high_v = _to_float_or_none(_pick_first(row, ("最高",)))
-                low_v = _to_float_or_none(_pick_first(row, ("最低",)))
-                volume_raw = _to_float_or_none(_pick_first(row, ("成交量", "总手", "总量")))
-                amount_raw = _to_float_or_none(_pick_first(row, ("成交额", "金额")))
-                volume_v, amount_v, turnover_unit_ok = _normalize_spot_turnover(
-                    close_v=close_v,
-                    volume_v=volume_raw,
-                    amount_v=amount_raw,
-                )
-                pct_v = _to_float_or_none(_pick_first(row, ("涨跌幅", "涨跌幅%")))
-
-                spot_map[symbol] = {
-                    "open": open_v,
-                    "high": high_v,
-                    "low": low_v,
-                    "close": close_v,
-                    "volume": volume_v,
-                    "amount": amount_v,
-                    "pct_chg": pct_v,
-                    "turnover_unit_ok": 1.0 if turnover_unit_ok else 0.0,
-                }
-            if not spot_map:
-                raise RuntimeError("spot snapshot parsed empty")
-
-            _SPOT_SNAPSHOT_MAP = spot_map
+            df = _fetch_spot_dataframe()
+            _SPOT_SNAPSHOT_MAP = _parse_spot_dataframe(df)
             _SPOT_SNAPSHOT_TS = now_ts
             return _SPOT_SNAPSHOT_MAP
         except FuturesTimeoutError:
@@ -411,10 +445,7 @@ def _fetch_stock_akshare(symbol: str, start: str, end: str, adjust: str) -> pd.D
 
 
 def _fetch_stock_baostock(symbol: str, start: str, end: str) -> pd.DataFrame:
-    if symbol.startswith(("600", "601", "603", "605", "688")):
-        bs_code = f"sh.{symbol}"
-    else:
-        bs_code = f"sz.{symbol}"
+    bs_code = f"sh.{symbol}" if symbol.startswith(_SH_PREFIXES) else f"sz.{symbol}"
     start_dash = f"{start[:4]}-{start[4:6]}-{start[6:]}"
     end_dash = f"{end[:4]}-{end[4:6]}-{end[6:]}"
     with _BAOSTOCK_LOCK:
@@ -471,10 +502,8 @@ def _baostock_logout_on_exit() -> None:
         bs = _BAOSTOCK_MODULE
         if not _BAOSTOCK_LOGGED or bs is None:
             return
-        try:
+        with suppress(BaseException):
             bs.logout()
-        except BaseException:
-            pass
         _BAOSTOCK_LOGGED = False
 
 
@@ -532,10 +561,8 @@ def _fetch_stock_efinance(symbol: str, start: str, end: str) -> pd.DataFrame:
         pathlib.Path.mkdir = orig_mkdir
 
     cache_dir = Path(tempfile.gettempdir()) / "efinance-cache"
-    try:
+    with suppress(Exception):
         cache_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
     ef_cfg.DATA_DIR = cache_dir
     ef_cfg.SEARCH_RESULT_CACHE_PATH = str(cache_dir / "search-cache.json")
 
@@ -545,10 +572,7 @@ def _fetch_stock_efinance(symbol: str, start: str, end: str) -> pd.DataFrame:
     # fqt: 0 不复权, 1 前复权, 2 后复权
     fqt = 1  # 默认前复权
     result = ef.stock.get_quote_history(symbol, beg=start, end=end, klt=101, fqt=fqt)
-    if isinstance(result, dict):
-        df = result.get(str(symbol))
-    else:
-        df = result
+    df = result.get(str(symbol)) if isinstance(result, dict) else result
     if df is None or (hasattr(df, "empty") and df.empty):
         raise RuntimeError("efinance empty")
 
@@ -629,7 +653,7 @@ def _fetch_stock_tushare(symbol: str, start: str, end: str, adjust: str) -> pd.D
             if df_no_adj is not None and not df_no_adj.empty:
                 raise RuntimeError("tushare empty (qfq auth limit?)")
         except Exception:
-            pass
+            logger.debug("tushare qfq diagnosis probe failed", exc_info=True)
         raise RuntimeError("tushare empty")
 
     df = df.rename(
@@ -674,7 +698,7 @@ def _fetch_stock_tickflow(symbol: str, start: str, end: str, adjust: str) -> pd.
     """
     client = _get_tickflow_client()
     if client is None:
-        raise RuntimeError("TICKFLOW_API_KEY 未配置，购买: https://tickflow.org/auth/register?ref=5N4NKTCPL4")
+        raise RuntimeError("TICKFLOW_API_KEY 未配置")
 
     try:
         start_d = datetime.strptime(start, "%Y%m%d").date()
@@ -763,6 +787,17 @@ def _fetch_stock_tickflow(symbol: str, start: str, end: str, adjust: str) -> pd.
     ].copy()
 
 
+def _build_datasource_hint(failed_details: list[str]) -> str:
+    hint = _network_hint_from_details(failed_details)
+    _has_tickflow = bool(os.getenv("TICKFLOW_API_KEY", "").strip())
+    _has_tushare = bool(os.getenv("TUSHARE_TOKEN", "").strip())
+    if not _has_tickflow and not _has_tushare:
+        return f" 请配置数据源：{TICKFLOW_UPGRADE_URL}"
+    if _has_tushare and not _has_tickflow:
+        return f" Tushare 数据权限不足，可购买 TickFlow 获取更稳定的数据源：{TICKFLOW_UPGRADE_URL}"
+    return f" 诊断提示：{hint}" if hint else ""
+
+
 def fetch_stock_hist(
     symbol: str,
     start: str | date,
@@ -827,7 +862,7 @@ def fetch_stock_hist(
         failed_details.append("tickflow=disabled_by_env")
     elif not os.getenv("TICKFLOW_API_KEY", "").strip():
         failed_sources.append("tickflow(unconfigured)")
-        failed_details.append("tickflow=api_key_missing(购买: https://tickflow.org/auth/register?ref=5N4NKTCPL4)")
+        failed_details.append("tickflow=unconfigured")
     else:
         try:
             return _tag_source(
@@ -987,8 +1022,7 @@ def fetch_stock_hist(
             failed_details.append(f"efinance={_compact_error(e)}")
 
     detail_suffix = f" 失败详情：{'；'.join(failed_details[:4])}。" if failed_details else ""
-    hint = _network_hint_from_details(failed_details)
-    hint_suffix = f" 诊断提示：{hint}" if hint else ""
+    hint_suffix = _build_datasource_hint(failed_details)
     raise RuntimeError(
         f"数据拉取全线失败 [标:{symbol}, 范围:{start_s}..{end_s}, 复权:{adjust}]：已按顺序尝试 mootdx→tickflow→tushare→akshare→baostock→efinance，"
         f"均无可用 K 线数据。请检查该标的是否已退市或处于长期停牌期。{detail_suffix}{hint_suffix}"
@@ -1003,9 +1037,7 @@ def _fetch_index_tushare(code: str, start: str, end: str) -> pd.DataFrame:
 
     pro = get_pro()
     if pro is None:
-        raise RuntimeError(
-            "拉取失败（非程序错误）：大盘指数需 Tushare Token，免费数据源（akshare 等）不支持大盘指数。请配置 TUSHARE_TOKEN。"
-        )
+        raise RuntimeError("tushare token 未配置，跳过 tushare 大盘指数")
     ts_code = _index_to_ts_code(code)
     df = pro.index_daily(ts_code=ts_code, start_date=start, end_date=end)
     if df is None or df.empty:
@@ -1072,7 +1104,15 @@ def fetch_index_hist(code: str, start: str | date, end: str | date) -> pd.DataFr
     except Exception as e2:
         _debug_source_fail("akshare(index)", e2)
 
-    raise RuntimeError(f"大盘指数 {code} 拉取全部失败（tushare + akshare），请检查 TUSHARE_TOKEN 或网络连通性。")
+    _has_tickflow = bool(os.getenv("TICKFLOW_API_KEY", "").strip())
+    _has_tushare = bool(os.getenv("TUSHARE_TOKEN", "").strip())
+    if not _has_tickflow and not _has_tushare:
+        suffix = f" 请配置数据源：{TICKFLOW_UPGRADE_URL}"
+    elif _has_tushare and not _has_tickflow:
+        suffix = f" Tushare 权限不足，可购买 TickFlow 获取更稳定数据：{TICKFLOW_UPGRADE_URL}"
+    else:
+        suffix = " 请检查网络连通性。"
+    raise RuntimeError(f"大盘指数 {code} 拉取全部失败（tushare + akshare）。{suffix}")
 
 
 # --- 行业 & 市值批量获取（tushare） ---
@@ -1103,10 +1143,8 @@ def _atomic_write_json(path: Path, payload: object) -> None:
         tmp_name = None
     finally:
         if tmp_name and os.path.exists(tmp_name):
-            try:
+            with suppress(Exception):
                 os.remove(tmp_name)
-            except Exception:
-                pass
 
 
 def _ts_code_to_symbol(ts_code: str) -> str:

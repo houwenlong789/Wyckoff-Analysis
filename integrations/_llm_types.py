@@ -1,0 +1,52 @@
+"""Shared LLM provider constants without importing provider SDKs."""
+
+from __future__ import annotations
+
+SUPPORTED_PROVIDERS = (
+    "1route",
+    "gemini",
+    "openai",
+    "longcat",
+    "efficiency",
+    "openai_compatible",
+    "zhipu",
+    "minimax",
+    "deepseek",
+    "qwen",
+    "volcengine",
+)
+
+OPENAI_COMPATIBLE_BASE_URLS = {
+    "1route": "https://www.1route.dev/v1",
+    "openai": "https://api.openai.com/v1",
+    "longcat": "https://api.longcat.chat/openai",
+    "efficiency": "",
+    "openai_compatible": "",
+    "zhipu": "https://open.bigmodel.cn/api/paas/v4",
+    "minimax": "https://api.minimax.chat/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "volcengine": "https://ark.cn-beijing.volces.com/api/v3",
+}
+
+DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+GEMINI_MODELS = (
+    DEFAULT_GEMINI_MODEL,
+    "gemini-2.5-flash-lite",
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+)
+
+PROVIDER_LABELS: dict[str, str] = {
+    "1route": "1Route（推荐）",
+    "gemini": "Gemini",
+    "openai": "OpenAI",
+    "longcat": "LongCat",
+    "efficiency": "Efficiency（OpenAI兼容）",
+    "openai_compatible": "OpenAI兼容",
+    "zhipu": "智谱",
+    "minimax": "Minimax",
+    "deepseek": "DeepSeek",
+    "qwen": "Qwen",
+    "volcengine": "火山引擎",
+}

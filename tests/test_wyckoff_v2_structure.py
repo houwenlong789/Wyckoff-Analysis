@@ -3,15 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from core.strategy_compare import (
-    STRATEGY_V1_CURRENT,
-    STRATEGY_V2_STRUCTURE,
-    StrategyRun,
-    compare_strategy_runs,
-    extract_l4_candidates,
-    format_strategy_comparison_markdown,
-)
-from core.wyckoff_engine import FunnelConfig, FunnelResult
+from core.wyckoff_engine import FunnelConfig
 from core.wyckoff_v2_structure import detect_structure_triggers, identify_trading_range
 
 
@@ -33,20 +25,6 @@ def _range_df(n: int = 120) -> pd.DataFrame:
             "volume": volume,
             "pct_chg": pd.Series(close).pct_change().fillna(0.0) * 100.0,
         }
-    )
-
-
-def _empty_result(triggers: dict[str, list[tuple[str, float]]]) -> FunnelResult:
-    return FunnelResult(
-        layer1_symbols=[],
-        layer2_symbols=[],
-        layer3_symbols=[],
-        top_sectors=[],
-        triggers=triggers,
-        stage_map={"000001": "Markup", "000002": "Accum_C", "000003": "Accum_B"},
-        markup_symbols=[],
-        exit_signals={},
-        channel_map={"000001": "main", "000002": "accum", "000003": "structure"},
     )
 
 
@@ -102,71 +80,3 @@ def test_structure_sos_uses_dynamic_resistance():
 
     assert result.triggers["sos"]
     assert result.stage_map["000001"] == "Markup"
-
-
-def test_strategy_compare_counts_overlap_and_unique_candidates():
-    v1 = StrategyRun(
-        strategy_id=STRATEGY_V1_CURRENT,
-        result=_empty_result({"sos": [("000001", 2.0)], "spring": [("000002", 1.0)], "lps": [], "evr": []}),
-        candidates=(),
-    )
-    v2 = StrategyRun(
-        strategy_id=STRATEGY_V2_STRUCTURE,
-        result=_empty_result({"sos": [("000001", 3.0)], "spring": [("000003", 1.5)], "lps": [], "evr": []}),
-        candidates=(),
-    )
-    v1 = StrategyRun(v1.strategy_id, v1.result, extract_l4_candidates(v1.result, v1.strategy_id))
-    v2 = StrategyRun(v2.strategy_id, v2.result, extract_l4_candidates(v2.result, v2.strategy_id))
-
-    comparison = compare_strategy_runs((v1, v2))
-
-    assert comparison.intersection == ("000001",)
-    assert comparison.only_by_strategy[STRATEGY_V1_CURRENT] == ("000002",)
-    assert comparison.only_by_strategy[STRATEGY_V2_STRUCTURE] == ("000003",)
-    assert comparison.counts["union"] == 3
-
-
-def test_shadow_report_uses_standalone_funnel_style():
-    v1 = StrategyRun(
-        strategy_id=STRATEGY_V1_CURRENT,
-        result=_empty_result({"sos": [("000001", 2.0)], "spring": [("000002", 1.0)], "lps": [], "evr": []}),
-        candidates=(),
-    )
-    v2 = StrategyRun(
-        strategy_id=STRATEGY_V2_STRUCTURE,
-        result=_empty_result({"sos": [("000001", 3.0)], "spring": [("000003", 1.5)], "lps": [], "evr": []}),
-        candidates=(),
-    )
-    v1 = StrategyRun(v1.strategy_id, v1.result, extract_l4_candidates(v1.result, v1.strategy_id))
-    v2 = StrategyRun(v2.strategy_id, v2.result, extract_l4_candidates(v2.result, v2.strategy_id))
-    comparison = compare_strategy_runs((v1, v2))
-
-    report = format_strategy_comparison_markdown(
-        (v1, v2),
-        comparison,
-        name_map={"000001": "平安银行", "000002": "万科A", "000003": "国农科技"},
-        sector_map={"000001": "银行", "000002": "房地产", "000003": "农业"},
-        benchmark_context={
-            "regime": "RISK_ON",
-            "close": 3200.0,
-            "ma50": 3100.0,
-            "ma200": 3000.0,
-            "recent3_cum_pct": 1.2,
-            "breadth": {"ratio_pct": 55.0},
-        },
-        input_symbol_count=3,
-        quality_summary={"total": 3, "error_symbols": 0, "warning_symbols": 1},
-    )
-
-    assert "**股票池**: 影子池 3 只" in report
-    assert "**漏斗概览**: 3只 → 结构命中:2" in report
-    assert "**【⚡ SOS（强势信号） 量价点火】1 只**" in report
-    assert "000001 平安银行" in report
-    assert "数据质量" in report
-    assert "右侧点火" in report
-    assert "[银行]" in report
-    assert "SOS（强势信号）" in report
-    assert "正式" not in report
-    assert "V1" not in report
-    assert "对照" not in report
-    assert "比较" not in report

@@ -30,6 +30,7 @@ from core.wyckoff_engine import (
     normalize_hist_from_fetch,
 )
 from integrations.tickflow_client import TickFlowClient
+from integrations.tickflow_notice import TICKFLOW_UPGRADE_URL
 from tools.candidate_ranker import TRIGGER_LABELS
 
 
@@ -76,6 +77,14 @@ MARKET_SPECS = {
         default_max_symbols=800,
         default_min_quote_amount=5_000_000.0,
     ),
+    "etf": MarketSpec(
+        key="etf",
+        label="ETF",
+        universe="CN_Fund",
+        symbol_file="etf_cn.txt",
+        default_max_symbols=200,
+        default_min_quote_amount=500_000.0,
+    ),
 }
 
 
@@ -113,11 +122,11 @@ def _runtime_config(market: str, output: str | None) -> RuntimeConfig:
     return RuntimeConfig(
         spec=spec,
         max_symbols=_int_env("MARKET_FUNNEL_MAX_SYMBOLS", spec.default_max_symbols, minimum=1),
-        quote_batch_size=_int_env("MARKET_FUNNEL_QUOTE_BATCH_SIZE", 50, minimum=1),
-        quote_batch_sleep=_float_env("MARKET_FUNNEL_QUOTE_BATCH_SLEEP", 1.1),
+        quote_batch_size=_int_env("MARKET_FUNNEL_QUOTE_BATCH_SIZE", 500, minimum=1),
+        quote_batch_sleep=_float_env("MARKET_FUNNEL_QUOTE_BATCH_SLEEP", 0.25),
         kline_count=_int_env("MARKET_FUNNEL_KLINE_COUNT", 320, minimum=220),
-        kline_batch_size=_int_env("MARKET_FUNNEL_KLINE_BATCH_SIZE", 100, minimum=1),
-        kline_batch_sleep=_float_env("MARKET_FUNNEL_KLINE_BATCH_SLEEP", 2.1),
+        kline_batch_size=_int_env("MARKET_FUNNEL_KLINE_BATCH_SIZE", 200, minimum=1),
+        kline_batch_sleep=_float_env("MARKET_FUNNEL_KLINE_BATCH_SLEEP", 0.55),
         min_quote_amount=_float_env("MARKET_FUNNEL_MIN_QUOTE_AMOUNT", spec.default_min_quote_amount),
         min_avg_amount=_float_env("MARKET_FUNNEL_MIN_AVG_AMOUNT", 0.0),
         min_history_rows=_int_env("MARKET_FUNNEL_MIN_HISTORY_ROWS", 220, minimum=80),
@@ -262,6 +271,26 @@ def _funnel_config(cfg: RuntimeConfig) -> FunnelConfig:
     funnel_cfg.enable_rs_filter = False
     funnel_cfg.enable_rs_divergence_channel = False
     funnel_cfg.require_bench_latest_alignment = False
+
+    if cfg.spec.key == "us":
+        # 美股波动率更高，SOS/Spring 门槛收紧避免 meme 股噪音
+        funnel_cfg.sos_pct_min = 7.0
+        funnel_cfg.sos_vol_ratio = 3.0
+        funnel_cfg.spring_vol_ratio = 1.3
+        funnel_cfg.evr_max_rise = 3.0
+    elif cfg.spec.key == "hk":
+        # 港股仙股多，Spring 低价回收率天然放大，用 bias 保护 + 放宽吸筹
+        funnel_cfg.spring_tr_max_range_pct = 25.0
+        funnel_cfg.sos_max_bias_200 = 25.0
+        funnel_cfg.accum_price_from_low_max = 0.40
+    elif cfg.spec.key == "etf":
+        # ETF 波动率低于个股，放宽触发门槛
+        funnel_cfg.sos_pct_min = 3.5
+        funnel_cfg.sos_vol_ratio = 2.0
+        funnel_cfg.spring_vol_ratio = 1.0
+        funnel_cfg.evr_min_turnover = 0.3
+        funnel_cfg.evr_max_rise = 2.0
+
     return funnel_cfg
 
 
@@ -412,6 +441,13 @@ def _write_report(path: Path | None, result: dict[str, Any]) -> None:
             fh.write(report + "\n")
 
 
+def _require_tickflow_client() -> TickFlowClient:
+    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(f"market_funnel_job 需要实时行情数据，请购买 TickFlow：{TICKFLOW_UPGRADE_URL}")
+    return TickFlowClient(api_key=api_key)
+
+
 def run_market_funnel(
     market: str,
     *,
@@ -419,7 +455,7 @@ def run_market_funnel(
     client: TickFlowClient | None = None,
 ) -> dict[str, Any]:
     runtime = _runtime_config(market, output)
-    tf = client or TickFlowClient(api_key=os.getenv("TICKFLOW_API_KEY", "").strip())
+    tf = client or _require_tickflow_client()
     universe_symbols = _load_symbols(runtime.symbol_path)
     print(
         f"[market-funnel] start market={runtime.spec.key} universe={runtime.spec.universe} "

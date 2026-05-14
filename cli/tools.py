@@ -1,5 +1,5 @@
 """
-工具注册表 — 复用 agents/chat_tools.py 的 10 个函数，去除 ADK 依赖。
+工具注册表 — 复用 agents/chat_tools.py 的工具函数，去除 ADK 依赖。
 
 核心思路：
 1. ToolContext 用 shim 类替代（只需 .state 属性）
@@ -40,22 +40,25 @@ class ToolContext:
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "search_stock_by_name",
-        "description": "根据关键词搜索 A 股股票，支持名称、代码、拼音首字母模糊搜索。最多返回 10 条。",
+        "description": "根据关键词搜索 A 股 / ETF / 美股 / 港股，支持名称、代码、常见中文别名和 TickFlow 标准代码。最多返回 10 条。",
         "parameters": {
             "type": "object",
             "properties": {
-                "keyword": {"type": "string", "description": "搜索关键词，如 '宁德' 或 '300750' 或 'gzmt'"},
+                "keyword": {
+                    "type": "string",
+                    "description": "搜索关键词，如 '宁德'、'300750'、'纳指100'、'苹果'、'AAPL.US'、'00700.HK'",
+                },
             },
             "required": ["keyword"],
         },
     },
     {
         "name": "analyze_stock",
-        "description": "分析单只 A 股股票：Wyckoff 健康诊断或近期行情查询。",
+        "description": "分析单只股票：A 股/ETF 支持 6 位代码；美股/港股使用 TickFlow 标准代码。支持 Wyckoff 健康诊断或近期行情查询。",
         "parameters": {
             "type": "object",
             "properties": {
-                "code": {"type": "string", "description": "6 位股票代码，如 '000001' 或 '600519'"},
+                "code": {"type": "string", "description": "股票代码，如 '000001'、'513100'、'AAPL.US'、'00700.HK'"},
                 "mode": {
                     "type": "string",
                     "enum": ["diagnose", "price"],
@@ -87,6 +90,23 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "parameters": {
             "type": "object",
             "properties": {},
+        },
+    },
+    {
+        "name": "get_market_history",
+        "description": "回看 A 股主要指数过去 N 个交易日的日线量价关系。用户问过去、近 N 日、回看、阶段位置时使用。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "回看交易日数量，默认 100，最大 320",
+                },
+                "index": {
+                    "type": "string",
+                    "description": "指数别名或代码，支持 sse/上证/csi300/沪深300/szse/深证/chinext/创业板",
+                },
+            },
         },
     },
     {
@@ -127,14 +147,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "query_history",
-        "description": "查询历史记录：AI 推荐追踪、信号确认池或尾盘买入记录。",
+        "description": "查询历史记录：形态复盘、信号确认池或尾盘买入记录。",
         "parameters": {
             "type": "object",
             "properties": {
                 "source": {
                     "type": "string",
                     "enum": ["recommendation", "signal", "tail_buy"],
-                    "description": "'recommendation' 推荐追踪；'signal' 信号确认池；'tail_buy' 尾盘买入",
+                    "description": "'recommendation' 形态复盘；'signal' 信号确认池；'tail_buy' 尾盘买入",
                 },
                 "status": {"type": "string", "description": "仅 signal：'all'/'pending'/'confirmed'/'expired'"},
                 "run_date": {"type": "string", "description": "仅 tail_buy：按日期过滤 YYYY-MM-DD"},
@@ -198,7 +218,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     # ── 委派工具 ──
     {
         "name": "delegate_to_research",
-        "description": "委派研究员收集市场数据和情报。用于全市场扫描、信号查询、推荐记录、回测等数据收集任务。",
+        "description": "委派研究员收集市场数据和情报。用于全市场扫描、信号查询、复盘记录、回测等数据收集任务。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -301,6 +321,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "analyze_stock": ToolSpec("analyze_stock", "个股分析", concurrency_safe=True),
     "portfolio": ToolSpec("portfolio", "持仓", concurrency_safe=True),
     "get_market_overview": ToolSpec("get_market_overview", "大盘水温", concurrency_safe=True),
+    "get_market_history": ToolSpec("get_market_history", "大盘回看", concurrency_safe=True),
     "screen_stocks": ToolSpec("screen_stocks", "全市场扫描", background=True),
     "generate_ai_report": ToolSpec("generate_ai_report", "深度审讯", background=True),
     "generate_strategy_decision": ToolSpec("generate_strategy_decision", "攻防决策", background=True),
@@ -386,6 +407,7 @@ class ToolRegistry:
             exec_command,
             generate_ai_report,
             generate_strategy_decision,
+            get_market_history,
             get_market_overview,
             portfolio,
             query_history,
@@ -408,6 +430,7 @@ class ToolRegistry:
             "analyze_stock": analyze_stock,
             "portfolio": portfolio,
             "get_market_overview": get_market_overview,
+            "get_market_history": get_market_history,
             "screen_stocks": screen_stocks,
             "generate_ai_report": generate_ai_report,
             "generate_strategy_decision": generate_strategy_decision,

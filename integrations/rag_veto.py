@@ -49,7 +49,7 @@ RAG_SEMANTIC_VETO_ENABLED = os.getenv("RAG_SEMANTIC_VETO_ENABLED", "1").strip().
     "on",
 }
 RAG_SEMANTIC_TIMEOUT = int(os.getenv("RAG_SEMANTIC_TIMEOUT", "25"))
-from integrations.llm_client import DEFAULT_GEMINI_MODEL as _DEFAULT_GEMINI_MODEL
+from integrations._llm_types import DEFAULT_GEMINI_MODEL as _DEFAULT_GEMINI_MODEL
 
 RAG_SEMANTIC_MODEL = (
     os.getenv("RAG_SEMANTIC_MODEL", "").strip() or os.getenv("GEMINI_MODEL", "").strip() or _DEFAULT_GEMINI_MODEL
@@ -138,7 +138,7 @@ def _fetch_news_akshare(code: str) -> list[dict[str, str]]:
                 if dt < cutoff:
                     continue
             except Exception:
-                pass
+                logger.debug("failed to parse news publish time", exc_info=True)
         results.append(
             {
                 "title": str(row.get("新闻标题", "")).strip(),
@@ -159,7 +159,7 @@ def _parse_semantic_judgement(raw: str) -> tuple[bool | None, str]:
         if isinstance(v, bool):
             return (v, reason)
     except Exception:
-        pass
+        logger.debug("failed to parse semantic judgement JSON", exc_info=True)
 
     m = re.search(r'"is_extreme_negative"\s*:\s*(true|false)', text, flags=re.IGNORECASE)
     if m:

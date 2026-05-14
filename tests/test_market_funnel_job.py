@@ -4,7 +4,7 @@ import json
 
 import pandas as pd
 
-from scripts.market_funnel_job import run_market_funnel
+from scripts.market_funnel_job import _candidate_rows, run_market_funnel
 
 
 def _daily_frame(rows: int = 230) -> pd.DataFrame:
@@ -26,6 +26,21 @@ def _daily_frame(rows: int = 230) -> pd.DataFrame:
             "pct_chg": close.pct_change().fillna(0.0) * 100.0,
         }
     )
+
+
+def test_candidate_rows_keep_raw_trigger_strength():
+    rows = _candidate_rows(
+        {"sos": [("BZFD.US", 535.7), ("WOK.US", 26.3), ("QUBT.US", 11.23)]},
+        name_map={"BZFD.US": "BuzzFeed", "WOK.US": "WORK Medical Tech", "QUBT.US": "Quantum Computing"},
+        df_map={
+            "BZFD.US": pd.DataFrame({"close": [1.39]}),
+            "WOK.US": pd.DataFrame({"close": [6.66]}),
+            "QUBT.US": pd.DataFrame({"close": [11.78]}),
+        },
+    )
+
+    assert [row["symbol"] for row in rows] == ["BZFD.US", "WOK.US", "QUBT.US"]
+    assert [row["score"] for row in rows] == [535.7, 26.3, 11.23]
 
 
 class FakeTickFlowClient:

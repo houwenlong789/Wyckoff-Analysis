@@ -30,7 +30,7 @@ with st.sidebar:
     st.divider()
 
     # ── 读盘室供应商快捷切换 ──
-    from integrations.llm_client import PROVIDER_LABELS, SUPPORTED_PROVIDERS
+    from integrations._llm_types import PROVIDER_LABELS, SUPPORTED_PROVIDERS
 
     st.session_state.setdefault("chat_provider", "gemini")
     _current_provider = st.session_state.get("chat_provider", "gemini")
@@ -46,7 +46,7 @@ with st.sidebar:
     )
     if _new_provider != _current_provider:
         st.session_state["chat_provider"] = _new_provider
-        # 清掉旧 agent，下面会用新 provider 重建
+        # Provider 切换需要重建对话上下文。
         st.session_state.pop("chat_manager", None)
         st.session_state.pop("chat_messages", None)
         st.rerun()
@@ -73,11 +73,11 @@ _WELCOME_TEXT = (
     "我是理查德·威科夫。我只看供需关系和主力行为，不听故事。\n\n"
     "你可以直接跟我说：\n"
     '- 🔍 **"搜一下宁德时代"** — 我帮你查\n'
-    '- 🕵️ **"帮我看看 000001"** — 我给它做一次完整的量价体检\n'
+    '- 🕵️ **"帮我看看 601318"** — 我给它做一次完整的量价体检\n'
     '- 🪓 **"审判我的持仓"** — 我会逐一下达去留判决\n'
     '- 🌊 **"今天大盘水温怎么样"** — 我告诉你现在适合进攻还是蛰伏\n'
     '- 🧭 **"有什么机会"** — 我从四千多只股票里帮你扫出来\n'
-    '- 📈 **"600519 最近走势"** — 我调它的 K 线给你看\n'
+    '- 📈 **"601318 最近走势"** — 我调它的 K 线给你看\n'
     '- 📝 **"深度审一下这几只"** — 我把它们分成三个阵营\n'
     '- ⚔️ **"该买什么该卖什么"** — 我给你下作战指令\n'
     '- 🎯 **"之前推荐的表现怎么样"** — 我翻一翻战绩\n\n'
@@ -112,7 +112,7 @@ def _get_chat_config() -> tuple[str, str, str, str]:
         )
     else:
         # 非 Gemini：读对应 provider 的 key/model/base_url
-        from integrations.llm_client import OPENAI_COMPATIBLE_BASE_URLS
+        from integrations._llm_types import OPENAI_COMPATIBLE_BASE_URLS
 
         key_prefix = provider.lower()
         env_prefix = key_prefix.upper()
@@ -279,7 +279,7 @@ def _inject_chat_css() -> None:
 
 
 def _render_header_card(provider: str, model: str) -> None:
-    from integrations.llm_client import PROVIDER_LABELS
+    from integrations._llm_types import PROVIDER_LABELS
 
     provider_label = PROVIDER_LABELS.get(provider, provider)
     model_text = (model or "gemini-2.0-flash").strip()

@@ -16,14 +16,43 @@ from tools.funnel_config import parse_int_env
 
 
 def _stock_name_map() -> dict[str, str]:
-    """获取全部 A 股代码→名称映射（如失败返回空 dict）。"""
+    """获取全部 A 股 + ETF 代码→名称映射（如失败返回空 dict）。"""
     try:
         from integrations.fetch_a_share_csv import get_all_stocks
 
         items = get_all_stocks()
-        return {x.get("code", ""): x.get("name", "") for x in items if isinstance(x, dict)}
+        result = {x.get("code", ""): x.get("name", "") for x in items if isinstance(x, dict)}
     except Exception:
+        result = {}
+    result.update(_etf_name_map())
+    return result
+
+
+def _etf_name_map() -> dict[str, str]:
+    """从结构化 ETF meta 加载 ETF 名称映射。"""
+    from contextlib import suppress
+    from pathlib import Path
+
+    with suppress(Exception):
+        from integrations.data_source import load_symbol_name_map
+
+        meta_map = load_symbol_name_map(("etf_cn",))
+        out = {code: name for code, name in meta_map.items() if len(code) == 6 and code.isdigit()}
+        if out:
+            return out
+
+    path = Path(__file__).resolve().parent.parent / "data" / "market_universes" / "etf_cn.txt"
+    if not path.is_file():
         return {}
+    out: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) == 2 and len(parts[0]) == 6 and parts[0].isdigit():
+            out[parts[0]] = f"{parts[1]}ETF"
+    return out
 
 
 def resolve_symbol_pool_from_env() -> tuple[list[str], dict[str, str], dict[str, int | str]]:

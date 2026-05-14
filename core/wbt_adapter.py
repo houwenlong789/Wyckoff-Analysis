@@ -138,10 +138,7 @@ def build_position_weight_frame(
                 continue
             active = pos_by_day.get(day, [])
             n_active = len(active)
-            if n_active:
-                weight = sum(1.0 / n_active for p in active if p["code"] == code)
-            else:
-                weight = 0.0
+            weight = sum(1.0 / n_active for p in active if p["code"] == code) if n_active else 0.0
             rows.append(
                 {
                     "dt": pd.Timestamp(day),
@@ -274,7 +271,7 @@ def _daily_return_mdd_pct(daily_return: pd.DataFrame | None) -> float | None:
     ret = pd.to_numeric(daily_return["total"], errors="coerce").dropna()
     if ret.empty:
         return None
-    nav = (1.0 + ret).cumprod()
+    nav = 1.0 + ret.cumsum()
     nav = pd.concat([pd.Series([1.0]), nav], ignore_index=True)
     peak = nav.cummax()
     drawdown = nav / peak - 1.0

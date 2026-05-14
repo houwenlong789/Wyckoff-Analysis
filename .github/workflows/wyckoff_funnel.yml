@@ -18,12 +18,12 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
       TICKFLOW_API_KEY: ${{ secrets.TICKFLOW_API_KEY }}
-      # TickFlow 日K上限为 300/min；主漏斗用线程模式共享客户端限速器，并留出安全余量。
-      TICKFLOW_KLINE_RATE_LIMIT_PER_MIN: "240"
+      # TickFlow 日K批量上限为 120/min、200标的/次；主漏斗优先走批量接口。
+      TICKFLOW_KLINE_RATE_LIMIT_PER_MIN: "110"
       FUNNEL_EXECUTOR_MODE: "thread"
       FUNNEL_MAX_WORKERS: "4"
-      FUNNEL_BATCH_SIZE: "120"
-      FUNNEL_BATCH_SLEEP: "6"
+      FUNNEL_BATCH_SIZE: "200"
+      FUNNEL_BATCH_SLEEP: "0.55"
       DEFAULT_LLM_PROVIDER: ${{ secrets.DEFAULT_LLM_PROVIDER }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
@@ -51,8 +51,6 @@ jobs:
       EFFICIENCY_API_KEY: ${{ secrets.EFFICIENCY_API_KEY }}
       EFFICIENCY_MODEL: ${{ secrets.EFFICIENCY_MODEL }}
       EFFICIENCY_BASE_URL: ${{ secrets.EFFICIENCY_BASE_URL }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
       TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
       MY_PORTFOLIO_STATE: ${{ secrets.MY_PORTFOLIO_STATE }}
       TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -69,6 +67,16 @@ jobs:
       STEP4_BUY_STOP_MODE: "floor"
       STEP4_PROBE_BUDGET_LIMIT: "0.10"
       STEP4_ATTACK_BUDGET_LIMIT: "0.20"
+      STEP4_BUY_BLOCK_REGIMES: "CRASH,BLACK_SWAN,RISK_OFF"
+      # AI 候选配额：偏 Accum（回测夏普 1.77 vs Trend 0.14）
+      FUNNEL_AI_SELECTION_MODE: "modern"
+      FUNNEL_AI_TOTAL_CAP: "8"
+      FUNNEL_AI_RISK_ON_TREND: "3"
+      FUNNEL_AI_RISK_ON_ACCUM: "5"
+      FUNNEL_AI_RISK_OFF_TREND: "0"
+      FUNNEL_AI_RISK_OFF_ACCUM: "0"
+      FUNNEL_AI_NEUTRAL_TREND: "2"
+      FUNNEL_AI_NEUTRAL_ACCUM: "3"
       TZ: Asia/Shanghai
 
     steps:

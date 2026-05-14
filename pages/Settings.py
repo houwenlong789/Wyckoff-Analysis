@@ -3,7 +3,7 @@ import streamlit as st
 from app.layout import setup_page
 from app.navigation import show_right_nav
 from app.ui_helpers import show_page_loading
-from integrations.llm_client import OPENAI_COMPATIBLE_BASE_URLS, PROVIDER_LABELS, SUPPORTED_PROVIDERS
+from integrations._llm_types import OPENAI_COMPATIBLE_BASE_URLS, PROVIDER_LABELS, SUPPORTED_PROVIDERS
 from integrations.supabase_client import save_user_settings
 
 setup_page(page_title="设置", page_icon="⚙️")

@@ -1,11 +1,8 @@
 """
-统一 LLM 调用层：支持 Gemini，可选 OpenAI 兼容接口。
-入参：provider、model、api_key、system_prompt、user_message；可选 base_url（OpenAI 兼容）。
+统一 LLM 调用层。
 
-可选 LiteLLM 路由（LITELLM_ENABLED=1）：
-  - 自动路由到 integrations/llm_adapter.py 的 LiteLLM 实现
-  - 所有现有调用方（step3, step4, single_stock_logic, rag_veto）零改动自动切换
-  - images 参数暂不支持 LiteLLM 路径，带 images 时自动降级为原生实现
+根据 provider/model/api_key/base_url 路由到 Gemini、OpenAI 兼容接口或 LiteLLM 适配层。
+带图片输入时使用原生 Gemini 路径，避免 LiteLLM 文本路由误处理多模态 payload。
 """
 
 from __future__ import annotations
@@ -14,63 +11,29 @@ import logging
 import os
 import time
 
+from integrations._llm_types import (
+    DEFAULT_GEMINI_MODEL,
+    GEMINI_MODELS,
+    OPENAI_COMPATIBLE_BASE_URLS,
+    PROVIDER_LABELS,
+    SUPPORTED_PROVIDERS,
+)
+
 logger = logging.getLogger(__name__)
 
-# 多厂商：Gemini + OpenAI 兼容（OpenAI/智谱/Minimax/DeepSeek/Qwen/火山引擎）
-SUPPORTED_PROVIDERS = (
-    "1route",
-    "gemini",
-    "openai",
-    "openrouter",
-    "longcat",
-    "efficiency",
-    "openai_compatible",
-    "zhipu",
-    "minimax",
-    "deepseek",
-    "qwen",
-    "volcengine",
-)
-# OpenAI 兼容接口的默认 base_url（可被调用方 base_url 覆盖）
-OPENAI_COMPATIBLE_BASE_URLS = {
-    "1route": "https://www.1route.dev/v1",
-    "openai": "https://api.openai.com/v1",
-    "openrouter": "https://openrouter.ai/api/v1",
-    "longcat": "https://api.longcat.chat/openai",
-    "efficiency": "",
-    "openai_compatible": "",
-    "zhipu": "https://open.bigmodel.cn/api/paas/v4",
-    "minimax": "https://api.minimax.chat/v1",
-    "deepseek": "https://api.deepseek.com/v1",
-    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "volcengine": "https://ark.cn-beijing.volces.com/api/v3",
-}
-DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
-GEMINI_MODELS = (
-    DEFAULT_GEMINI_MODEL,
-    "gemini-2.5-flash-lite",
-    "gemini-3-pro-preview",
-    "gemini-3-flash-preview",
-)
+__all__ = [
+    "DEFAULT_GEMINI_MODEL",
+    "GEMINI_MODELS",
+    "OPENAI_COMPATIBLE_BASE_URLS",
+    "PROVIDER_LABELS",
+    "SUPPORTED_PROVIDERS",
+    "call_llm",
+    "get_provider_credentials",
+]
+
 GEMINI_MAX_OUTPUT_TOKENS_DEFAULT = 32768
 GEMINI_MAX_RETRIES = 3
 GEMINI_RETRY_DELAY = 2.0
-
-# 供应商展示名（供 UI selectbox 的 format_func 使用）
-PROVIDER_LABELS: dict[str, str] = {
-    "1route": "1Route（推荐）",
-    "gemini": "Gemini",
-    "openai": "OpenAI",
-    "openrouter": "OpenRouter",
-    "longcat": "LongCat",
-    "efficiency": "Efficiency（OpenAI兼容）",
-    "openai_compatible": "OpenAI兼容",
-    "zhipu": "智谱",
-    "minimax": "Minimax",
-    "deepseek": "DeepSeek",
-    "qwen": "Qwen",
-    "volcengine": "火山引擎",
-}
 
 
 def get_provider_credentials(provider: str) -> tuple[str, str, str]:
@@ -133,7 +96,7 @@ def call_llm(
     调用大模型，返回回复文本。
 
     Args:
-        provider: 供应商，当前仅支持 "gemini"。
+        provider: 供应商名称。
         model: 模型名，如 gemini-3.1-flash-lite-preview。
         api_key: 对应供应商的 API Key。
         system_prompt: 系统提示词（Alpha 投委会等）。
@@ -155,9 +118,7 @@ def call_llm(
     if provider not in SUPPORTED_PROVIDERS:
         raise ValueError(f"不支持的供应商: {provider}，当前仅支持: {SUPPORTED_PROVIDERS}")
 
-    # ── Phase 2: LiteLLM 路由开关 ──────────────────────────────
-    # 当 LITELLM_ENABLED=1 时，走 LiteLLM 统一适配层。
-    # 带 images 参数时降级为原生实现（LiteLLM 暂不支持 Gemini 多模态）。
+    # LiteLLM handles text-only provider routing; image payloads stay on the native Gemini path.
     if os.environ.get("LITELLM_ENABLED", "").strip() in ("1", "true", "yes"):
         if not images:
             try:
@@ -183,8 +144,6 @@ def call_llm(
                 logger.warning("[llm] LiteLLM not installed, falling back to native implementation")
         else:
             logger.info("[llm] LITELLM_ENABLED=1 but images present, using native Gemini implementation")
-    # ── /Phase 2 ────────────────────────────────────────────────
-
     if provider == "gemini":
         return _call_gemini(
             model=model,

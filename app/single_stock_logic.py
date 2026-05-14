@@ -273,9 +273,8 @@ def _validate_plot_code(code_block: str) -> tuple[bool, str]:
             return (False, f"不允许的语句: {type(node).__name__}")
         if isinstance(node, ast.Name) and node.id in DISALLOWED_NAMES:
             return (False, f"不允许的标识符: {node.id}")
-        if isinstance(node, ast.Attribute):
-            if node.attr in DISALLOWED_ATTRS or node.attr.startswith("__"):
-                return (False, f"不允许的属性访问: {node.attr}")
+        if isinstance(node, ast.Attribute) and (node.attr in DISALLOWED_ATTRS or node.attr.startswith("__")):
+            return (False, f"不允许的属性访问: {node.attr}")
         if isinstance(node, ast.Call):
             fn = node.func
             if isinstance(fn, ast.Name) and fn.id in DISALLOWED_NAMES:
@@ -380,7 +379,7 @@ def render_single_stock_page(
     api_key,
     *,
     base_url: str = "",
-    feishu_webhook: str = "",
+    feishu_webhook: str = "",  # deprecated, kept for caller compat
 ):
     """渲染单股分析页面"""
     st.markdown("### 🔍 威科夫单股分析 (大师模式)")
@@ -389,7 +388,7 @@ def render_single_stock_page(
     col1, col2 = st.columns([1, 1])
     with col1:
         stock_input = st.text_input(
-            "股票代码", placeholder="例如：600519", help="请输入单个 A 股代码", key="single_stock_code"
+            "股票代码", placeholder="例如：601318", help="请输入单个 A 股代码", key="single_stock_code"
         )
     with col2:
         uploaded_file = st.file_uploader(
@@ -416,7 +415,6 @@ def render_single_stock_page(
             model,
             api_key,
             base_url=base_url,
-            feishu_webhook=feishu_webhook,
         )
 
 
@@ -428,7 +426,6 @@ def _run_analysis(
     api_key,
     *,
     base_url: str = "",
-    feishu_webhook: str = "",
 ):
     """执行分析流程"""
     end_calendar = date.today() - timedelta(days=1)
@@ -448,7 +445,7 @@ def _run_analysis(
         df_hist = _run_with_timeout(
             "历史行情拉取",
             SINGLE_STOCK_FETCH_TIMEOUT_S,
-            lambda: _fetch_hist(symbol, window, ADJUST),
+            lambda: _fetch_hist(symbol, window, ADJUST, user_id=st.session_state.get("user", {}).get("id", "")),
         )
         try:
             sector = _run_with_timeout(
@@ -560,23 +557,6 @@ def _run_analysis(
         report_text = _strip_code_blocks_for_ui(response_text)
         st.markdown("### 📝 威科夫大师研报")
         st.markdown(report_text or "（研报正文已生成）")
-
-        try:
-            from utils.notify import send_all_webhooks
-
-            effective_feishu_webhook = (
-                str(feishu_webhook or "").strip() or str(st.session_state.get("feishu_webhook") or "").strip()
-            )
-            send_all_webhooks(
-                effective_feishu_webhook,
-                st.session_state.get("wecom_webhook") or "",
-                st.session_state.get("dingtalk_webhook") or "",
-                f"AI 深度研报 (单股 - {symbol})",
-                response_text,
-            )
-        except Exception as e:
-            traceback.print_exc()
-            st.toast(f"通知推送失败: {e}", icon="⚠️")
 
         if code_block:
             st.markdown("### 📊 结构标注图")

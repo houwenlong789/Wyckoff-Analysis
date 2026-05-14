@@ -19,6 +19,7 @@ pillow>=10.0.0
 
 # ── agent framework ──
 google-adk>=1.0.0
+deprecated>=1.2.0
 litellm>=1.40.0
 
 # ── dev / test ──

@@ -71,29 +71,9 @@ def test_validate_compliance_report_blocks_codes_names_and_action_terms():
     assert any(reason.startswith("contains_term:") for reason in result.reasons)
 
 
-def test_resolve_compliance_llm_prefers_openrouter(monkeypatch):
-    from core.compliance_report import OPENROUTER_BASE_URL, resolve_compliance_llm_config
-
-    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-    monkeypatch.setenv("OPENROUTER_MODEL", "tencent/hy3-preview:free")
-    monkeypatch.setenv("EFFICIENCY_API_KEY", "eff-key")
-    monkeypatch.setenv("EFFICIENCY_MODEL", "longcat")
-    monkeypatch.setenv("EFFICIENCY_BASE_URL", "https://example.com/v1")
-
-    cfg = resolve_compliance_llm_config()
-
-    assert cfg is not None
-    assert cfg.provider == "openrouter"
-    assert cfg.api_key == "or-key"
-    assert cfg.model == "tencent/hy3-preview:free"
-    assert cfg.base_url == OPENROUTER_BASE_URL
-
-
-def test_resolve_compliance_llm_uses_efficiency_when_openrouter_absent(monkeypatch):
+def test_resolve_compliance_llm_uses_efficiency(monkeypatch):
     from core.compliance_report import resolve_compliance_llm_config
 
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
     monkeypatch.setenv("EFFICIENCY_API_KEY", "eff-key")
     monkeypatch.setenv("EFFICIENCY_MODEL", "longcat")
     monkeypatch.setenv("EFFICIENCY_BASE_URL", "https://example.com/v1")
@@ -108,8 +88,6 @@ def test_resolve_compliance_llm_uses_efficiency_when_openrouter_absent(monkeypat
 def test_generate_compliance_brief_fallback_has_no_stock_identifiers(monkeypatch):
     from core.compliance_report import generate_compliance_brief
 
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
     monkeypatch.delenv("EFFICIENCY_API_KEY", raising=False)
     monkeypatch.delenv("EFFICIENCY_MODEL", raising=False)
     monkeypatch.delenv("EFFICIENCY_BASE_URL", raising=False)
@@ -131,8 +109,9 @@ def test_generate_compliance_brief_fallback_has_no_stock_identifiers(monkeypatch
 def test_generate_compliance_brief_rejects_bad_llm_output(monkeypatch):
     import core.compliance_report as cr
 
-    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
-    monkeypatch.setenv("OPENROUTER_MODEL", "tencent/hy3-preview:free")
+    monkeypatch.setenv("EFFICIENCY_API_KEY", "eff-key")
+    monkeypatch.setenv("EFFICIENCY_MODEL", "mimo-v2.5-pro")
+    monkeypatch.setenv("EFFICIENCY_BASE_URL", "https://example.com/v1")
     monkeypatch.setenv("STEP3_COMPLIANCE_MAX_RETRIES", "0")
     monkeypatch.setattr(cr, "call_llm", lambda **kwargs: "600000 浦发银行 可以买入")
 

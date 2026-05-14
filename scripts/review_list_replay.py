@@ -18,8 +18,11 @@ import pandas as pd
 # Ensure project root is on sys.path for direct script invocation
 if __name__ == "__main__" or not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from core.funnel_pipeline import TRIGGER_LABELS, run_funnel_job
+import contextlib
+
+from core.funnel_pipeline import TRIGGER_LABELS
 from core.wyckoff_engine import FunnelConfig, _sorted_if_needed
+from scripts.wyckoff_funnel import run_funnel_job
 from utils.feishu import send_feishu_notification
 
 
@@ -105,6 +108,20 @@ def _build_hit_map(triggers: dict[str, list[tuple[str, float]]]) -> dict[str, li
     return hit_map
 
 
+def _latest_pct_change(df: pd.DataFrame) -> float | None:
+    s = _sorted_if_needed(df)
+    close = pd.to_numeric(s.get("close"), errors="coerce").dropna()
+    if len(close) >= 2:
+        prev_close = float(close.iloc[-2])
+        if prev_close > 0:
+            return (float(close.iloc[-1]) / prev_close - 1.0) * 100.0
+
+    pct = pd.to_numeric(s.get("pct_chg"), errors="coerce")
+    if pct.empty or pd.isna(pct.iloc[-1]):
+        return None
+    return float(pct.iloc[-1])
+
+
 def _find_big_gainers(
     df_map: dict[str, pd.DataFrame],
     name_map: dict[str, str],
@@ -119,11 +136,8 @@ def _find_big_gainers(
             continue
         if df is None or df.empty:
             continue
-        s = _sorted_if_needed(df)
-        pct = pd.to_numeric(s.get("pct_chg"), errors="coerce")
-        if pct.empty or pd.isna(pct.iloc[-1]):
-            continue
-        if float(pct.iloc[-1]) >= threshold:
+        pct = _latest_pct_change(df)
+        if pct is not None and pct >= threshold:
             codes.append(code)
     codes.sort()
     return codes
@@ -158,6 +172,63 @@ def _find_big_gainers_from_spot(
     return codes, usable
 
 
+def _review_spot_min_coverage() -> float:
+    try:
+        value = float(os.getenv("REVIEW_SPOT_MIN_COVERAGE", "0.8"))
+    except ValueError:
+        value = 0.8
+    return min(max(value, 0.0), 1.0)
+
+
+def _load_today_review_codes(all_codes: list[str], name_map_today: dict[str, str], today_window) -> list[str]:
+    review_codes: list[str] = []
+    spot_usable = 0
+    try:
+        from integrations.data_source import _load_spot_snapshot_map
+
+        spot_map = _load_spot_snapshot_map(force_refresh=True)
+        review_codes, spot_usable = _find_big_gainers_from_spot(
+            spot_map=spot_map,
+            name_map=name_map_today,
+            threshold=8.0,
+        )
+        print(
+            "[review] 实时快照加载完成: "
+            f"symbols={len(spot_map or {})}, usable_pct={spot_usable}, "
+            f"big_gainers={len(review_codes)}"
+        )
+    except Exception as e:
+        print(f"[review] 实时快照加载失败，准备回退日线拉取: {e}")
+
+    spot_min_coverage = _review_spot_min_coverage()
+    spot_coverage = spot_usable / max(len(all_codes), 1)
+    if spot_usable > 0 and spot_coverage >= spot_min_coverage:
+        return review_codes
+
+    from tools.data_fetcher import fetch_all_ohlcv
+
+    if spot_usable <= 0:
+        print("[review] 实时快照不可用，回退到两日 OHLCV 拉取")
+    else:
+        print(
+            "[review] 实时快照覆盖不足，回退到两日 OHLCV 拉取: "
+            f"coverage={spot_coverage:.1%}, min={spot_min_coverage:.1%}"
+        )
+    today_df_map, today_fetch_stats = fetch_all_ohlcv(
+        symbols=all_codes,
+        window=today_window,
+        enforce_target_trade_date=True,
+        direct_source=True,
+    )
+    print(
+        "[review] 今日数据拉取完成: "
+        f"ok={today_fetch_stats.get('fetch_ok', len(today_df_map))}, "
+        f"fail={today_fetch_stats.get('fetch_fail', 0)}, "
+        f"target_trade_date={today_window.end_trade_date}"
+    )
+    return _find_big_gainers(today_df_map, name_map_today, threshold=8.0)
+
+
 def _blocked_exit_signal_map(exit_signals: dict[str, dict] | None) -> dict[str, dict]:
     blocked: dict[str, dict] = {}
     for code, raw in (exit_signals or {}).items():
@@ -184,10 +255,8 @@ def _explain_risk_reject(
 
     parts = [signal_label]
     if price is not None:
-        try:
+        with contextlib.suppress(Exception):
             parts.append(f"参考价={float(price):.2f}")
-        except Exception:
-            pass
     if trigger_labels:
         parts.append(f"L4命中={trigger_labels}")
     if reason:
@@ -205,10 +274,7 @@ def _normalize_recommend_date(raw: object) -> str:
     if not s:
         return "日期未知"
     try:
-        if len(s) == 8 and s.isdigit():
-            d = pd.to_datetime(s, format="%Y%m%d")
-        else:
-            d = pd.to_datetime(s)
+        d = pd.to_datetime(s, format="%Y%m%d") if len(s) == 8 and s.isdigit() else pd.to_datetime(s)
         if pd.isna(d):
             return s
         return d.strftime("%Y-%m-%d")
@@ -263,10 +329,8 @@ def _format_recommendation_history(code: str, lookup: dict[str, list[dict]], loa
     dates = sorted({_normalize_recommend_date(row.get("recommend_date")) for row in records}, reverse=True)
     parsed_counts = []
     for row in records:
-        try:
+        with contextlib.suppress(Exception):
             parsed_counts.append(int(row.get("recommend_count") or 0))
-        except Exception:
-            pass
     count = max([len(dates), *parsed_counts]) if parsed_counts else len(dates)
     return f"推荐记录: {'、'.join(dates)} 被推荐过；累计推荐{count}次"
 
@@ -370,7 +434,7 @@ def main() -> int:
     from utils.trading_clock import resolve_end_calendar_day
 
     end_calendar_day = resolve_end_calendar_day()
-    today_window = _resolve_trading_window(end_calendar_day=end_calendar_day, trading_days=1)
+    today_window = _resolve_trading_window(end_calendar_day=end_calendar_day, trading_days=2)
     today = today_window.end_trade_date
     previous_window = _resolve_trading_window(end_calendar_day=today - timedelta(days=1), trading_days=1)
     previous_trade_date = previous_window.end_trade_date
@@ -384,41 +448,7 @@ def main() -> int:
         if isinstance(item, dict) and str(item.get("code", "")).strip()
     }
     all_codes = sorted(name_map_today.keys())
-    review_codes: list[str] = []
-    spot_usable = 0
-    try:
-        from integrations.data_source import _load_spot_snapshot_map
-
-        spot_map = _load_spot_snapshot_map(force_refresh=True)
-        review_codes, spot_usable = _find_big_gainers_from_spot(
-            spot_map=spot_map,
-            name_map=name_map_today,
-            threshold=8.0,
-        )
-        print(
-            "[review] 实时快照加载完成: "
-            f"symbols={len(spot_map or {})}, usable_pct={spot_usable}, "
-            f"big_gainers={len(review_codes)}"
-        )
-    except Exception as e:
-        print(f"[review] 实时快照加载失败，准备回退日线拉取: {e}")
-
-    if spot_usable <= 0:
-        from tools.data_fetcher import fetch_all_ohlcv
-
-        print("[review] 实时快照不可用，回退到一日 OHLCV 拉取")
-        today_df_map, today_fetch_stats = fetch_all_ohlcv(
-            symbols=all_codes,
-            window=today_window,
-            enforce_target_trade_date=True,
-        )
-        print(
-            "[review] 今日数据拉取完成: "
-            f"ok={today_fetch_stats.get('fetch_ok', len(today_df_map))}, "
-            f"fail={today_fetch_stats.get('fetch_fail', 0)}, "
-            f"target_trade_date={today_window.end_trade_date}"
-        )
-        review_codes = _find_big_gainers(today_df_map, name_map_today, threshold=8.0)
+    review_codes = _load_today_review_codes(all_codes, name_map_today, today_window)
 
     if not review_codes:
         print("[review] 今日无涨幅 ≥ 8% 的股票，跳过")
@@ -432,7 +462,7 @@ def main() -> int:
     os.environ["END_CALENDAR_DAY"] = previous_trade_date.strftime("%Y-%m-%d")
 
     try:
-        triggers, metrics = run_funnel_job(include_debug_context=True)
+        triggers, metrics = run_funnel_job(include_debug_context=True, direct_source=True)
     finally:
         if original_end_day:
             os.environ["END_CALENDAR_DAY"] = original_end_day

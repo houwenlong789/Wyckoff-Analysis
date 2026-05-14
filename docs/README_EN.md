@@ -2,13 +2,13 @@
 
 # Wyckoff Trading Agent
 
-**Wyckoff Volume-Price Analysis Agent for China A-Shares — Talk to it like a human, it reads the tape**
+**Wyckoff Volume-Price Analysis Agent for A-shares / Hong Kong stocks / US stocks — Talk to it like a human, it reads the tape**
 
 [![PyPI](https://img.shields.io/pypi/v/youngcan-wyckoff-analysis?color=blue)](https://pypi.org/project/youngcan-wyckoff-analysis/)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](../LICENSE)
 [![Web App](https://img.shields.io/badge/Web-React%20App-0ea5e9.svg)](https://wyckoff-analysis.pages.dev/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B.svg)](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)
+[![Homepage](https://img.shields.io/badge/homepage-Wyckoff%20Homepage-0ea5e9.svg)](https://youngcan-wang.github.io/wyckoff-homepage/)
 
 [中文](../README.md) | [日本語](README_JA.md) | [Español](README_ES.md) | [한국어](README_KO.md) | [Architecture](ARCHITECTURE.md)
 
@@ -21,8 +21,6 @@ Talk to a Wyckoff master in natural language. He commands 10 professional tools 
 Web + CLI + MCP triple channel, Gemini / Claude / OpenAI / DeepSeek multi-model switching, GitHub Actions for fully automated daily runs.
 
 Project homepage: **[youngcan-wang.github.io/wyckoff-homepage](https://youngcan-wang.github.io/wyckoff-homepage/)**
-
-Keyword entries: **[Trading Agent](https://youngcan-wang.github.io/wyckoff-homepage/trading-agent/)** · **[Wyckoff Trading Agent](https://youngcan-wang.github.io/wyckoff-homepage/wyckoff-trading-agent/)** · **[AI Trading Agent](https://youngcan-wang.github.io/wyckoff-homepage/ai-trading-agent/)** · **[Stock Screener Agent](https://youngcan-wang.github.io/wyckoff-homepage/stock-screener-agent/)**
 
 > Risk disclosure: WyckoffAgent is for educational, research, and informational use. It does not provide investment advice, does not account for every personal financial circumstance, and does not guarantee future performance.
 
@@ -64,7 +62,7 @@ Modern React SPA with AI Agent chat, portfolio management, funnel screening, rec
 |:---:|:---:|
 | <img src="screenshots/web-chat.png" width="450" /> | <img src="screenshots/web-screen.png" width="450" /> |
 
-| Recommendation Tracking | Portfolio |
+| Wyckoff Pattern Replay | Portfolio |
 |:---:|:---:|
 | <img src="screenshots/web-track.png" width="450" /> | <img src="screenshots/web-portfolio.png" width="450" /> |
 
@@ -82,13 +80,13 @@ Streamlit powered the early MVP and remains available for data export, single-st
 |---|---|
 | Conversational Agent | Trigger diagnosis, screening, and reports in plain language; the LLM orchestrates tools autonomously; also reads/writes files, executes commands, and fetches web pages |
 | Skills | Built-in slash commands (`/screen`, `/checkup`, `/report`, `/strategy`, `/backtest`) for one-tap complex workflows; user-extensible via `~/.wyckoff/skills/*.md` |
-| Five-Layer Funnel | Full market ~4 500 stocks -> ~30 candidates via six channels + sector resonance + micro triggers |
+| Five-Layer Funnel | A-share full-market scan plus independent Hong Kong / US universes via six channels + sector resonance + micro triggers |
 | AI Three-Camp Report | Logic Bankrupt / Reserve Camp / Springboard — LLM renders an independent verdict |
 | Portfolio Diagnosis | Batch health check: MA structure, accumulation phase, trigger signals, stop-loss status |
 | Private Rebalance | Synthesizes holdings + candidates, outputs EXIT / TRIM / HOLD / PROBE / ATTACK orders, pushes to Telegram |
 | Tail-Buy Strategy | Executes at 13:50, two-stage evaluation (rule scoring + LLM review) for end-of-day entries |
 | Signal Confirmation Pool | L4 trigger signals must pass 1-3 day price confirmation before becoming actionable |
-| Recommendation Tracking | Historical picks auto-sync closing prices and compute cumulative returns |
+| Wyckoff Pattern Replay | Historical picks auto-sync closing prices and compute cumulative returns |
 | Daily-Bar Backtest | Replays post-funnel N-day returns; reports win rate / Sharpe / max drawdown |
 | Pre-Market Risk | A50 futures + VIX monitoring with four alert levels |
 | Local Dashboard | `wyckoff dashboard` — recommendations, signals, portfolio, agent memory, chat logs; dark/light theme, bilingual CN/EN |
@@ -121,7 +119,7 @@ Native terminal workflow with the most complete feature set. Supports background
 ### One-line Install (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YoungCan-Wang/Wyckoff-Analysis/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/YoungCan-Wang/WyckoffTradingAgent/main/install.sh | bash
 ```
 
 Detects Python, installs uv, creates an isolated environment. Run `wyckoff` when done.
@@ -200,8 +198,8 @@ pnpm dev
 Legacy Streamlit local run:
 
 ```bash
-git clone https://github.com/YoungCan-Wang/Wyckoff-Analysis.git
-cd Wyckoff-Analysis
+git clone https://github.com/YoungCan-Wang/WyckoffTradingAgent.git
+cd WyckoffTradingAgent
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run streamlit_app.py
@@ -242,7 +240,7 @@ Tool call order and frequency are decided by the LLM at runtime — no pre-chore
 | L1 | Garbage Filter | Remove ST / BSE / STAR Market; market cap >= 3.5 B CNY; avg daily turnover >= 50 M CNY |
 | L2 | Six-Channel Selection | Rally / Ignition / Stealth / Accumulation / Dry Volume / Support |
 | L3 | Sector Resonance | Top-N industry distribution filter |
-| L4 | Micro Triggers | Spring / LPS / SOS / EVR — four trigger signals |
+| L4 | Micro Triggers | Spring / LPS / SOS / EVR / Compression — five trigger signals |
 | L5 | AI Verdict | LLM three-camp classification: Logic Bankrupt / Reserve / Springboard |
 
 ## Daily Automation
@@ -344,4 +342,4 @@ If this project helps, a GitHub Star is appreciated. If it helps you make money,
 
 ---
 
-[![Star History Chart](https://api.star-history.com/svg?repos=YoungCan-Wang/Wyckoff-Analysis&type=Date)](https://star-history.com/#YoungCan-Wang/Wyckoff-Analysis&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=YoungCan-Wang/WyckoffTradingAgent&type=Date)](https://star-history.com/#YoungCan-Wang/WyckoffTradingAgent&Date)

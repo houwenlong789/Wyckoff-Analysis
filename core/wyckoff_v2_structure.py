@@ -1,9 +1,4 @@
-"""Structure-aware Wyckoff funnel variant.
-
-This module is intentionally independent from the production V1 funnel.  It
-reuses the current L1/L2/L3 filters, then swaps L4 for a dynamic trading-range
-detector so the new strategy can run as a shadow strategy.
-"""
+"""Structure-aware Wyckoff diagnostics."""
 
 from __future__ import annotations
 
@@ -12,18 +7,7 @@ from typing import NamedTuple
 
 import pandas as pd
 
-from core.wyckoff_engine import (
-    FunnelConfig,
-    FunnelResult,
-    _sorted_if_needed,
-    detect_accum_stage,
-    layer1_filter,
-    layer2_strength_detailed,
-    layer3_sector_resonance,
-    layer5_exit_signals,
-)
-
-STRATEGY_ID = "wyckoff_v2_structure"
+from core.wyckoff_engine import FunnelConfig, _sorted_if_needed
 
 
 @dataclass(frozen=True)
@@ -98,9 +82,9 @@ def _swing_values(series: pd.Series, *, kind: str, window: int) -> list[float]:
         span = values.iloc[i - w : i + w + 1].dropna()
         if span.empty:
             continue
-        if kind == "low" and float(current) <= float(span.min()):
-            out.append(float(current))
-        elif kind == "high" and float(current) >= float(span.max()):
+        if (kind == "low" and float(current) <= float(span.min())) or (
+            kind == "high" and float(current) >= float(span.max())
+        ):
             out.append(float(current))
     return out
 
@@ -206,7 +190,7 @@ def detect_structure_triggers(
 ) -> StructureTriggerResult:
     """Run dynamic-TR Spring / SOS / LPS / EVR detection."""
 
-    triggers: dict[str, list[tuple[str, float]]] = {"sos": [], "spring": [], "lps": [], "evr": []}
+    triggers: dict[str, list[tuple[str, float]]] = {"sos": [], "spring": [], "lps": [], "evr": [], "compression": []}
     ranges: dict[str, TradingRange] = {}
     stage_map: dict[str, str] = {}
 
@@ -295,78 +279,9 @@ def detect_structure_triggers(
     return StructureTriggerResult(triggers=triggers, trading_ranges=ranges, stage_map=stage_map)
 
 
-def run_structure_funnel(
-    all_symbols: list[str],
-    df_map: dict[str, pd.DataFrame],
-    bench_df: pd.DataFrame | None,
-    name_map: dict[str, str],
-    market_cap_map: dict[str, float],
-    sector_map: dict[str, str],
-    cfg: FunnelConfig | None = None,
-    *,
-    financial_map: dict[str, dict] | None = None,
-) -> FunnelResult:
-    """Run the shadow V2 funnel.
-
-    V1 remains the benchmark.  V2 deliberately reuses V1 L1/L2/L3 so the only
-    strategy difference is structural L4 trigger detection.
-    """
-
-    cfg = cfg or FunnelConfig()
-    prepared_df_map: dict[str, pd.DataFrame] = {
-        sym: _sorted_if_needed(df) for sym, df in df_map.items() if df is not None and not df.empty
-    }
-    l1 = layer1_filter(
-        all_symbols,
-        name_map,
-        market_cap_map,
-        prepared_df_map,
-        cfg,
-        financial_map=financial_map,
-    )
-    l2, channel_map, _pre_ign = layer2_strength_detailed(
-        l1,
-        prepared_df_map,
-        bench_df,
-        cfg,
-        rps_universe=list(prepared_df_map.keys()),
-    )
-    l3, top_sectors = layer3_sector_resonance(
-        l2,
-        sector_map,
-        cfg,
-        base_symbols=l1,
-        df_map=prepared_df_map,
-    )
-    structure = detect_structure_triggers(l3, prepared_df_map, cfg)
-
-    accum_stage_map = detect_accum_stage(l2, prepared_df_map, cfg)
-    stage_map = {**accum_stage_map, **structure.stage_map}
-    markup_symbols = [code for code, stage in stage_map.items() if stage == "Markup"]
-    channel_map_v2 = dict(channel_map)
-    for code in structure.trading_ranges:
-        existing = str(channel_map_v2.get(code, "")).strip()
-        channel_map_v2[code] = f"{existing}+结构TR" if existing else "结构TR"
-
-    exit_signals = layer5_exit_signals(l2 + markup_symbols, prepared_df_map, accum_stage_map, cfg)
-    return FunnelResult(
-        layer1_symbols=l1,
-        layer2_symbols=l2,
-        layer3_symbols=l3,
-        top_sectors=top_sectors,
-        triggers=structure.triggers,
-        stage_map=stage_map,
-        markup_symbols=markup_symbols,
-        exit_signals=exit_signals,
-        channel_map=channel_map_v2,
-    )
-
-
 __all__ = [
-    "STRATEGY_ID",
     "StructureTriggerResult",
     "TradingRange",
     "detect_structure_triggers",
     "identify_trading_range",
-    "run_structure_funnel",
 ]

@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
-from cli.compaction import compact_messages
+from cli.compaction import compact_messages, shrink_stale_tool_results
 from cli.loop_guard import (
     MAX_INCOMPLETE_TOOL_RETRIES,
     MAX_TOOL_ROUNDS,
@@ -34,6 +34,44 @@ from cli.tools import ToolRegistry
 logger = logging.getLogger(__name__)
 
 RuntimeEvent = dict[str, Any]
+
+STREAM_CHUNK_TIMEOUT = 60.0
+
+
+def _iter_with_timeout(stream, timeout: float):
+    """包装流式迭代器，chunk 间超过 timeout 秒无数据则抛出 TimeoutError。
+
+    使用独立 daemon 线程 + Queue 实现：半开连接卡死时，主线程在 queue.get
+    超时后立即抛出，不等待僵死的生产线程（daemon 线程随进程退出自动回收）。
+    """
+    import queue
+    import threading
+
+    _SENTINEL = None
+    _EXCEPTION = object()
+    q: queue.Queue = queue.Queue()
+
+    def _producer():
+        try:
+            for chunk in stream:
+                q.put(chunk)
+            q.put(_SENTINEL)
+        except BaseException as exc:
+            q.put((_EXCEPTION, exc))
+
+    t = threading.Thread(target=_producer, daemon=True)
+    t.start()
+
+    while True:
+        try:
+            item = q.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError(f"模型响应超时（{timeout:.0f}s 内无数据）") from None
+        if item is _SENTINEL:
+            return
+        if isinstance(item, tuple) and len(item) == 2 and item[0] is _EXCEPTION:
+            raise item[1]
+        yield item
 
 
 @dataclass
@@ -101,9 +139,14 @@ class AgentRuntime:
         model_name = getattr(self.provider, "name", "")
 
         for round_idx in range(self.max_tool_rounds):
+            if round_idx > 0:
+                shrink_stale_tool_results(messages)
             messages, event = self._compact_if_needed(messages, model_name)
             if event:
                 yield event
+
+            if round_idx > 0:
+                yield {"type": "model_start", "round": round_idx + 1}
 
             round_state = yield from self._collect_model_round(messages, system_prompt, round_idx + 1)
             self._accumulate_usage(state, round_state)
@@ -152,7 +195,8 @@ class AgentRuntime:
         round_number: int,
     ) -> Iterator[RuntimeEvent | RoundState]:
         round_state = RoundState()
-        for chunk in self.provider.chat_stream(messages, self.tools.schemas(), system_prompt):
+        stream = self.provider.chat_stream(messages, self.tools.schemas(), system_prompt)
+        for chunk in _iter_with_timeout(stream, STREAM_CHUNK_TIMEOUT):
             event = self._consume_model_chunk(round_state, chunk, round_number)
             if event:
                 yield event

@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import sys
+from datetime import date
+from types import ModuleType, SimpleNamespace
+
 import pandas as pd
 
 # ── tools/funnel_config ──
@@ -129,7 +134,7 @@ class TestCandidateRanker:
         assert isinstance(TRIGGER_LABELS, dict)
         assert "sos" in TRIGGER_LABELS
         assert "spring" in TRIGGER_LABELS
-        assert len(TRIGGER_LABELS) == 4
+        assert len(TRIGGER_LABELS) == 5
 
 
 # ── tools/market_regime ──
@@ -166,13 +171,84 @@ class TestDataFetcher:
         assert latest_trade_date_from_hist(df) is None
 
     def test_latest_trade_date_from_hist_valid(self):
-        from datetime import date
-
         from tools.data_fetcher import latest_trade_date_from_hist
 
         df = pd.DataFrame({"date": ["2025-01-01", "2025-01-02"]})
         result = latest_trade_date_from_hist(df)
         assert result == date(2025, 1, 2)
+
+    def test_tickflow_batch_partial_returns_none(self, monkeypatch):
+        import tools.data_fetcher as dfetcher
+
+        class FakeTickFlowClient:
+            def __init__(self, api_key: str) -> None:
+                self.api_key = api_key
+
+            def get_klines_batch(self, *args, **kwargs):
+                return {
+                    "000001.SZ": pd.DataFrame(
+                        {
+                            "date": ["2025-01-01", "2025-01-02"],
+                            "open": [10.0, 10.1],
+                            "high": [10.5, 10.6],
+                            "low": [9.8, 9.9],
+                            "close": [10.2, 10.3],
+                            "volume": [1000, 1100],
+                        }
+                    )
+                }
+
+        window = SimpleNamespace(start_trade_date=date(2025, 1, 1), end_trade_date=date(2025, 1, 2))
+        monkeypatch.setenv("TICKFLOW_API_KEY", "dummy")
+        monkeypatch.setattr(dfetcher, "TICKFLOW_BATCH_ENABLED", True)
+        monkeypatch.setattr(dfetcher, "TickFlowClient", FakeTickFlowClient)
+
+        result = dfetcher._fetch_all_ohlcv_tickflow_batch(["000001", "000002"], window, False, 200, 0)
+
+        assert result is None
+
+    def test_fetch_hist_direct_source_bypasses_cached_repository(self, monkeypatch):
+        import integrations.data_source as data_source
+        import integrations.fetch_a_share_csv as fetch_csv
+        import tools.data_fetcher as dfetcher
+
+        calls: list[dict] = []
+
+        def fake_source(**kwargs):
+            calls.append(kwargs)
+            return pd.DataFrame(
+                {
+                    "日期": ["2026-05-12", "2026-05-13"],
+                    "开盘": [10.0, 10.5],
+                    "最高": [10.2, 10.8],
+                    "最低": [9.9, 10.4],
+                    "收盘": [10.1, 10.7],
+                    "成交量": [1000, 1200],
+                    "成交额": [10100, 12840],
+                    "涨跌幅": [0.0, 5.94],
+                    "换手率": [pd.NA, pd.NA],
+                    "振幅": [pd.NA, pd.NA],
+                }
+            )
+
+        def cached_fetch(**kwargs):
+            raise AssertionError(f"should bypass cached repository: {kwargs}")
+
+        monkeypatch.setattr(data_source, "fetch_stock_hist", fake_source)
+        monkeypatch.setattr(fetch_csv, "_fetch_hist", cached_fetch)
+        window = SimpleNamespace(start_trade_date=date(2026, 5, 12), end_trade_date=date(2026, 5, 13))
+
+        result = dfetcher._fetch_hist("000001", window, "qfq", direct_source=True)
+
+        assert result["close"].tolist() == [10.1, 10.7]
+        assert calls == [
+            {
+                "symbol": "000001",
+                "start": date(2026, 5, 12),
+                "end": date(2026, 5, 13),
+                "adjust": "qfq",
+            }
+        ]
 
 
 # ── tools/symbol_pool ──
@@ -183,6 +259,33 @@ class TestSymbolPool:
         from tools.symbol_pool import _stock_name_map
 
         assert callable(_stock_name_map)
+
+    def test_screen_stocks_accepts_mcp_main_chinext_alias(self, monkeypatch):
+        from agents import chat_tools
+
+        captured_env = {}
+        fake_pipeline = ModuleType("scripts.wyckoff_funnel")
+
+        def fake_run_funnel(*args, **kwargs):
+            captured_env["mode"] = os.environ.get("FUNNEL_POOL_MODE")
+            captured_env["board"] = os.environ.get("FUNNEL_POOL_BOARD")
+            captured_env["executor"] = os.environ.get("FUNNEL_EXECUTOR_MODE")
+            return True, [], {}, {"metrics": {}, "triggers": {}, "name_map": {}}
+
+        fake_pipeline.run = fake_run_funnel
+        monkeypatch.setitem(sys.modules, "scripts.wyckoff_funnel", fake_pipeline)
+        monkeypatch.setattr(chat_tools, "_ensure_tushare_token", lambda tool_context: None)
+        monkeypatch.setenv("FUNNEL_POOL_MODE", "manual")
+        monkeypatch.setenv("FUNNEL_POOL_BOARD", "chinext")
+        monkeypatch.setenv("FUNNEL_EXECUTOR_MODE", "process")
+
+        result = chat_tools.screen_stocks(board="main_chinext")
+
+        assert "error" not in result
+        assert captured_env == {"mode": "board", "board": "all", "executor": "thread"}
+        assert os.environ["FUNNEL_POOL_MODE"] == "manual"
+        assert os.environ["FUNNEL_POOL_BOARD"] == "chinext"
+        assert os.environ["FUNNEL_EXECUTOR_MODE"] == "process"
 
 
 # ── core/strategy bridge ──

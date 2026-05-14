@@ -1,8 +1,8 @@
 [project]
 name = "youngcan-wyckoff-analysis"
-version = "0.7.15"
+version = "0.8.4"
 requires-python = ">=3.11"
-description = "Wyckoff method quantitative analysis system for A-shares"
+description = "Wyckoff method quantitative analysis system for A-shares, Hong Kong stocks, and US stocks"
 readme = "README.md"
 license = "AGPL-3.0-only"
 authors = [{ name = "youngcan" }]
@@ -56,7 +56,13 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["agents*", "app*", "cli*", "core*", "integrations*", "tools*", "utils*", "scripts*"]
+include = ["agents*", "app*", "cli*", "core*", "integrations*", "pages*", "tools*", "utils*", "scripts*"]
+
+[tool.setuptools.data-files]
+"share/youngcan-wyckoff-analysis/market_universes" = [
+    "data/market_universes/*.json",
+    "data/market_universes/*.txt",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -68,6 +74,9 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
 ignore = ["E501", "E402", "E741", "B904", "B905"]
+
+[tool.ruff.lint.isort]
+known-third-party = ["supabase"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B011", "S101"]

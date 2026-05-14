@@ -1,6 +1,6 @@
 import random
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -72,9 +72,7 @@ def _maybe_cleanup_export_artifacts() -> None:
 # 增加网络请求重试机制，应对 RemoteDisconnected 等反爬限制
 def _should_retry_fetch(e: Exception) -> bool:
     # 明确的"数据源全失败"不应重试，否则页面会长时间卡在加载中
-    if is_data_source_failure_message(str(e)):
-        return False
-    return True
+    return not is_data_source_failure_message(str(e))
 
 
 @retry(
@@ -84,12 +82,14 @@ def _should_retry_fetch(e: Exception) -> bool:
     reraise=True,
 )
 def _fetch_hist_with_retry(symbol, window, adjust):
+    uid = st.session_state.get("user", {}).get("id", "")
     return get_stock_hist(
         symbol=symbol,
         start_date=window.start_trade_date,
         end_date=window.end_trade_date,
         adjust=adjust or "",
         context="web",
+        user_id=uid,
     )
 
 
@@ -166,7 +166,7 @@ with content_col:
             batch_symbols_text = st.text_area(
                 "股票代码列表（支持粘贴混合文本）",
                 value="",
-                placeholder="例如：000973;600798;300459（; 或 ；均可）",
+                placeholder="例如：601318;000001;600519（; 或 ；均可）",
                 help="用分号（; 或 ；）分隔，系统会提取其中的 6 位数字作为股票代码（自动去重）。",
             )
 
@@ -229,7 +229,7 @@ with content_col:
                     "选择股票 (支持代码或名称搜索)",
                     options=stock_options,
                     index=default_index,
-                    help="输入代码（如 300364）或名称（如 中文在线）进行搜索",
+                    help="输入代码（如 601318）或名称（如 中国平安）进行搜索",
                     key="stock_selector",
                 )
 
@@ -248,7 +248,7 @@ with content_col:
                 symbol_input = st.text_input(
                     "股票代码 (必填)",
                     value=st.session_state.current_symbol,
-                    help="请输入 6 位股票代码，例如 300364",
+                    help="请输入 6 位股票代码，例如 601318",
                     key="symbol_input_widget",
                 )
                 if symbol_input != st.session_state.current_symbol:
@@ -409,31 +409,6 @@ with content_col:
                         zip_members,
                         prefix=file_name_zip.replace(".zip", ""),
                     )
-
-                    # 通知：飞书 + 企微 + 钉钉（任一配置则发送）
-                    feishu = st.session_state.get("feishu_webhook") or ""
-                    wecom = st.session_state.get("wecom_webhook") or ""
-                    dingtalk = st.session_state.get("dingtalk_webhook") or ""
-                    if feishu or wecom or dingtalk:
-                        success_count = len([r for r in results if r["status"] == "ok"])
-                        failed_count = len(results) - success_count
-                        notify_title = f"📦 批量下载完成 ({success_count}/{len(symbols)})"
-                        notify_text = (
-                            f"**任务状态**: 已完成\n"
-                            f"**成功**: {success_count} 个\n"
-                            f"**失败**: {failed_count} 个\n"
-                            f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                            f"**文件**: {file_name_zip}"
-                        )
-                        if failed_count > 0:
-                            failed_details = "\\n".join(
-                                [f"- {r['symbol']}: {r['error']}" for r in results if r["status"] != "ok"]
-                            )
-                            notify_text += f"\\n\\n**失败详情**:\\n{failed_details}"
-                        from utils.notify import send_all_webhooks
-
-                        send_all_webhooks(feishu, wecom, dingtalk, notify_title, notify_text)
-                        st.toast("✅ 通知已发送", icon="🔔")
 
                 finally:
                     loading.empty()

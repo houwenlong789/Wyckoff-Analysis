@@ -39,8 +39,9 @@ from core.tail_buy_strategy import (
     score_tail_features,
     select_llm_overlay_candidates,
 )
+from integrations._llm_types import DEFAULT_GEMINI_MODEL, OPENAI_COMPATIBLE_BASE_URLS
 from integrations.fetch_a_share_csv import _resolve_trading_window
-from integrations.llm_client import DEFAULT_GEMINI_MODEL, OPENAI_COMPATIBLE_BASE_URLS, call_llm
+from integrations.llm_client import call_llm
 from integrations.supabase_base import create_admin_client, is_admin_configured
 from integrations.supabase_market_signal import (
     load_latest_market_signal_daily,
@@ -48,7 +49,7 @@ from integrations.supabase_market_signal import (
 )
 from integrations.supabase_portfolio import load_portfolio_state
 from integrations.tickflow_client import TickFlowClient, normalize_cn_symbol
-from integrations.tickflow_notice import TICKFLOW_LIMIT_HINT, is_tickflow_rate_limited_error
+from integrations.tickflow_notice import TICKFLOW_LIMIT_HINT, TICKFLOW_UPGRADE_URL, is_tickflow_rate_limited_error
 from utils.feishu import send_feishu_notification, send_tail_buy_card
 from utils.notify import send_to_telegram
 from utils.trading_clock import is_a_share_trading_day
@@ -213,7 +214,7 @@ def _safe_bool(raw: Any) -> bool:
 
 def _resolve_quote_price(quote: dict[str, Any] | None) -> float:
     row = quote or {}
-    for key in ("close", "last", "price", "current", "open"):
+    for key in ("last_price", "close", "last", "price", "current"):
         value = _safe_float(row.get(key), 0.0)
         if value > 0:
             return value
@@ -403,7 +404,7 @@ def _analyze_holdings_actions(
         return [], False, meta
 
     symbols = [normalize_cn_symbol(p["code"]) for p in positions]
-    symbol_set = sorted(set([s for s in symbols if s]))
+    symbol_set = sorted({s for s in symbols if s})
     _log(
         f"持仓动作分析开始: requested={requested_portfolio_id}, resolved={resolved_portfolio_id}, "
         f"positions={len(positions)}, symbols={len(symbol_set)}",
@@ -1212,7 +1213,7 @@ def _build_llm_routes(
         base_url=primary_base_url,
     )
 
-    # fallback: NVIDIA Kimi K2（仅当前主路由失败时使用）
+    # NVIDIA Kimi K2 作为主路由失败时的备用模型。
     nvidia_key = os.getenv("NVIDIA_API_KEY", "").strip()
     nvidia_base = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1").strip()
     nvidia_kimi = os.getenv("NVIDIA_MODEL_KIMI", "").strip()
@@ -1287,6 +1288,7 @@ def main() -> int:
         default=_default_tail_buy_portfolio_id(),
     )
     parser.add_argument("--logs", default=None, help="日志路径")
+    parser.add_argument("--user-id", default=os.getenv("SUPABASE_USER_ID", "").strip(), help="目标用户ID")
     args = parser.parse_args()
 
     started_at = _now()
@@ -1365,7 +1367,7 @@ def main() -> int:
     )
 
     if not tickflow_api_key:
-        _log(f"缺少 TICKFLOW_API_KEY，Tail Buy 需要分钟级数据。{TICKFLOW_UPGRADE_HINT}", logs_path)
+        _log(f"缺少 TICKFLOW_API_KEY，Tail Buy 需要分钟级数据，请购买：{TICKFLOW_UPGRADE_URL}", logs_path)
         return 1
     if not feishu_webhook:
         _log("缺少 FEISHU_WEBHOOK_URL，Tail Buy 需要至少配置飞书推送；Telegram 为可选通道。", logs_path)
@@ -1540,7 +1542,7 @@ def main() -> int:
         if buy_rows:
             from integrations.supabase_tail_buy import save_tail_buy_to_supabase
 
-            n_sb = save_tail_buy_to_supabase(buy_rows)
+            n_sb = save_tail_buy_to_supabase(buy_rows, user_id=args.user_id)
             _log(f"已写入 {n_sb} 条 BUY 到 Supabase", logs_path)
     except Exception as e:
         _log(f"写入 SQLite 失败（不影响推送）: {e}", logs_path)

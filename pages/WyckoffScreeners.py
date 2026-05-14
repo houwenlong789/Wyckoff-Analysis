@@ -22,6 +22,7 @@ TRIGGER_LABELS = {
     "spring": "Spring（终极震仓）",
     "lps": "LPS（缩量回踩）",
     "evr": "Effort vs Result（放量不跌）",
+    "compression": "Compression（压缩蓄势）",
 }
 STATE_KEY = "funnel_background_job"
 
@@ -146,7 +147,7 @@ with content_col:
     board = "all"
     manual_symbols = ""
     if pool_mode == "手动输入":
-        manual_symbols = st.text_area("股票代码", placeholder="例如: 600519, 000001", height=120)
+        manual_symbols = st.text_area("股票代码", placeholder="例如: 601318", height=120)
     else:
         board = st.selectbox(
             "选择板块",

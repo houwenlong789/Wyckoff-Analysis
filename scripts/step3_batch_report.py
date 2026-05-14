@@ -112,7 +112,7 @@ HIGHLIGHT_PCT_THRESHOLD = 5.0
 HIGHLIGHT_VOL_RATIO = 2.0
 from tools.debug_io import dump_model_input as _dump_model_input_shared
 
-# 已按策略要求关闭"目标交易日强校验"，避免数据源时差导致候选被整批跳过。
+# 目标交易日只用于提示，不作为整批候选过滤条件。
 ENFORCE_TARGET_TRADE_DATE = False
 SUPPLY_HEAVY_VOL_RATIO = 1.5
 SUPPLY_DRY_VOL_RATIO = 0.8
@@ -428,13 +428,15 @@ def _resolve_step3_context_cap(raw_count: int) -> int:
 def _has_upstream_priority_context(candidates_df: pd.DataFrame) -> bool:
     if not STEP3_RESPECT_UPSTREAM_PRIORITY or candidates_df is None or candidates_df.empty:
         return False
-    if "priority_score" in candidates_df.columns:
-        if pd.to_numeric(candidates_df["priority_score"], errors="coerce").notna().any():
-            return True
-    if "selection_source" in candidates_df.columns:
-        if candidates_df["selection_source"].astype(str).str.strip().ne("").any():
-            return True
-    return False
+    if (
+        "priority_score" in candidates_df.columns
+        and pd.to_numeric(candidates_df["priority_score"], errors="coerce").notna().any()
+    ):
+        return True
+    return (
+        "selection_source" in candidates_df.columns
+        and candidates_df["selection_source"].astype(str).str.strip().ne("").any()
+    )
 
 
 def _select_upstream_priority_candidates(
@@ -583,7 +585,7 @@ def _call_track_report(
         report = report.rstrip() + "\n\n" + _build_fallback_sections(selected_df)
 
     # 校验：检测报告中出现但不属于本轨输入集的股票代码（模型幻觉）
-    input_set = set(str(c).strip() for c in selected_codes)
+    input_set = {str(c).strip() for c in selected_codes}
     mentioned = set(re.findall(r"\b(\d{6})\b", report))
     leaked = mentioned - input_set
     if leaked:
@@ -591,6 +593,15 @@ def _call_track_report(
         report += f"\n\n> ⚠ 以下代码不在{track}轨输入集中，可能为模型幻觉: {', '.join(sorted(leaked))}"
 
     return (True, report, used_model or model)
+
+
+def _fill_wyckoff_score(df: pd.DataFrame) -> None:
+    """priority_score 优先，缺失时回退到 funnel_score。"""
+    df["wyckoff_score"] = pd.to_numeric(df.get("priority_score"), errors="coerce")
+    df["wyckoff_score"] = df["wyckoff_score"].where(
+        df["wyckoff_score"].notna(),
+        pd.to_numeric(df.get("funnel_score"), errors="coerce"),
+    )
 
 
 def run(
@@ -768,6 +779,7 @@ def run(
                     "bias_200": bias_200,
                     "rs_10": rs_10,
                     "min_vol_ratio_5d": min_vol_ratio_5d,
+                    "springboard_grade": str(item.get("springboard_grade", "") or ""),
                 }
             )
         except Exception as e:
@@ -790,14 +802,7 @@ def run(
     candidates_df.loc[~candidates_df["track"].isin(["Trend", "Accum"]), "track"] = "Trend"
     candidates_df["policy_tag"] = ""
     selected_df = candidates_df.copy()
-    selected_df["wyckoff_score"] = pd.to_numeric(
-        selected_df.get("priority_score"),
-        errors="coerce",
-    )
-    selected_df["wyckoff_score"] = selected_df["wyckoff_score"].where(
-        selected_df["wyckoff_score"].notna(),
-        pd.to_numeric(selected_df.get("funnel_score"), errors="coerce"),
-    )
+    _fill_wyckoff_score(selected_df)
     selected_df["industry_rank"] = pd.NA
     effective_context_cap = _resolve_step3_context_cap(len(candidates_df))
 
@@ -842,14 +847,7 @@ def run(
             f"default_cap={STEP3_DEFAULT_CONTEXT_CAP})"
         )
 
-    selected_df["wyckoff_score"] = pd.to_numeric(
-        selected_df.get("priority_score"),
-        errors="coerce",
-    )
-    selected_df["wyckoff_score"] = selected_df["wyckoff_score"].where(
-        selected_df["wyckoff_score"].notna(),
-        pd.to_numeric(selected_df.get("funnel_score"), errors="coerce"),
-    )
+    _fill_wyckoff_score(selected_df)
     if "industry_rank" not in selected_df.columns:
         selected_df["industry_rank"] = pd.NA
 
@@ -1031,6 +1029,7 @@ def run(
             exit_price=_exit_price,
             exit_reason=_exit_reason,
             financial_metrics=financial_map.get(code),
+            springboard_grade=str(row.get("springboard_grade", "")).strip() or None,
         )
         payloads_by_track.setdefault(track_key, []).append(payload)
         df_by_track[track_key] = pd.concat(

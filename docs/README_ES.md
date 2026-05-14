@@ -2,13 +2,13 @@
 
 # Wyckoff Trading Agent
 
-**Sistema cuantitativo Wyckoff para acciones A de China — hablas con naturalidad, el agente lee el mercado**
+**Sistema cuantitativo Wyckoff para acciones A, Hong Kong y EE. UU. — hablas con naturalidad, el agente lee el mercado**
 
 [![PyPI](https://img.shields.io/pypi/v/youngcan-wyckoff-analysis?color=blue)](https://pypi.org/project/youngcan-wyckoff-analysis/)
 [![Python](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](../LICENSE)
 [![Web App](https://img.shields.io/badge/Web-React%20App-0ea5e9.svg)](https://wyckoff-analysis.pages.dev/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B.svg)](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)
+[![Homepage](https://img.shields.io/badge/homepage-Wyckoff%20Homepage-0ea5e9.svg)](https://youngcan-wang.github.io/wyckoff-homepage/)
 
 [中文](../README.md) | [English](README_EN.md) | [日本語](README_JA.md) | [한국어](README_KO.md) | [Arquitectura](ARCHITECTURE.md)
 
@@ -21,8 +21,6 @@ Conversa en lenguaje natural con un agente IA experto en el metodo Wyckoff. Desp
 Web + CLI + MCP triple canal, compatible con Gemini / Claude / OpenAI / DeepSeek, automatizacion completa via GitHub Actions.
 
 Pagina del proyecto: **[youngcan-wang.github.io/wyckoff-homepage](https://youngcan-wang.github.io/wyckoff-homepage/)**
-
-Entradas por palabra clave: **[Trading Agent](https://youngcan-wang.github.io/wyckoff-homepage/trading-agent/)** · **[Wyckoff Trading Agent](https://youngcan-wang.github.io/wyckoff-homepage/wyckoff-trading-agent/)** · **[AI Trading Agent](https://youngcan-wang.github.io/wyckoff-homepage/ai-trading-agent/)** · **[Stock Screener Agent](https://youngcan-wang.github.io/wyckoff-homepage/stock-screener-agent/)**
 
 > Aviso de riesgo: WyckoffAgent es una herramienta educativa, de investigacion e informacion. No ofrece asesoramiento de inversion, no cubre todas las circunstancias financieras personales y no garantiza resultados futuros.
 
@@ -82,7 +80,7 @@ Streamlit sostuvo el MVP inicial y sigue disponible para exportacion de datos, a
 |-----------|-------------|
 | Agente conversacional | Diagnosticos, filtros y reportes activados con lenguaje natural; el LLM orquesta herramientas de forma autonoma; tambien lee/escribe archivos, ejecuta comandos y obtiene contenido web |
 | Skills | Comandos slash integrados (`/screen`, `/checkup`, `/report`, `/strategy`, `/backtest`) para flujos complejos con un toque; extensible por el usuario via `~/.wyckoff/skills/*.md` |
-| Embudo de 5 capas | ~4 500 acciones del mercado completo se reducen a ~30 candidatas mediante seis canales + resonancia sectorial + micro-disparo |
+| Embudo de 5 capas | Escaneo completo de acciones A y universos independientes de Hong Kong / EE. UU. mediante seis canales + resonancia sectorial + micro-disparo |
 | Reporte IA de 3 campamentos | Logica rota / Reserva / Plataforma de despegue — el LLM clasifica de forma independiente |
 | Diagnostico de cartera | Escaneo masivo: estructura de medias moviles, fase de acumulacion, senales de activacion, estado de stop-loss |
 | Rebalanceo privado | Combina posiciones + candidatas y emite ordenes EXIT / TRIM / HOLD / PROBE / ATTACK, con push a Telegram |
@@ -121,7 +119,7 @@ Flujo nativo de terminal con el conjunto de funciones mas completo. Soporta tare
 ### Instalacion en una linea (recomendado)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YoungCan-Wang/Wyckoff-Analysis/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/YoungCan-Wang/WyckoffTradingAgent/main/install.sh | bash
 ```
 
 Detecta Python, instala uv y crea un entorno aislado. Al finalizar, ejecuta `wyckoff`.
@@ -200,8 +198,8 @@ pnpm dev
 Ejecucion local legacy de Streamlit:
 
 ```bash
-git clone https://github.com/YoungCan-Wang/Wyckoff-Analysis.git
-cd Wyckoff-Analysis
+git clone https://github.com/YoungCan-Wang/WyckoffTradingAgent.git
+cd WyckoffTradingAgent
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run streamlit_app.py
@@ -242,7 +240,7 @@ El orden y la frecuencia de las llamadas los decide el LLM en tiempo real, sin o
 | L1 | Eliminar basura | Excluye ST / BSE / STAR Market; capitalizacion >= 3 500 M CNY; volumen diario >= 50 M CNY |
 | L2 | Seleccion de 6 canales | Impulso / Ignicion / Latente / Acumulacion / Volumen minimo / Soporte |
 | L3 | Resonancia sectorial | Filtro por distribucion Top-N de sectores |
-| L4 | Micro-disparo | Cuatro senales clave: Spring / LPS / SOS / EVR |
+| L4 | Micro-disparo | Cinco senales clave: Spring / LPS / SOS / EVR / Compression |
 | L5 | Juicio IA | Clasificacion LLM en 3 campamentos: Logica rota / Reserva / Plataforma de despegue |
 
 ## Automatizacion diaria
@@ -344,4 +342,4 @@ Si el proyecto te ayuda, una Star se agradece. Si te ayuda a ganar dinero, invit
 
 ---
 
-[![Star History Chart](https://api.star-history.com/svg?repos=YoungCan-Wang/Wyckoff-Analysis&type=Date)](https://star-history.com/#YoungCan-Wang/Wyckoff-Analysis&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=YoungCan-Wang/WyckoffTradingAgent&type=Date)](https://star-history.com/#YoungCan-Wang/WyckoffTradingAgent&Date)

@@ -2,16 +2,16 @@
 读盘室 Agent 端到端提示词效果测试。
 
 验证用户消息 → Agent 是否调了正确工具 → 回复是否符合威科夫人设。
-工具层 mock 掉（不发真实网络请求），但 LLM 用真实模型。
+工具层 mock 掉；真实 LLM 用例默认跳过，避免常规 pytest 误发网络请求。
 
 默认使用 LongCat（OpenAI 兼容），也支持 Gemini。
 
 用法:
     # 使用 LongCat（默认，读 .env 中的 LONGCAT_* 配置）
-    .venv/bin/python -m pytest tests/test_chat_agent_e2e.py -v -s
+    RUN_LIVE_LLM_TESTS=1 .venv/bin/python -m pytest tests/test_chat_agent_e2e.py -v -s
 
     # 使用 Gemini
-    GEMINI_API_KEY=xxx .venv/bin/python -m pytest tests/test_chat_agent_e2e.py -v -s
+    RUN_LIVE_LLM_TESTS=1 GEMINI_API_KEY=xxx .venv/bin/python -m pytest tests/test_chat_agent_e2e.py -v -s
 
     # 直接运行（更详细输出）
     .venv/bin/python tests/test_chat_agent_e2e.py
@@ -55,8 +55,8 @@ else:
     _base_url = ""
 
 skip_no_key = pytest.mark.skipif(
-    not _api_key,
-    reason="Neither LONGCAT_API_KEY nor GEMINI_API_KEY set",
+    not _api_key or os.getenv("RUN_LIVE_LLM_TESTS") != "1",
+    reason="Live LLM e2e tests are opt-in: set RUN_LIVE_LLM_TESTS=1 and provide LONGCAT_API_KEY or GEMINI_API_KEY",
 )
 
 
@@ -95,6 +95,20 @@ MOCK_MARKET_OVERVIEW = {
         "创业板指": {"ts_code": "399006.SZ", "close": 2180.0, "pct_chg": 1.45},
     },
     "source": "mock",
+}
+
+MOCK_MARKET_HISTORY = {
+    "ok": True,
+    "index": {"key": "sse", "symbol": "000001.SH", "name": "上证指数"},
+    "requested_days": 100,
+    "returned_days": 3,
+    "source": "mock",
+    "summary": {"period_return_pct": 1.0, "latest_close": 3383.5},
+    "rows": [
+        {"date": "2026-04-09", "close": 3350.0, "pct_chg": 0.2, "volume": 1000},
+        {"date": "2026-04-10", "close": 3370.0, "pct_chg": 0.6, "volume": 1200},
+        {"date": "2026-04-11", "close": 3383.5, "pct_chg": 0.4, "volume": 1100},
+    ],
 }
 
 MOCK_PRICE_RESULT = {
@@ -242,6 +256,7 @@ class AgentTestHarness:
             "analyze_stock": MOCK_DIAGNOSE_RESULT,
             "portfolio": {"message": "当前没有持仓数据", "positions": []},
             "get_market_overview": MOCK_MARKET_OVERVIEW,
+            "get_market_history": MOCK_MARKET_HISTORY,
             "screen_stocks": {
                 "ok": True,
                 "summary": {"total_scanned": 4500, "layer1_passed": 800, "layer2_passed": 200, "layer3_passed": 50},
@@ -250,7 +265,7 @@ class AgentTestHarness:
             },
             "generate_ai_report": {"ok": True, "report_text": "测试报告", "stock_count": 1},
             "generate_strategy_decision": {"message": "策略分析完成"},
-            "query_history": {"message": "暂无推荐跟踪记录", "records": []},
+            "query_history": {"message": "暂无复盘记录", "records": []},
         }
 
         mock_tools = []

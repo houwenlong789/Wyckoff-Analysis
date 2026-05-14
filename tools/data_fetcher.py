@@ -21,12 +21,13 @@ from concurrent.futures import (
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 
 from core.wyckoff_engine import normalize_hist_from_fetch
 from integrations.data_source import fetch_stock_spot_snapshot
+from integrations.tickflow_client import TickFlowClient, normalize_cn_symbol
 from utils.trading_clock import CN_TZ
 
 # ── 环境变量配置 ──
@@ -36,40 +37,56 @@ RETRY_BASE_DELAY = float(os.getenv("FUNNEL_RETRY_BASE_DELAY", "1.0"))
 SOCKET_TIMEOUT = int(os.getenv("FUNNEL_SOCKET_TIMEOUT", "20"))
 FETCH_TIMEOUT = int(os.getenv("FUNNEL_FETCH_TIMEOUT", "45"))
 BATCH_TIMEOUT = int(os.getenv("FUNNEL_BATCH_TIMEOUT", "420"))
-BATCH_SIZE = int(os.getenv("FUNNEL_BATCH_SIZE", "250"))
-BATCH_SLEEP = float(os.getenv("FUNNEL_BATCH_SLEEP", "2"))
+BATCH_SIZE = int(os.getenv("FUNNEL_BATCH_SIZE", "200"))
+BATCH_SLEEP = float(os.getenv("FUNNEL_BATCH_SLEEP", "0.55"))
 MAX_WORKERS = int(os.getenv("FUNNEL_MAX_WORKERS", "8"))
 EXECUTOR_MODE = os.getenv("FUNNEL_EXECUTOR_MODE", "process").strip().lower()
 if EXECUTOR_MODE not in {"thread", "process"}:
     EXECUTOR_MODE = "process"
+TICKFLOW_BATCH_ENABLED = os.getenv("FUNNEL_ENABLE_TICKFLOW_BATCH", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _normalize_hist(df: pd.DataFrame) -> pd.DataFrame:
     return normalize_hist_from_fetch(df)
 
 
-def _fetch_hist(symbol: str, window, adjust: str) -> pd.DataFrame:
-    from integrations.fetch_a_share_csv import _fetch_hist as _fh
+def _fetch_hist(symbol: str, window, adjust: str, *, direct_source: bool = False) -> pd.DataFrame:
+    if direct_source:
+        from integrations.data_source import fetch_stock_hist
 
-    df = _fh(symbol=symbol, window=window, adjust=adjust)
+        df = fetch_stock_hist(
+            symbol=symbol,
+            start=window.start_trade_date,
+            end=window.end_trade_date,
+            adjust=adjust,
+        )
+    else:
+        from integrations.fetch_a_share_csv import _fetch_hist as _fh
+
+        df = _fh(symbol=symbol, window=window, adjust=adjust)
     return _normalize_hist(df)
 
 
-def _run_with_timeout(sym: str, window, timeout_s: int) -> pd.DataFrame:
+def _run_with_timeout(sym: str, window, timeout_s: int, *, direct_source: bool = False) -> pd.DataFrame:
     """
     在 worker 进程内给单票请求加硬超时（Unix 下用 SIGALRM）。
     若平台不支持 SIGALRM（例如 Windows），则退化为直接调用。
     """
     if timeout_s <= 0:
-        return _fetch_hist(sym, window, "qfq")
+        return _fetch_hist(sym, window, "qfq", direct_source=direct_source)
 
     try:
         import signal
     except Exception:
-        return _fetch_hist(sym, window, "qfq")
+        return _fetch_hist(sym, window, "qfq", direct_source=direct_source)
 
     if not hasattr(signal, "SIGALRM"):
-        return _fetch_hist(sym, window, "qfq")
+        return _fetch_hist(sym, window, "qfq", direct_source=direct_source)
 
     def _alarm_handler(signum, frame):  # pragma: no cover - signal handler
         raise TimeoutError(f"single fetch timeout>{timeout_s}s")
@@ -77,18 +94,23 @@ def _run_with_timeout(sym: str, window, timeout_s: int) -> pd.DataFrame:
     old = signal.signal(signal.SIGALRM, _alarm_handler)
     signal.alarm(timeout_s)
     try:
-        return _fetch_hist(sym, window, "qfq")
+        return _fetch_hist(sym, window, "qfq", direct_source=direct_source)
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old)
 
 
-def fetch_one_with_retry(sym: str, window, max_retries: int = MAX_RETRIES) -> tuple[str, pd.DataFrame | None]:
+def fetch_one_with_retry(
+    sym: str,
+    window,
+    max_retries: int = MAX_RETRIES,
+    direct_source: bool = False,
+) -> tuple[str, pd.DataFrame | None]:
     """在子进程中执行，单票硬超时 + 重试，避免个别数据源卡死拖慢整批。"""
     socket.setdefaulttimeout(SOCKET_TIMEOUT)
     for attempt in range(max_retries):
         try:
-            df = _run_with_timeout(sym, window, FETCH_TIMEOUT)
+            df = _run_with_timeout(sym, window, FETCH_TIMEOUT, direct_source=direct_source)
             return (sym, df)
         except Exception:
             if attempt < max_retries - 1:
@@ -97,19 +119,157 @@ def fetch_one_with_retry(sym: str, window, max_retries: int = MAX_RETRIES) -> tu
     return (sym, None)
 
 
-def fetch_one_with_retry_thread(sym: str, window, max_retries: int = MAX_RETRIES) -> tuple[str, pd.DataFrame | None]:
+def fetch_one_with_retry_thread(
+    sym: str,
+    window,
+    max_retries: int = MAX_RETRIES,
+    direct_source: bool = False,
+) -> tuple[str, pd.DataFrame | None]:
     """
     线程模式：避免 signal，依赖数据源请求超时与重试。
     """
     for attempt in range(max_retries):
         try:
-            df = _fetch_hist(sym, window, "qfq")
+            df = _fetch_hist(sym, window, "qfq", direct_source=direct_source)
             return (sym, df)
         except Exception:
             if attempt < max_retries - 1:
                 delay = RETRY_BASE_DELAY * (attempt + 1)
                 time.sleep(delay)
     return (sym, None)
+
+
+def _tickflow_window_params(window) -> tuple[int, int, int]:
+    start_d = window.start_trade_date
+    end_d = window.end_trade_date
+    start_dt = datetime.combine(start_d, datetime.min.time(), tzinfo=CN_TZ)
+    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time(), tzinfo=CN_TZ) - timedelta(milliseconds=1)
+    day_span = (end_d - start_d).days + 1
+    count = min(max(day_span * 2 + 16, 64), 10000)
+    return int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000), count
+
+
+def _should_use_tickflow_batch() -> bool:
+    return TICKFLOW_BATCH_ENABLED and bool(os.getenv("TICKFLOW_API_KEY", "").strip())
+
+
+def _normalize_batch_df(df: pd.DataFrame, target_trade_date: date | None) -> pd.DataFrame | None:
+    if df is None or df.empty:
+        return None
+    out = _normalize_hist(df)
+    if target_trade_date is None:
+        return out
+    trimmed = out[pd.to_datetime(out["date"], errors="coerce").dt.date <= target_trade_date].copy()
+    return trimmed if not trimmed.empty else None
+
+
+def _fetch_tickflow_daily_batch(
+    client: TickFlowClient,
+    batch: list[str],
+    *,
+    count: int,
+    start_ms: int,
+    end_ms: int,
+    batch_no: int,
+) -> dict[str, pd.DataFrame] | None:
+    try:
+        return client.get_klines_batch(
+            batch,
+            period="1d",
+            count=count,
+            start_time_ms=start_ms,
+            end_time_ms=end_ms,
+            adjust="forward",
+        )
+    except Exception as e:
+        print(f"[funnel] TickFlow 日K批次#{batch_no} 失败: {e}")
+        return None
+
+
+def _merge_tickflow_batch(
+    df_map: dict[str, pd.DataFrame],
+    fetched: dict[str, pd.DataFrame],
+    raw_by_norm: dict[str, str],
+    target_trade_date: date,
+    enforce_target_trade_date: bool,
+) -> int:
+    patched_count = 0
+    for norm_sym, raw_sym in raw_by_norm.items():
+        df = _normalize_batch_df(fetched.get(norm_sym), target_trade_date)
+        if df is None:
+            continue
+        if enforce_target_trade_date and latest_trade_date_from_hist(df) != target_trade_date:
+            df, patched = append_spot_bar_if_needed(raw_sym, df, target_trade_date)
+            patched_count += int(patched)
+        if not enforce_target_trade_date or latest_trade_date_from_hist(df) == target_trade_date:
+            df_map[raw_sym] = df
+    return patched_count
+
+
+def _tickflow_fetch_stats(
+    symbol_count: int,
+    df_map: dict[str, pd.DataFrame],
+    fetch_spot_patched: int,
+    started: float,
+) -> dict[str, int]:
+    elapsed = time.monotonic() - started
+    return {
+        "fetch_ok": len(df_map),
+        "fetch_fail": max(symbol_count - len(df_map), 0),
+        "fetch_date_mismatch": 0,
+        "fetch_spot_patched": fetch_spot_patched,
+        "fetch_elapsed_s": int(elapsed),
+        "fetch_qps": int(len(df_map) / elapsed) if elapsed > 0 else 0,
+    }
+
+
+def _fetch_all_ohlcv_tickflow_batch(
+    symbols: list[str],
+    window,
+    enforce_target_trade_date: bool,
+    batch_size: int,
+    batch_sleep: float,
+) -> tuple[dict[str, pd.DataFrame], dict[str, int]] | None:
+    if not _should_use_tickflow_batch():
+        return None
+    client = TickFlowClient(api_key=os.getenv("TICKFLOW_API_KEY", "").strip())
+    start_ms, end_ms, count = _tickflow_window_params(window)
+    total_batches = (len(symbols) + batch_size - 1) // batch_size if symbols else 0
+    df_map: dict[str, pd.DataFrame] = {}
+    fetch_spot_patched = 0
+    failed_batches = 0
+    started = time.monotonic()
+    print(f"[funnel] TickFlow 批量日K启动: symbols={len(symbols)}, batches={total_batches}, batch_size={batch_size}")
+    for index in range(0, len(symbols), batch_size):
+        batch_no = index // batch_size + 1
+        batch = symbols[index : index + batch_size]
+        raw_by_norm = {normalize_cn_symbol(sym): sym for sym in batch}
+        print(f"[funnel] TickFlow 日K批次#{batch_no}/{total_batches} symbols={len(batch)}")
+        fetched = _fetch_tickflow_daily_batch(
+            client, batch, count=count, start_ms=start_ms, end_ms=end_ms, batch_no=batch_no
+        )
+        if fetched is None:
+            failed_batches += 1
+            continue
+        fetch_spot_patched += _merge_tickflow_batch(
+            df_map, fetched, raw_by_norm, window.end_trade_date, enforce_target_trade_date
+        )
+        if index + batch_size < len(symbols) and batch_sleep > 0:
+            time.sleep(batch_sleep)
+    if not df_map:
+        return None
+    missing = max(len(symbols) - len(df_map), 0)
+    if failed_batches or missing:
+        print(
+            "[funnel] TickFlow 批量日K不完整，回退并行单票链路，避免候选池缩水: "
+            f"成功={len(df_map)}, 缺失={missing}, 失败批次={failed_batches}"
+        )
+        return None
+    stats = _tickflow_fetch_stats(len(symbols), df_map, fetch_spot_patched, started)
+    print(
+        f"[funnel] TickFlow 批量日K完成: 成功={stats['fetch_ok']}, 失败={stats['fetch_fail']}, 耗时={stats['fetch_elapsed_s']}s"
+    )
+    return df_map, stats
 
 
 def latest_trade_date_from_hist(df: pd.DataFrame) -> date | None:
@@ -235,16 +395,16 @@ def terminate_executor_processes(ex: ProcessPoolExecutor, batch_no: int) -> None
     procs = getattr(ex, "_processes", {}) or {}
     killed = 0
     for proc in procs.values():
-        try:
-            if proc.is_alive():
+        from contextlib import suppress
+
+        with suppress(Exception):
+            if proc and proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=1)
                 if proc.is_alive():
                     proc.kill()
                     proc.join(timeout=1)
                 killed += 1
-        except Exception:
-            pass
     if killed:
         print(f"[funnel] 批次#{batch_no} 已强制终止 {killed} 个卡住子进程")
 
@@ -259,16 +419,13 @@ def fetch_all_ohlcv(
     batch_timeout: int = BATCH_TIMEOUT,
     batch_sleep: float = BATCH_SLEEP,
     executor_mode: str = EXECUTOR_MODE,
+    direct_source: bool = False,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, int]]:
-    """
-    批量并行拉取 OHLCV 数据。
+    """批量拉取 OHLCV，TickFlow 可用时先走批量接口，否则退回并行单票链路。"""
+    batch_result = _fetch_all_ohlcv_tickflow_batch(symbols, window, enforce_target_trade_date, batch_size, batch_sleep)
+    if batch_result is not None:
+        return batch_result
 
-    返回:
-      (df_map, fetch_stats)
-      - df_map: symbol -> DataFrame
-      - fetch_stats: {"fetch_ok", "fetch_fail", "fetch_date_mismatch",
-                      "fetch_spot_patched", "fetch_elapsed_s", "fetch_qps"}
-    """
     all_df_map: dict[str, pd.DataFrame] = {}
     fetch_ok = 0
     fetch_fail = 0
@@ -298,7 +455,7 @@ def fetch_all_ohlcv(
             ProcessPoolExecutor(max_workers=max_workers) if use_process else ThreadPoolExecutor(max_workers=max_workers)
         )
         fetch_fn = fetch_one_with_retry if use_process else fetch_one_with_retry_thread
-        futures = {ex.submit(fetch_fn, s, window): s for s in batch}
+        futures = {ex.submit(fetch_fn, s, window, MAX_RETRIES, direct_source): s for s in batch}
         try:
             for f in as_completed(futures, timeout=batch_timeout):
                 sym = futures[f]

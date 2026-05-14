@@ -1,9 +1,10 @@
 """
-Supabase 推荐跟踪数据存取模块
+Supabase 形态复盘数据存取模块
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from bisect import bisect_right
 from datetime import UTC, date, datetime, timedelta
@@ -15,6 +16,151 @@ import pandas as pd
 from core.constants import TABLE_RECOMMENDATION_TRACKING
 from integrations.supabase_base import create_admin_client as _get_supabase_admin_client
 from integrations.supabase_base import is_admin_configured as is_supabase_configured
+
+logger = logging.getLogger(__name__)
+
+
+def _fetch_all_tracking_records(client, select_expr: str = "*", page_size: int = 1000) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    page = max(min(int(page_size), 1000), 1)
+    start = 0
+    while True:
+        resp = (
+            client.table(TABLE_RECOMMENDATION_TRACKING)
+            .select(select_expr)
+            .order("recommend_date", desc=False)
+            .order("id", desc=False)
+            .range(start, start + page - 1)
+            .execute()
+        )
+        batch = resp.data or []
+        records.extend(batch)
+        if len(batch) < page:
+            return records
+        start += page
+
+
+def _safe_float(raw: Any, default: float = 0.0) -> float:
+    try:
+        value = float(raw)
+    except Exception:
+        return default
+    return value if pd.notna(value) else default
+
+
+def _code6(raw: Any) -> str:
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    return digits[-6:].zfill(6) if digits else ""
+
+
+def _chunked(items: list[Any], size: int) -> list[list[Any]]:
+    step = max(int(size), 1)
+    return [items[i : i + step] for i in range(0, len(items), step)]
+
+
+def _upsert_tracking_updates(client, updates: list[dict[str, Any]], batch_size: int = 500) -> int:
+    written = 0
+    clean_updates = [row for row in updates if row.get("code") is not None and row.get("recommend_date") is not None]
+    for chunk in _chunked(clean_updates, max(min(int(batch_size), 1000), 1)):
+        client.table(TABLE_RECOMMENDATION_TRACKING).upsert(chunk, on_conflict="code,recommend_date").execute()
+        written += len(chunk)
+    return written
+
+
+def _resolve_tickflow_quote_price(quote: dict[str, Any] | None) -> float:
+    row = quote or {}
+    for key in ("last_price", "close", "last", "price", "current"):
+        value = _safe_float(row.get(key), 0.0)
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _quote_trade_date_yyyymmdd(quote: dict[str, Any] | None) -> str:
+    timestamp_ms = _safe_float((quote or {}).get("timestamp"), 0.0)
+    if timestamp_ms <= 0:
+        return ""
+    timestamp_s = timestamp_ms / 1000.0 if timestamp_ms > 10_000_000_000 else timestamp_ms
+    try:
+        return datetime.fromtimestamp(timestamp_s, UTC).astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+    except Exception:
+        return ""
+
+
+def _close_map_from_tickflow_hist(hist: pd.DataFrame | None) -> dict[str, float]:
+    if hist is None or hist.empty or not {"date", "close"}.issubset(hist.columns):
+        return {}
+    work = hist[["date", "close"]].copy()
+    work["trade_date"] = pd.to_datetime(work["date"], errors="coerce").dt.strftime("%Y%m%d")
+    work["close"] = pd.to_numeric(work["close"], errors="coerce")
+    work = work.dropna(subset=["trade_date", "close"])
+    work = work[work["close"] > 0]
+    return {str(d): float(px) for d, px in zip(work["trade_date"], work["close"])}
+
+
+def _fetch_tickflow_tracking_market_data(
+    api_key: str,
+    symbols: list[str],
+    batch_size: int,
+) -> tuple[dict[str, dict[str, Any]], dict[str, pd.DataFrame]]:
+    from integrations.tickflow_client import TickFlowClient
+
+    tf_client = TickFlowClient(api_key=api_key)
+    quotes: dict[str, dict[str, Any]] = {}
+    hist_map: dict[str, pd.DataFrame] = {}
+    for chunk in _chunked(symbols, batch_size):
+        quotes.update(tf_client.get_quotes(chunk))
+        hist_map.update(tf_client.get_klines_batch(chunk, period="1d", count=120, adjust="none"))
+    return quotes, hist_map
+
+
+def _build_tickflow_tracking_updates(
+    grouped: dict[str, list[dict[str, Any]]],
+    quotes: dict[str, dict[str, Any]],
+    hist_map: dict[str, pd.DataFrame],
+    now_iso: str,
+) -> tuple[list[dict[str, Any]], int, str]:
+    from integrations.tickflow_client import normalize_cn_symbol
+
+    updates: list[dict[str, Any]] = []
+    codes_no_data = 0
+    latest_trade_date_global = ""
+    for code6, rows in grouped.items():
+        sym = normalize_cn_symbol(code6)
+        quote = quotes.get(sym) or {}
+        current_price = _resolve_tickflow_quote_price(quote)
+        quote_trade_date = _quote_trade_date_yyyymmdd(quote)
+        if quote_trade_date and quote_trade_date > latest_trade_date_global:
+            latest_trade_date_global = quote_trade_date
+
+        close_map = _close_map_from_tickflow_hist(hist_map.get(sym))
+        trade_dates = sorted(close_map)
+        if current_price <= 0 and trade_dates:
+            current_price = float(close_map[trade_dates[-1]])
+        if trade_dates and trade_dates[-1] > latest_trade_date_global:
+            latest_trade_date_global = trade_dates[-1]
+        if current_price <= 0 or not trade_dates:
+            codes_no_data += 1
+            continue
+
+        for row in rows:
+            rec_date = _recommend_date_to_yyyymmdd(row.get("recommend_date"))
+            pick_date = _pick_close_on_or_before(trade_dates, rec_date)
+            initial_close = float(close_map.get(pick_date, 0.0)) if pick_date else 0.0
+            if initial_close <= 0:
+                continue
+            updates.append(
+                {
+                    "id": row.get("id"),
+                    "code": int(code6),
+                    "recommend_date": int(rec_date) if rec_date.isdigit() else None,
+                    "initial_price": round(initial_close, 4),
+                    "current_price": round(current_price, 4),
+                    "change_pct": round((current_price - initial_close) / initial_close * 100.0, 2),
+                    "updated_at": now_iso,
+                }
+            )
+    return updates, codes_no_data, latest_trade_date_global
 
 
 def _parse_recommend_date(raw_value: Any) -> date | None:
@@ -47,7 +193,7 @@ def _parse_write_date(record: dict[str, Any]) -> date | None:
                 return datetime.strptime(s, "%Y%m%d").date()
             return datetime.fromisoformat(s).date()
         except Exception:
-            pass
+            logger.debug("failed to parse created_at date: %s", created, exc_info=True)
     return None
 
 
@@ -92,7 +238,7 @@ def _resolve_initial_price_from_history(code_str: str, rec_date: date) -> float:
 
 def upsert_recommendations(recommend_date: int, symbols_info: list[dict[str, Any]]) -> bool:
     """
-    将每日选出的股票存入推荐跟踪表
+    将每日选出的股票存入形态复盘表
     recommend_date: YYYYMMDD (int)
     """
     if not is_supabase_configured() or not symbols_info:
@@ -100,27 +246,22 @@ def upsert_recommendations(recommend_date: int, symbols_info: list[dict[str, Any
     try:
         client = _get_supabase_admin_client()
 
-        # 预读已有记录（按 code 聚合），用于维护 recommend_count。
-        # 规则：仅当 recommend_date 变化时才 +1，同日重跑不重复累计。
         existing_counts: dict[int, int] = {}
         existing_code_dates: dict[int, set[int]] = {}
         try:
-            resp = client.table(TABLE_RECOMMENDATION_TRACKING).select("code,recommend_count,recommend_date").execute()
-            for row in resp.data or []:
+            all_rows = _fetch_all_tracking_records(client, "code,recommend_count,recommend_date")
+            for row in all_rows:
                 try:
                     code_int = int(row.get("code"))
-                except Exception:
+                except (TypeError, ValueError):
                     continue
-                try:
-                    cnt = int(row.get("recommend_count") or 1)
-                except Exception:
-                    cnt = 1
+                cnt = int(row.get("recommend_count") or 1) if row.get("recommend_count") else 1
                 existing_counts[code_int] = max(existing_counts.get(code_int, 0), cnt)
                 try:
                     d = int(row.get("recommend_date"))
                     existing_code_dates.setdefault(code_int, set()).add(d)
-                except Exception:
-                    pass
+                except (TypeError, ValueError):
+                    logger.debug("invalid recommend_date for code %s", row.get("code"), exc_info=True)
         except Exception:
             existing_counts = {}
             existing_code_dates = {}
@@ -254,6 +395,35 @@ def mark_ai_recommendations(recommend_date: int, ai_codes: list[str]) -> bool:
         return False
 
 
+def _resolve_price(code_str, price_map, history_fn, spot_fn) -> float | None:
+    if price_map:
+        try:
+            px = float(price_map.get(code_str) or 0)
+        except (TypeError, ValueError):
+            px = 0.0
+        if px > 0:
+            return px
+    px = history_fn(code_str)
+    if px is not None:
+        return px
+    return spot_fn(code_str)
+
+
+def _build_price_update_row(record: dict, new_price: float, code_str: str, now_iso: str) -> dict:
+    row: dict = {"id": record["id"], "current_price": new_price, "updated_at": now_iso}
+    initial_price = float(record.get("initial_price") or 0.0)
+    if initial_price > 0:
+        row["change_pct"] = round((new_price - initial_price) / initial_price * 100.0, 2)
+    else:
+        rec_date = _parse_recommend_date(record.get("recommend_date"))
+        backfill = _resolve_initial_price_from_history(code_str, rec_date) if rec_date else 0.0
+        if backfill <= 0:
+            backfill = new_price
+        row["initial_price"] = backfill
+        row["change_pct"] = round((new_price - backfill) / backfill * 100.0, 2) if backfill > 0 else 0.0
+    return row
+
+
 def sync_all_tracking_prices(
     price_map: dict[str, float] | None = None,
 ) -> int:
@@ -277,12 +447,12 @@ def sync_all_tracking_prices(
         }
 
         # 获取需要跟踪的股票代码（去重）
-        resp = client.table(TABLE_RECOMMENDATION_TRACKING).select("code").execute()
-        if not resp.data:
+        code_rows = _fetch_all_tracking_records(client, "id,code")
+        if not code_rows:
             print("[supabase_recommendation] sync_all_tracking_prices: 推荐表无记录，跳过")
             return 0
 
-        unique_codes = sorted(list(set(int(r["code"]) for r in resp.data)))
+        unique_codes = sorted({int(r["code"]) for r in code_rows if r.get("code") is not None})
 
         # 统一日线窗口（与 step2 同口径），避免实时快照不稳定导致脏数据。
         hist_start_s: str | None = None
@@ -346,54 +516,35 @@ def sync_all_tracking_prices(
             except Exception:
                 return None
 
+        all_records = _fetch_all_tracking_records(client, "*")
+        records_by_code: dict[int, list[dict]] = {}
+        for rec in all_records:
+            try:
+                c = int(rec.get("code"))
+            except (TypeError, ValueError):
+                continue
+            records_by_code.setdefault(c, []).append(rec)
+
         updated_count = 0
+        upsert_batch: list[dict] = []
+        now_iso = datetime.now(UTC).isoformat()
+
         for code_int in unique_codes:
             code_str = f"{code_int:06d}"
-            new_current_price: float | None = None
-
-            if price_map:
-                raw_px = price_map.get(code_str)
-                try:
-                    parsed_px = float(raw_px) if raw_px is not None else 0.0
-                except Exception:
-                    parsed_px = 0.0
-                if parsed_px > 0:
-                    new_current_price = parsed_px
-
-            if new_current_price is None:
-                new_current_price = _price_from_history(code_str)
-            if new_current_price is None:
-                new_current_price = _price_from_spot(code_str)
+            new_current_price = _resolve_price(code_str, price_map, _price_from_history, _price_from_spot)
             if new_current_price is None:
                 continue
+            for record in records_by_code.get(code_int, []):
+                row = _build_price_update_row(record, new_current_price, code_str, now_iso)
+                upsert_batch.append(row)
+                if len(upsert_batch) >= 50:
+                    client.table(TABLE_RECOMMENDATION_TRACKING).upsert(upsert_batch, on_conflict="id").execute()
+                    updated_count += len(upsert_batch)
+                    upsert_batch = []
 
-            # 该股票可能有多条推荐记录（不同日期），逐条更新价格与涨跌幅
-            rec_resp = client.table(TABLE_RECOMMENDATION_TRACKING).select("*").eq("code", code_int).execute()
-            for record in rec_resp.data:
-                initial_price = float(record.get("initial_price") or 0.0)
-                rec_date = _parse_recommend_date(record.get("recommend_date"))
-                update_payload = {
-                    "current_price": new_current_price,
-                    "updated_at": datetime.now(UTC).isoformat(),
-                }
-                if initial_price > 0:
-                    change_pct = (new_current_price - initial_price) / initial_price * 100.0
-                    update_payload["change_pct"] = round(change_pct, 2)
-                else:
-                    backfill_price = _resolve_initial_price_from_history(code_str, rec_date) if rec_date else 0.0
-                    if backfill_price <= 0:
-                        backfill_price = new_current_price
-                    update_payload["initial_price"] = backfill_price
-                    update_payload["change_pct"] = (
-                        round(
-                            (new_current_price - backfill_price) / backfill_price * 100.0,
-                            2,
-                        )
-                        if backfill_price > 0
-                        else 0.0
-                    )
-                client.table(TABLE_RECOMMENDATION_TRACKING).update(update_payload).eq("id", record["id"]).execute()
-                updated_count += 1
+        if upsert_batch:
+            client.table(TABLE_RECOMMENDATION_TRACKING).upsert(upsert_batch, on_conflict="id").execute()
+            updated_count += len(upsert_batch)
 
         if unique_codes and updated_count == 0:
             print(
@@ -418,12 +569,12 @@ def correct_tracking_initial_prices() -> int:
         return 0
     try:
         client = _get_supabase_admin_client()
-        resp = client.table(TABLE_RECOMMENDATION_TRACKING).select("*").execute()
-        if not resp.data:
+        records = _fetch_all_tracking_records(client, "*")
+        if not records:
             return 0
         cache: dict[tuple[str, date], float] = {}
         updated = 0
-        for record in resp.data:
+        for record in records:
             write_date = _parse_write_date(record)
             if not write_date:
                 continue
@@ -456,7 +607,7 @@ def correct_tracking_initial_prices() -> int:
 
 
 def load_recommendation_tracking(limit: int = 1000, client=None) -> list[dict[str, Any]]:
-    """加载推荐跟踪数据"""
+    """加载形态复盘数据"""
     try:
         if client is None:
             client = _get_supabase_admin_client()
@@ -499,7 +650,7 @@ def _pick_close_on_or_before(sorted_trade_dates: list[str], target_yyyymmdd: str
 
 def refresh_tracking_prices_with_tushare_unadjusted() -> dict[str, Any]:
     """
-    使用 Tushare（日线不复权）回填并刷新推荐跟踪价格：
+    使用 Tushare（日线不复权）回填并刷新形态复盘价格：
     - initial_price: 推荐日（或之前最近交易日）收盘价
     - current_price: 当前系统时间对应最近交易日收盘价
     - change_pct: (current - initial) / initial * 100
@@ -514,8 +665,7 @@ def refresh_tracking_prices_with_tushare_unadjusted() -> dict[str, Any]:
         raise ValueError("TUSHARE_TOKEN 未配置或 tushare 不可用")
 
     client = _get_supabase_admin_client()
-    resp = client.table(TABLE_RECOMMENDATION_TRACKING).select("id,code,recommend_date").execute()
-    records = resp.data or []
+    records = _fetch_all_tracking_records(client, "id,code,recommend_date")
     if not records:
         return {
             "rows_total": 0,
@@ -601,29 +751,69 @@ def refresh_tracking_prices_with_tushare_unadjusted() -> dict[str, Any]:
                 }
             )
 
-    if updates:
-        for item in updates:
-            row_id = item.pop("id", None)
-            code_val = item.pop("code", None)
-            rec_date_val = item.pop("recommend_date", None)
-            q = client.table(TABLE_RECOMMENDATION_TRACKING).update(item)
-            if row_id is not None:
-                q = q.eq("id", row_id)
-            elif code_val is not None and rec_date_val is not None:
-                q = q.eq("code", code_val).eq("recommend_date", rec_date_val)
-            else:
-                continue
-            q.execute()
+    written = _upsert_tracking_updates(client, updates)
 
-    updated_keys = {
-        f"{x.get('code', '')}:{x.get('recommend_date', '')}"
-        for x in updates
-        if x.get("code") is not None and x.get("recommend_date") is not None
-    }
     return {
         "rows_total": len(records),
-        "rows_updated": len(updated_keys),
-        "rows_skipped": max(len(records) - len(updated_keys), 0),
+        "rows_updated": written,
+        "rows_skipped": max(len(records) - written, 0),
+        "codes_total": len(grouped),
+        "codes_no_data": codes_no_data,
+        "latest_trade_date": latest_trade_date_global,
+    }
+
+
+def refresh_tracking_prices_with_tickflow_realtime() -> dict[str, Any]:
+    """
+    使用 Tickflow 实时报价刷新形态复盘价格：
+    - current_price: Tickflow /v1/quotes 的 last_price
+    - initial_price: 推荐日（或之前最近交易日）Tickflow 不复权日线收盘价
+    - change_pct: (current - initial) / initial * 100
+    """
+    if not is_supabase_configured():
+        raise ValueError("SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY 未配置")
+
+    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("TICKFLOW_API_KEY 未配置")
+
+    from integrations.tickflow_client import normalize_cn_symbol
+
+    client = _get_supabase_admin_client()
+    records = _fetch_all_tracking_records(client, "id,code,recommend_date")
+    if not records:
+        return {
+            "rows_total": 0,
+            "rows_updated": 0,
+            "rows_skipped": 0,
+            "codes_total": 0,
+            "codes_no_data": 0,
+            "latest_trade_date": "",
+        }
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in records:
+        code6 = _code6(row.get("code"))
+        if code6:
+            grouped.setdefault(code6, []).append(row)
+
+    symbols = [normalize_cn_symbol(code6) for code6 in sorted(grouped)]
+    symbols = [sym for sym in symbols if sym]
+    batch_size = max(min(int(os.getenv("RECOMMENDATION_TICKFLOW_BATCH_SIZE", "80")), 200), 1)
+    quotes, hist_map = _fetch_tickflow_tracking_market_data(api_key, symbols, batch_size)
+    updates, codes_no_data, latest_trade_date_global = _build_tickflow_tracking_updates(
+        grouped,
+        quotes,
+        hist_map,
+        datetime.now(UTC).isoformat(),
+    )
+
+    written = _upsert_tracking_updates(client, updates)
+
+    return {
+        "rows_total": len(records),
+        "rows_updated": written,
+        "rows_skipped": max(len(records) - written, 0),
         "codes_total": len(grouped),
         "codes_no_data": codes_no_data,
         "latest_trade_date": latest_trade_date_global,

@@ -4,7 +4,7 @@ import streamlit as st
 
 from app.auth_component import check_auth, login_form
 from core.token_storage import ensure_query_params_synced, restore_tokens_from_storage
-from integrations.llm_client import DEFAULT_GEMINI_MODEL, OPENAI_COMPATIBLE_BASE_URLS
+from integrations._llm_types import DEFAULT_GEMINI_MODEL, OPENAI_COMPATIBLE_BASE_URLS
 from integrations.supabase_market_signal import compose_market_banner, load_latest_market_signal_daily
 
 
@@ -18,7 +18,7 @@ def init_session_state() -> None:
     _set_default("access_token", None)
     _set_default("refresh_token", None)
     _set_default("search_history", [])
-    _set_default("current_symbol", "300364")
+    _set_default("current_symbol", "601318")
     _set_default("should_run", False)
     _set_default("mobile_mode", False)
     _set_default("custom_export_payload", None)
@@ -62,13 +62,13 @@ def init_session_state() -> None:
     access = st.session_state.get("access_token") or ""
     refresh = st.session_state.get("refresh_token") or ""
     if not access or not refresh:
-        try:
+        from contextlib import suppress
+
+        with suppress(Exception):
             restored_access, restored_refresh = restore_tokens_from_storage()
             if restored_access and restored_refresh:
                 st.session_state.access_token = restored_access
                 st.session_state.refresh_token = restored_refresh
-        except Exception:
-            pass
 
     # 确保 URL query_params 中带有 session_key（跨页面导航时保持）
     ensure_query_params_synced()

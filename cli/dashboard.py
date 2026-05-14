@@ -8,10 +8,13 @@ stdlib http.server 提供 JSON API + 嵌入式 HTML/CSS/JS SPA。
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Data access layer (thin wrappers over local_db)
@@ -375,14 +378,35 @@ class _Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 
+def start_dashboard_background(port: int = 8765):
+    """后台静默启动 dashboard（daemon 线程调用，不打开浏览器）。"""
+    server = HTTPServer(("127.0.0.1", port), _Handler)
+    server.allow_reuse_address = True
+    server.serve_forever()
+
+
+def _port_in_use(port: int) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
 def start_dashboard(port: int = 8765):
     """启动 dashboard HTTP 服务并打开浏览器。"""
+    url = f"http://127.0.0.1:{port}"
+
+    if _port_in_use(port):
+        print(f"Dashboard 已在运行: {url}")
+        webbrowser.open(url)
+        return
+
     from integrations.local_db import init_db
 
     init_db()
 
     server = HTTPServer(("127.0.0.1", port), _Handler)
-    url = f"http://127.0.0.1:{port}"
+    server.allow_reuse_address = True
     print(f"Wyckoff Dashboard: {url}")
     print("按 Ctrl+C 停止")
 
@@ -391,7 +415,7 @@ def start_dashboard(port: int = 8765):
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        logger.debug("dashboard server stopped by user", exc_info=True)
     finally:
         server.server_close()
 
@@ -613,15 +637,15 @@ const API=p=>fetch(p).then(r=>r.json());
 // ═══ i18n ═══
 const I18N={
 zh:{
-  nav_overview:'总览',nav_recommendations:'AI 推荐',nav_signals:'信号池',nav_tailbuy:'尾盘记录',nav_portfolio:'持仓',
+  nav_overview:'总览',nav_recommendations:'形态复盘',nav_signals:'信号池',nav_tailbuy:'尾盘记录',nav_portfolio:'持仓',
   nav_memory:'Agent 记忆',nav_config:'配置',nav_bgtasks:'后台任务',nav_chatlog:'对话日志',nav_sync:'同步状态',
   theme_dark:'深色',theme_light:'浅色',
-  overview:'总览',recommendations:'AI 推荐',signals:'信号池',tailbuy:'尾盘记录',portfolio:'持仓',
+  overview:'总览',recommendations:'形态复盘',signals:'信号池',tailbuy:'尾盘记录',portfolio:'持仓',
   memory:'Agent 记忆',config:'配置',bgtasks:'后台任务',chatlog:'对话日志',sync:'同步状态',
   no_tailbuy:'暂无尾盘买入记录',th_run_date:'执行日',th_signal_type:'信号',th_rule_score:'规则分',th_priority:'优先级',th_llm:'LLM',confirm_del_tailbuy:'确认删除尾盘记录：',
-  card_recs:'AI 推荐跟踪',card_signals:'信号确认池',card_portfolio:'持仓',card_memory:'Agent 记忆',card_sync:'同步状态',
+  card_recs:'威科夫形态复盘',card_signals:'信号确认池',card_portfolio:'持仓',card_memory:'Agent 记忆',card_sync:'同步状态',
   tracked:'只跟踪中',pending_confirm:'条待确认',positions:'持仓',cash:'可用资金',stored:'条记忆',synced:'表已同步',
-  recent_recs:'最近推荐',no_data:'暂无数据',loading:'加载中...',
+  recent_recs:'最近复盘',no_data:'暂无数据',loading:'加载中...',
   th_code:'代码',th_name:'名称',th_camp:'阵营',th_date:'日期',th_init_price:'推荐价',th_cur_price:'现价',th_ai:'来源',
   th_type:'类型',th_status:'状态',th_score:'评分',th_days:'天数',th_regime:'市况',th_industry:'行业',
   th_shares:'股数',th_cost:'成本',th_stop_loss:'止损',
@@ -636,8 +660,8 @@ zh:{
   no_sessions:'暂无对话记录',th_session:'会话',th_started:'开始',th_ended:'结束',
   th_messages:'消息数',th_tokens_in:'输入 Token',th_tokens_out:'输出 Token',th_error:'状态',
   view:'查看',back:'返回列表',session:'会话',no_messages:'暂无消息',
-  no_recs:'暂无推荐',no_signals:'暂无信号',
-  confirm_del_rec:'确认删除推荐记录：',confirm_del_sig:'确认删除信号记录：',confirm_del_session:'确认删除整个会话？会话 ID：',
+  no_recs:'暂无复盘记录',no_signals:'暂无信号',
+  confirm_del_rec:'确认删除复盘记录：',confirm_del_sig:'确认删除信号记录：',confirm_del_session:'确认删除整个会话？会话 ID：',
   buy_links:'购买 API Key',buy_tickflow:'数据源（TickFlow）',buy_llm:'大模型（1Route）',
   tab_content:'内容',tab_runtime:'调用链',no_runtime:'无调用链数据（需重新对话后可见）',
 },

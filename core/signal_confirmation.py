@@ -11,6 +11,7 @@ SIGNAL_TTL_DAYS: dict[str, int] = {
     "spring": 3,
     "lps": 3,
     "evr": 2,
+    "compression": 3,
 }
 
 
@@ -75,12 +76,92 @@ def _confirm_evr(snap: dict, today: dict, days_elapsed: int) -> tuple[str, str]:
     return "pending", "等待企稳确认"
 
 
+def _confirm_compression(snap: dict, today: dict, days_elapsed: int) -> tuple[str, str]:
+    support = snap.get("snap_support", 0)
+    snap_close = snap.get("snap_close", 0)
+    snap_vol = snap.get("snap_volume", 0)
+    if today["low"] < support * 0.97:
+        return "expired", f"跌破压缩区间下沿 {support:.2f}"
+    if snap_vol > 0 and today["volume"] > snap_vol * 2.0:
+        if today["close"] > snap_close * 1.01:
+            return "confirmed", f"放量向上突破压缩区间，收盘 {today['close']:.2f}"
+        return "expired", "放量下破，压缩结构失效"
+    if snap_vol > 0 and today["volume"] <= snap_vol * 1.0 and today["close"] >= support:
+        return "confirmed", f"维持缩量窄幅，守住 {support:.2f}"
+    return "pending", "等待继续缩量确认"
+
+
 _CONFIRM_DISPATCH = {
     "sos": _confirm_sos,
     "spring": _confirm_spring,
     "lps": _confirm_lps,
     "evr": _confirm_evr,
+    "compression": _confirm_compression,
 }
+
+
+def _compute_support_level(
+    df: pd.DataFrame,
+    signal_type: str,
+    window: int = 60,
+) -> float:
+    """根据信号类型计算支撑位。"""
+    df_s = df.sort_values("date") if "date" in df.columns else df
+    last = df_s.iloc[-1]
+    if signal_type in ("spring", "compression"):
+        zone = df_s.iloc[-(window + 2) : -2] if len(df_s) > window + 2 else df_s.iloc[:-2]
+        return float(zone["close"].min()) if len(zone) > 0 else float(last["low"])
+    if signal_type == "sos":
+        return float(df_s["high"].tail(21).iloc[:-1].max()) if len(df_s) >= 21 else float(last["high"])
+    if signal_type == "lps":
+        return float(df_s["close"].rolling(20).mean().iloc[-1]) if len(df_s) >= 20 else float(last["close"])
+    return float(df_s["low"].tail(20).min())
+
+
+def score_springboard_abc(
+    df: pd.DataFrame,
+    signal_type: str,
+    window: int = 60,
+) -> dict[str, Any]:
+    """量化计算起跳板 A/B/C 三个硬门槛。
+
+    A: 近5日有缩量测试（vol_ratio < 0.8 且 close_pos > 60%）
+    B: 最后一根K线放量突破（vol_ratio >= 1.5 且 close_pos > 70%）
+    C: 支撑位在 window 内被 low 触碰 >= 2 次（tolerance 5%）
+    """
+    df_s = df.sort_values("date") if "date" in df.columns else df
+    close = pd.to_numeric(df_s["close"], errors="coerce")
+    high = pd.to_numeric(df_s["high"], errors="coerce")
+    low = pd.to_numeric(df_s["low"], errors="coerce")
+    volume = pd.to_numeric(df_s["volume"], errors="coerce")
+    vol_ma20 = volume.rolling(20).mean()
+    vol_ratio = volume / vol_ma20.replace(0, pd.NA)
+    span = (high - low).replace(0, pd.NA)
+    close_pos = ((close - low) / span * 100).clip(lower=0, upper=100).fillna(50.0)
+
+    tail5 = df_s.tail(5)
+    idx5 = tail5.index
+    a = bool(((vol_ratio.loc[idx5] < 0.8) & (close_pos.loc[idx5] > 60)).any())
+
+    last_idx = df_s.index[-1]
+    b = bool(vol_ratio.loc[last_idx] >= 1.5 and close_pos.loc[last_idx] > 70)
+
+    support = _compute_support_level(df, signal_type, window)
+    tol = support * 0.05
+    lookback = df_s.tail(window)
+    touches = int(((low.loc[lookback.index] - support).abs() <= tol).sum())
+    c = touches >= 2
+
+    parts = []
+    if a:
+        parts.append("A")
+    if b:
+        parts.append("B")
+    if c:
+        parts.append("C")
+    met = len(parts)
+    grade = "+".join(parts) if parts else "none"
+    return {"a": a, "b": b, "c": c, "grade": grade, "met_count": met}
 
 
 def build_snap(
@@ -105,7 +186,7 @@ def build_snap(
         "snap_ma50": ma50,
     }
 
-    if signal_type == "spring":
+    if signal_type in ("spring", "compression"):
         window = 60 if cfg is None else getattr(cfg, "spring_support_window", 60)
         zone = df_s.iloc[-(window + 2) : -2] if len(df_s) > window + 2 else df_s.iloc[:-2]
         snap["snap_support"] = float(zone["close"].min()) if len(zone) > 0 else float(last["low"])

@@ -221,11 +221,57 @@ class TestCheckDoomLoop:
         check_doom_loop(recent, "analyze_stock", {"code": "000001"})
         assert check_doom_loop(recent, "analyze_stock", {"code": "000001"})
 
+    def test_triggers_keep_arg_texts_in_sync(self):
+        recent: list[tuple[str, int]] = []
+        recent_texts: list[str] = []
+        args = {"code": "000001"}
+
+        check_doom_loop(recent, "analyze_stock", args, recent_args_texts=recent_texts)
+        check_doom_loop(recent, "analyze_stock", args, recent_args_texts=recent_texts)
+        assert check_doom_loop(recent, "analyze_stock", args, recent_args_texts=recent_texts)
+
+        assert len(recent_texts) == len(recent)
+
     def test_different_args_no_trigger(self):
         recent: list[tuple[str, int]] = []
         check_doom_loop(recent, "analyze_stock", {"code": "000001"})
         check_doom_loop(recent, "analyze_stock", {"code": "000002"})
         assert not check_doom_loop(recent, "analyze_stock", {"code": "000001"})
+
+    def test_short_distinct_args_skip_fuzzy_match(self):
+        recent: list[tuple[str, int]] = []
+        recent_texts: list[str] = []
+
+        for code in ("300001", "300002", "300003"):
+            assert not check_doom_loop(
+                recent,
+                "analyze_stock",
+                {"code": code},
+                recent_args_texts=recent_texts,
+            )
+
+        assert len(recent_texts) == len(recent)
+
+    def test_similar_long_args_trigger_and_keep_arg_texts_in_sync(self):
+        recent: list[tuple[str, int]] = []
+        recent_texts: list[str] = []
+
+        base = "请基于威科夫方法分析成交量结构、关键支撑压力、筹码吸收以及供需转换，场景编号 "
+        for code in ("A", "B"):
+            assert not check_doom_loop(
+                recent,
+                "analyze_stock",
+                {"prompt": f"{base}{code}"},
+                recent_args_texts=recent_texts,
+            )
+        assert check_doom_loop(
+            recent,
+            "analyze_stock",
+            {"prompt": f"{base}C"},
+            recent_args_texts=recent_texts,
+        )
+
+        assert len(recent_texts) == len(recent)
 
     def test_window_eviction(self):
         recent: list[tuple[str, int]] = []

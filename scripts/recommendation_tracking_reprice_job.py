@@ -1,9 +1,9 @@
 """
-推荐跟踪价格回填任务（独立定时）：
+形态复盘价格回填任务（独立定时）：
 - 从 recommendation_tracking 读取 code / recommend_date
-- 使用 Tushare 不复权日线（daily）计算：
-  - initial_price: 推荐时间对应最近交易日收盘价
-  - current_price: 当前系统时间对应最近交易日收盘价
+- 使用 Tickflow 实时报价与不复权日线计算：
+  - initial_price: 推荐时间对应最近交易日收盘价（不复权）
+  - current_price: Tickflow 最新实时价/收盘价
   - change_pct
 """
 
@@ -18,7 +18,13 @@ from zoneinfo import ZoneInfo
 # Ensure project root is on sys.path for direct script invocation
 if __name__ == "__main__" or not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from integrations.supabase_recommendation import refresh_tracking_prices_with_tushare_unadjusted
+from contextlib import suppress
+
+with suppress(Exception):
+    from dotenv import load_dotenv
+
+    load_dotenv()
+from integrations.supabase_recommendation import refresh_tracking_prices_with_tickflow_realtime
 
 TZ = ZoneInfo("Asia/Shanghai")
 
@@ -37,14 +43,14 @@ def _log(msg: str, logs_path: str | None = None) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="推荐跟踪价格回填任务（Tushare 不复权）")
+    parser = argparse.ArgumentParser(description="形态复盘价格回填任务（Tickflow 实时报价）")
     parser.add_argument("--logs", default="", help="日志文件路径（可选）")
     args = parser.parse_args()
     logs_path = str(args.logs or "").strip() or None
 
-    _log("开始执行 recommendation tracking 回填任务（Tushare 不复权）", logs_path)
+    _log("开始执行 recommendation tracking 回填任务（Tickflow 实时报价）", logs_path)
     try:
-        summary = refresh_tracking_prices_with_tushare_unadjusted()
+        summary = refresh_tracking_prices_with_tickflow_realtime()
     except Exception as e:
         _log(f"任务失败: {e}", logs_path)
         return 1

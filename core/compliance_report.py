@@ -16,11 +16,9 @@ from typing import Any
 
 import pandas as pd
 
-from integrations.llm_client import OPENAI_COMPATIBLE_BASE_URLS, call_llm
+from integrations.llm_client import call_llm
 
-OPENROUTER_PROVIDER = "openrouter"
 EFFICIENCY_PROVIDER = "efficiency"
-OPENROUTER_BASE_URL = OPENAI_COMPATIBLE_BASE_URLS["openrouter"]
 DEFAULT_MAX_OUTPUT_TOKENS = 2048
 
 _STOCK_CODE_RE = re.compile(r"(?<!\d)\d{6}(?!\d)")
@@ -84,24 +82,7 @@ def fmt_pct(value: Any) -> str:
 
 
 def resolve_compliance_llm_config() -> ComplianceLLMConfig | None:
-    """Resolve the cheap/efficiency model channel from environment variables.
-
-    Priority:
-    1. OPENROUTER_API_KEY + OPENROUTER_MODEL, with default OpenRouter base URL.
-    2. EFFICIENCY_API_KEY + EFFICIENCY_MODEL + EFFICIENCY_BASE_URL for any
-       OpenAI-compatible cheap endpoint.
-    """
-
-    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    openrouter_model = os.getenv("OPENROUTER_MODEL", "").strip()
-    if openrouter_key and openrouter_model:
-        return ComplianceLLMConfig(
-            provider=OPENROUTER_PROVIDER,
-            api_key=openrouter_key,
-            model=openrouter_model,
-            base_url=OPENROUTER_BASE_URL,
-            source="openrouter",
-        )
+    """Resolve the cheap model channel from EFFICIENCY_* variables."""
 
     efficiency_key = os.getenv("EFFICIENCY_API_KEY", "").strip()
     efficiency_model = os.getenv("EFFICIENCY_MODEL", "").strip()

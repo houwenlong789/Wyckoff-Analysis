@@ -6,9 +6,13 @@ import pandas as pd
 
 from core.wyckoff_engine import (
     FunnelConfig,
+    _compute_stop_loss,
+    _detect_compression,
+    _is_holiday_grace,
     _latest_trade_date,
     _sorted_if_needed,
     layer1_filter,
+    layer3_sector_resonance,
 )
 
 
@@ -70,3 +74,134 @@ class TestLayer1Filter:
 
         result = layer1_filter(["000001", "000002"], name_map, mcap, df_map, cfg)
         assert "000002" not in result  # ST 被剔除
+
+
+class TestIsHolidayGrace:
+    def test_normal_day_no_grace(self):
+        df = _make_df(["2024-01-02", "2024-01-03"], [10, 11])
+        assert _is_holiday_grace(df, 1) is False
+
+    def test_weekend_no_grace(self):
+        df = _make_df(["2024-01-05", "2024-01-08"], [10, 11])
+        assert _is_holiday_grace(df, 1) is True
+
+    def test_holiday_gap_triggers_grace(self):
+        df = _make_df(["2024-09-27", "2024-10-08"], [10, 11])
+        assert _is_holiday_grace(df, 1) is True
+
+    def test_grace_disabled(self):
+        df = _make_df(["2024-09-27", "2024-10-08"], [10, 11])
+        assert _is_holiday_grace(df, 0) is False
+
+    def test_grace_day2_still_active(self):
+        df = _make_df(["2024-09-27", "2024-10-08", "2024-10-09"], [10, 11, 12])
+        assert _is_holiday_grace(df, 1) is False
+        assert _is_holiday_grace(df, 2) is True
+
+    def test_grace_day3_expired(self):
+        df = _make_df(
+            ["2024-09-27", "2024-10-08", "2024-10-09", "2024-10-10"],
+            [10, 11, 12, 13],
+        )
+        assert _is_holiday_grace(df, 2) is False
+        assert _is_holiday_grace(df, 3) is True
+
+
+class TestComputeStopLoss:
+    def test_markup_trailing_stop(self):
+        cfg = FunnelConfig()
+        n = 250
+        closes = pd.Series([10.0 + i * 0.05 for i in range(n)])
+        lows = closes * 0.99
+        highs = closes * 1.01
+        price, reason = _compute_stop_loss(closes, lows, highs, "Markup", cfg)
+        assert price is not None
+        assert "主升趋势破位" in reason
+
+    def test_accum_bottom_stop(self):
+        cfg = FunnelConfig()
+        n = 250
+        closes = pd.Series([10.0] * n)
+        lows = pd.Series([9.5] * n)
+        highs = pd.Series([10.5] * n)
+        price, reason = _compute_stop_loss(closes, lows, highs, "Accum_B", cfg)
+        assert price is not None
+        assert "吸筹底线" in reason
+
+
+class TestDetectCompression:
+    def _build_compression_df(self):
+        n = 60
+        dates = pd.date_range("2024-01-01", periods=n, freq="B")
+        closes = [10.0] * n
+        highs = [10.0 + (0.5 if i < 40 else 0.5 * (0.7 ** (i - 40))) for i in range(n)]
+        lows = [10.0 - (0.5 if i < 40 else 0.5 * (0.7 ** (i - 40))) for i in range(n)]
+        vols = [1_000_000 if i < 40 else int(600_000 * (0.9 ** (i - 40))) for i in range(n)]
+        return pd.DataFrame(
+            {
+                "date": dates,
+                "open": closes,
+                "close": closes,
+                "high": highs,
+                "low": lows,
+                "volume": vols,
+                "pct_chg": [0.0] * n,
+            }
+        )
+
+    def test_detects_compression(self):
+        cfg = FunnelConfig()
+        df = self._build_compression_df()
+        result = _detect_compression(df, cfg)
+        assert result is not None
+        assert result < 1.0
+
+    def test_rejects_high_position(self):
+        cfg = FunnelConfig()
+        n = 250
+        dates = pd.date_range("2024-01-01", periods=n, freq="B")
+        closes = [10.0 + i * 0.2 for i in range(n)]
+        df = pd.DataFrame(
+            {
+                "date": dates,
+                "open": closes,
+                "close": closes,
+                "high": [c * 1.001 for c in closes],
+                "low": [c * 0.999 for c in closes],
+                "volume": [1_000_000] * n,
+                "pct_chg": [0.0] * n,
+            }
+        )
+        result = _detect_compression(df, cfg)
+        assert result is None
+
+
+class TestSectorHeatBypass:
+    def test_heat_bypass_includes_sector(self):
+        cfg = FunnelConfig()
+        cfg.sector_heat_bypass_min_count = 2
+        n = 30
+        dates = pd.date_range("2024-01-01", periods=n, freq="B")
+        base_closes = [10.0 + i * 0.1 for i in range(n)]
+        df_map = {}
+        for code in ["A1", "A2", "B1"]:
+            df_map[code] = pd.DataFrame(
+                {
+                    "date": dates,
+                    "open": base_closes,
+                    "close": base_closes,
+                    "high": [c * 1.02 for c in base_closes],
+                    "low": [c * 0.98 for c in base_closes],
+                    "volume": [1_000_000] * n,
+                }
+            )
+        sector_map = {"A1": "电气设备", "A2": "电气设备", "B1": "食品饮料"}
+        result, top = layer3_sector_resonance(
+            ["A1", "A2", "B1"],
+            sector_map,
+            cfg,
+            base_symbols=["A1", "A2", "B1"],
+            df_map=df_map,
+        )
+        assert "A1" in result
+        assert "A2" in result

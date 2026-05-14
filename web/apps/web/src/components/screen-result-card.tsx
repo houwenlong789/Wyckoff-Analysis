@@ -1,0 +1,63 @@
+import { memo, useState } from 'react'
+import { Link } from 'react-router'
+import { ChevronRight } from 'lucide-react'
+import type { ScreenResult, ScreenStockItem } from '@/lib/chat-tools'
+
+function StockRow({ s }: { s: ScreenStockItem }) {
+  const chgColor = s.change_pct != null && s.change_pct >= 0 ? 'text-red-500' : 'text-green-600'
+  return (
+    <Link
+      to={`/analysis?code=${s.code}`}
+      className="flex items-center gap-3 rounded px-2 py-1 text-xs hover:bg-muted/60 transition-colors"
+    >
+      <span className="font-mono w-14 shrink-0">{s.code}</span>
+      <span className="flex-1 truncate">{s.name}</span>
+      <span className="w-10 text-right text-muted-foreground">{s.funnel_score?.toFixed(2) ?? '--'}</span>
+      <span className={`w-16 text-right ${chgColor}`}>
+        {s.change_pct != null ? `${s.change_pct >= 0 ? '+' : ''}${s.change_pct.toFixed(2)}%` : '--'}
+      </span>
+    </Link>
+  )
+}
+
+function StockGroup({ title, stocks }: { title: string; stocks: ScreenStockItem[] }) {
+  const [open, setOpen] = useState(true)
+  return (
+    <div className="mb-1.5">
+      <button
+        onClick={() => setOpen(!open)}
+        className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground"
+      >
+        <ChevronRight size={12} className={`transition-transform ${open ? 'rotate-90' : ''}`} />
+        {title} ({stocks.length})
+      </button>
+      {open && <div className="ml-3 mt-0.5">{stocks.map(s => <StockRow key={s.code} s={s} />)}</div>}
+    </div>
+  )
+}
+
+export const ScreenResultCard = memo(function ScreenResultCard({ data }: { data: ScreenResult }) {
+  if (!data.stocks || data.stocks.length === 0) return null
+
+  const highScore = data.stocks.filter(s => (s.funnel_score ?? 0) >= 0.8)
+  const rest = data.stocks.filter(s => (s.funnel_score ?? 0) < 0.8)
+
+  return (
+    <div className="my-2 rounded-xl border border-border bg-card/50 p-3 text-sm shadow-sm">
+      <div className="mb-2 flex items-center justify-between text-xs text-muted-foreground">
+        <span>漏斗筛选 {data.date}</span>
+        <span className="rounded-full bg-primary/10 px-2 py-0.5 font-medium text-primary">
+          {data.meta.ai_count} 只入选
+        </span>
+      </div>
+      <div className="mb-1 flex gap-4 text-[10px] text-muted-foreground px-2">
+        <span className="w-14">代码</span>
+        <span className="flex-1">名称</span>
+        <span className="w-10 text-right">分数</span>
+        <span className="w-16 text-right">涨跌</span>
+      </div>
+      {highScore.length > 0 && <StockGroup title="高分候选 ≥0.8" stocks={highScore} />}
+      {rest.length > 0 && <StockGroup title="其他候选" stocks={rest} />}
+    </div>
+  )
+})

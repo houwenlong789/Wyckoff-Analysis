@@ -13,9 +13,16 @@ import uuid
 from collections import deque
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
+
+import contextlib
+import re
+
+from rich.highlighter import Highlighter
 from rich.markdown import Markdown
 from rich.text import Text
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -67,6 +74,40 @@ class StatusBar(Static):
         padding: 0 1;
     }
     """
+
+
+class _PasteHighlighter(Highlighter):
+    def highlight(self, text: Text) -> None:
+        m = re.match(r"^\[Pasted Text: \d+ lines\]$", text.plain)
+        if m:
+            text.stylize("bold magenta", m.start(), m.end())
+
+
+class ChatInput(Input):
+    """支持多行粘贴折叠显示的输入框。"""
+
+    _pasted_text: str | None = None
+
+    def on_paste(self, event: events.Paste) -> None:
+        lines = event.text.splitlines()
+        if len(lines) <= 1:
+            return
+        self._pasted_text = event.text
+        self.value = f"[Pasted Text: {len(lines)} lines]"
+        event.prevent_default()
+        event.stop()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if self._pasted_text is None:
+            return
+        expected = f"[Pasted Text: {len(self._pasted_text.splitlines())} lines]"
+        if event.value != expected:
+            self._pasted_text = None
+
+    def consume_pasted(self) -> str | None:
+        text = self._pasted_text
+        self._pasted_text = None
+        return text
 
 
 class BackgroundTaskPanel(Static):
@@ -179,6 +220,10 @@ class _InputState:
     MODEL_KEY = "model_key"
     MODEL_NAME = "model_name"
     MODEL_URL = "model_url"
+    SCHED_ID = "sched_id"
+    SCHED_NAME = "sched_name"
+    SCHED_CRON = "sched_cron"
+    SCHED_ACTION = "sched_action"
 
 
 # ---------------------------------------------------------------------------
@@ -296,10 +341,8 @@ class ToolConfirmScreen(ModalScreen[dict]):
         elif self.tool_name == "write_file":
             modified["path"] = event.value
         else:
-            try:
+            with contextlib.suppress(json.JSONDecodeError):
                 modified = json.loads(event.value)
-            except json.JSONDecodeError:
-                pass
         self.dismiss({"action": "edit", "modified_args": modified})
 
     def action_cancel(self) -> None:
@@ -375,7 +418,7 @@ class WyckoffTUI(App):
                 self._agent_log.addHandler(fh)
                 self._agent_log.propagate = False
             except Exception:
-                pass
+                logger.debug("agent log file handler setup failed", exc_info=True)
         # 后台任务管理
         from cli.background import BackgroundTaskManager
 
@@ -387,12 +430,20 @@ class WyckoffTUI(App):
         # 交互式输入状态
         self._input_mode = _InputState.NONE
         self._input_buf: dict[str, str] = {}
+        # 定时调度
+        from cli.scheduler import load_schedules
+
+        self._schedules = load_schedules()
 
     def compose(self) -> ComposeResult:
         yield StatusBar(self._build_status_text(), id="status-bar")
         yield BackgroundTaskPanel(self._bg_manager, id="bg-panel")
         yield ChatLog(id="chat-log", highlight=True, markup=True, wrap=True)
-        yield Input(placeholder="问我关于股票的任何问题... (/help 查看命令)", id="chat-input")
+        yield ChatInput(
+            placeholder="问我关于股票的任何问题... (/help 查看命令)",
+            id="chat-input",
+            highlighter=_PasteHighlighter(),
+        )
 
     def on_mount(self) -> None:
         # 加载保存的主题
@@ -403,7 +454,7 @@ class WyckoffTUI(App):
             if saved_theme and saved_theme in self.available_themes:
                 self.theme = saved_theme
         except Exception:
-            pass
+            logger.debug("load saved theme failed", exc_info=True)
 
         log = self.query_one("#chat-log", ChatLog)
         log.write(
@@ -417,6 +468,8 @@ class WyckoffTUI(App):
         if self._session_expired:
             log.write(Text.from_markup("[yellow]⚠ 登录已过期，请输入 /login 重新登录[/yellow]\n"))
         self.query_one("#chat-input", Input).focus()
+        if self._schedules:
+            self.set_interval(60.0, self._check_schedules)
 
     def _build_status_text(self) -> str:
         from importlib.metadata import version as _ver
@@ -432,6 +485,7 @@ class WyckoffTUI(App):
             parts.append(f"{prov}:{model}")
         email = self._tools.state.get("email", "") if self._tools else ""
         parts.append(email or "未登录")
+        parts.append(f"#{self._session_id}")
         t = self._session_tokens
         if t["rounds"] > 0:
             parts.append(f"Token: {t['input'] + t['output']:,}")
@@ -478,7 +532,7 @@ class WyckoffTUI(App):
                 t.start()
                 t.join(timeout=5)
             except Exception:
-                pass
+                logger.debug("save session summary on exit failed", exc_info=True)
         self.exit()
 
     def action_quit(self) -> None:
@@ -534,7 +588,7 @@ class WyckoffTUI(App):
 
             save_config_key("theme", new_theme)
         except Exception:
-            pass
+            logger.debug("save theme preference failed", exc_info=True)
 
     # ----- Spinner（ChatLog 底部边框） -----
 
@@ -559,9 +613,10 @@ class WyckoffTUI(App):
     # ----- 输入处理 -----
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
-        inp = event.input
+        inp = self.query_one("#chat-input", ChatInput)
+        text = (inp.consume_pasted() or event.value).strip()
         inp.clear()
+        inp._pasted_text = None
 
         # 交互式多步输入
         if self._input_mode != _InputState.NONE:
@@ -584,6 +639,7 @@ class WyckoffTUI(App):
 
         if self._busy:
             self._queue.append(text)
+            log.write(Text.from_markup("  [dim]📋 已排队（等待当前回复完成后自动发送）[/dim]"))
             return
 
         # 用户消息
@@ -592,7 +648,12 @@ class WyckoffTUI(App):
     def _send_message(self, text: str) -> None:
         log = self.query_one("#chat-log", ChatLog)
         log.write(Text(""))
-        log.write(Text.from_markup(f"[bold cyan]❯[/bold cyan] {text}"))
+        lines = text.splitlines()
+        if len(lines) > 3:
+            preview = "\n".join(lines[:3]) + f"\n... ({len(lines)} lines total)"
+            log.write(Text.from_markup(f"[bold cyan]❯[/bold cyan] {preview}"))
+        else:
+            log.write(Text.from_markup(f"[bold cyan]❯[/bold cyan] {text}"))
         # 注入记忆上下文
         try:
             from cli.memory import build_memory_context
@@ -601,7 +662,7 @@ class WyckoffTUI(App):
             if mem_ctx and mem_ctx not in self._system_prompt:
                 self._system_prompt = self._system_prompt.rstrip() + "\n" + mem_ctx
         except Exception:
-            pass
+            logger.debug("memory context injection failed", exc_info=True)
         self._messages.append({"role": "user", "content": text})
         self._start_spinner("thinking")
         self._run_agent()
@@ -631,6 +692,7 @@ class WyckoffTUI(App):
                     "  /login   — 登录\n"
                     "  /logout  — 退出登录\n"
                     "  /token   — Token 用量\n"
+                    "  /schedule— 定时任务（list/add/rm/on/off）\n"
                     "  /resume  — 恢复历史对话\n"
                     "  /new     — 新对话 (Ctrl+N)\n"
                     "  /clear   — 清屏 (Ctrl+L)\n"
@@ -696,6 +758,8 @@ class WyckoffTUI(App):
                 self._resume_session(parts[1].strip())
             else:
                 self._resume_session_selector()
+        elif cmd == "/schedule":
+            self._handle_schedule_cmd(raw, log)
         else:
             self._try_skill(raw, log)
 
@@ -793,7 +857,7 @@ class WyckoffTUI(App):
 
                 logout()
             except Exception:
-                pass
+                logger.warning("logout failed", exc_info=True)
             self._tools.state.update({"user_id": "", "email": "", "access_token": "", "refresh_token": ""})
         log.write(Text.from_markup("[green]已退出登录[/green]"))
         self._update_status()
@@ -847,7 +911,7 @@ class WyckoffTUI(App):
             return
         default_cfg = next((c for c in configs if c["id"] == default_id), configs[0])
         if len(configs) == 1:
-            from cli.__main__ import _create_provider
+            from cli._provider_factory import _create_provider
 
             provider, err = _create_provider(
                 default_cfg["provider_name"],
@@ -1059,8 +1123,10 @@ class WyckoffTUI(App):
             self._input_buf["base_url"] = text
             self._input_mode = _InputState.NONE
             inp.placeholder = "问我关于股票的任何问题... (/help 查看命令)"
-            # 创建 provider
             self._apply_model_config()
+
+        elif mode in (_InputState.SCHED_ID, _InputState.SCHED_NAME, _InputState.SCHED_CRON, _InputState.SCHED_ACTION):
+            self._handle_sched_input(mode, text, log, inp)
 
     def _apply_model_config(self) -> None:
         log = self.query_one("#chat-log", ChatLog)
@@ -1095,6 +1161,148 @@ class WyckoffTUI(App):
         except Exception as e:
             log.write(Text.from_markup(f"  [red]配置失败: {e}[/red]"))
 
+    # ----- 定时调度 -----
+
+    def _handle_schedule_cmd(self, raw: str, log) -> None:
+        parts = raw.strip().split()
+        sub = parts[1] if len(parts) > 1 else "list"
+        if sub == "list":
+            self._schedule_list(log)
+        elif sub == "add":
+            self._schedule_add_start(log)
+        elif sub == "rm" and len(parts) > 2:
+            self._schedule_remove(parts[2], log)
+        elif sub == "on" and len(parts) > 2:
+            self._schedule_toggle(parts[2], True, log)
+        elif sub == "off" and len(parts) > 2:
+            self._schedule_toggle(parts[2], False, log)
+        else:
+            log.write(Text.from_markup("[dim]/schedule 用法: list | add | rm <id> | on <id> | off <id>[/dim]"))
+
+    def _schedule_list(self, log) -> None:
+        if not self._schedules:
+            log.write(Text.from_markup("[dim]暂无定时任务。使用 /schedule add 创建[/dim]"))
+            return
+        log.write(Text.from_markup("\n[bold]定时任务[/bold]"))
+        for s in self._schedules:
+            icon = "[green]●[/green]" if s.enabled else "[dim]○[/dim]"
+            log.write(Text.from_markup(f"  {icon} [bold]{s.id}[/bold] — {s.name}  [dim]{s.cron}[/dim]  → {s.action}"))
+
+    def _handle_sched_input(self, mode: str, text: str, log, inp) -> None:
+        if mode == _InputState.SCHED_ID:
+            self._input_buf["id"] = text
+            log.write(Text.from_markup("  输入任务名称（如：盘前风控）："))
+            inp.placeholder = "任务名称"
+            self._input_mode = _InputState.SCHED_NAME
+        elif mode == _InputState.SCHED_NAME:
+            self._input_buf["name"] = text
+            log.write(Text.from_markup("  输入 cron 表达式（如：25 9 * * 1-5）："))
+            inp.placeholder = "分 时 日 月 周"
+            self._input_mode = _InputState.SCHED_CRON
+        elif mode == _InputState.SCHED_CRON:
+            self._input_buf["cron"] = text
+            log.write(Text.from_markup("  输入触发动作（/skill 或自由文本）："))
+            inp.placeholder = "如 /checkup 或 帮我看看大盘"
+            self._input_mode = _InputState.SCHED_ACTION
+        elif mode == _InputState.SCHED_ACTION:
+            self._input_mode = _InputState.NONE
+            inp.placeholder = "问我关于股票的任何问题... (/help 查看命令)"
+            self._finish_schedule_add(text, log)
+
+    def _schedule_add_start(self, log) -> None:
+        log.write(Text.from_markup("\n[bold]添加定时任务[/bold]"))
+        log.write(Text.from_markup("  输入任务 ID（如：mkt-open）："))
+        inp = self.query_one("#chat-input", Input)
+        inp.placeholder = "任务 ID"
+        self._input_mode = _InputState.SCHED_ID
+        self._input_buf = {}
+
+    def _finish_schedule_add(self, action: str, log) -> None:
+        from cli.scheduler import Schedule, save_schedules
+
+        s = Schedule(
+            id=self._input_buf["id"],
+            name=self._input_buf["name"],
+            cron=self._input_buf["cron"],
+            action=action,
+        )
+        self._schedules.append(s)
+        save_schedules(self._schedules)
+        log.write(Text.from_markup(f"  [green]✓ 已添加 {s.id} ({s.cron} → {s.action})[/green]"))
+
+    def _schedule_remove(self, sched_id: str, log) -> None:
+        from cli.scheduler import save_schedules
+
+        before = len(self._schedules)
+        self._schedules = [s for s in self._schedules if s.id != sched_id]
+        if len(self._schedules) < before:
+            save_schedules(self._schedules)
+            log.write(Text.from_markup(f"  [green]✓ 已删除 {sched_id}[/green]"))
+        else:
+            log.write(Text.from_markup(f"  [red]未找到: {sched_id}[/red]"))
+
+    def _schedule_toggle(self, sched_id: str, enable: bool, log) -> None:
+        from cli.scheduler import save_schedules
+
+        for s in self._schedules:
+            if s.id == sched_id:
+                s.enabled = enable
+                save_schedules(self._schedules)
+                log.write(Text.from_markup(f"  [green]✓ {sched_id} 已{'启用' if enable else '禁用'}[/green]"))
+                return
+        log.write(Text.from_markup(f"  [red]未找到: {sched_id}[/red]"))
+
+    def _check_schedules(self) -> None:
+        from datetime import datetime
+
+        from cli.scheduler import cron_matches_now, save_schedules
+
+        now_min = datetime.now().strftime("%Y-%m-%dT%H:%M")
+        fired = False
+        for s in self._schedules:
+            if not s.enabled or s.last_fired.startswith(now_min):
+                continue
+            if cron_matches_now(s.cron):
+                s.last_fired = now_min
+                fired = True
+                self._fire_schedule(s)
+        if fired:
+            save_schedules(self._schedules)
+
+    def _fire_schedule(self, sched) -> None:
+        log = self.query_one("#chat-log", ChatLog)
+        log.write(Text.from_markup(f"\n[bold yellow]⏰ 定时触发：{sched.name}[/bold yellow]"))
+        if sched.notify:
+            self._desktop_notify(f"Wyckoff: {sched.name}")
+        action = sched.action.strip()
+        if action.startswith("/"):
+            self._handle_command(action)
+        elif self._busy:
+            self._queue.append(action)
+            log.write(Text.from_markup("  [dim]📋 Agent 忙碌中，已排队[/dim]"))
+        else:
+            self._send_message(action)
+
+    def _desktop_notify(self, message: str) -> None:
+        import subprocess
+        import sys
+
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(
+                    ["osascript", "-e", f'display notification "{message}" with title "Wyckoff 读盘室"'],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.Popen(
+                    ["notify-send", "Wyckoff 读盘室", message],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except FileNotFoundError:
+            print("\a", end="", flush=True)
+
     def _chatlog_save(self, role: str, content: str, **kwargs):
         """保存一条对话记录到 SQLite（静默失败）。"""
         try:
@@ -1102,7 +1310,7 @@ class WyckoffTUI(App):
 
             save_chat_log(self._session_id, role, content, **kwargs)
         except Exception:
-            pass
+            logger.debug("chat log save failed", exc_info=True)
 
     # ----- Agent 执行（后台 Worker）-----
 
@@ -1293,11 +1501,8 @@ class WyckoffTUI(App):
                 _ensure_round(round_number)
 
                 if event_type == "compaction":
-                    _write(
-                        Text.from_markup(
-                            f"  [dim]📦 上下文已压缩（{event['before_messages']}条 → {event['after_messages']}条）[/dim]"
-                        )
-                    )
+                    before, after = event["before_messages"], event["after_messages"]
+                    _write(Text.from_markup(f"  [dim]📦 上下文压缩（{before}→{after}条）[/dim]"))
                     _scroll()
                     continue
 
@@ -1338,6 +1543,9 @@ class WyckoffTUI(App):
                 if event_type == "thinking":
                     _spinner_stop()
                     _display_thinking(event.get("text", ""))
+                    continue
+                if event_type == "model_start":
+                    _spinner_start("思考中")
                     continue
 
                 if event_type == "tool_start":
@@ -1483,7 +1691,7 @@ class WyckoffTUI(App):
         try:
             self.call_from_thread(self._refresh_bg_panel)
         except Exception:
-            pass
+            logger.debug("background panel refresh failed", exc_info=True)
 
     def _refresh_bg_panel(self) -> None:
         self.query_one("#bg-panel", BackgroundTaskPanel)._tick()
@@ -1506,7 +1714,7 @@ class WyckoffTUI(App):
                 status="failed" if is_error else "completed",
             )
         except Exception:
-            pass
+            logger.debug("save background task result failed", exc_info=True)
 
         log = self.query_one("#chat-log", ChatLog)
         if is_error:
@@ -1588,13 +1796,13 @@ class WyckoffTUI(App):
                     daemon=True,
                 ).start()
             except Exception:
-                pass
+                logger.debug("save session summary before restore failed", exc_info=True)
 
-        # 重置状态
         self._messages.clear()
         self._queue.clear()
         self._session_tokens = {"input": 0, "output": 0, "rounds": 0}
         self._session_id = session_id
+        self._update_status()
         log.clear()
 
         log.write(Text.from_markup(f"[green]已恢复会话[/green] [dim]{session_id} · {len(rows)} 条记录[/dim]\n"))
@@ -1646,7 +1854,7 @@ class WyckoffTUI(App):
                     daemon=True,
                 ).start()
             except Exception:
-                pass
+                logger.debug("save session summary before new chat failed", exc_info=True)
         self._messages.clear()
         self._queue.clear()
         self._session_tokens = {"input": 0, "output": 0, "rounds": 0}

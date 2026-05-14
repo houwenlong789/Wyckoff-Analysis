@@ -41,15 +41,15 @@ def test_get_quotes_accepts_universe(monkeypatch):
     client = TickFlowClient(api_key="test-key")
     calls = []
 
-    def fake_request(path, *, params=None):
-        calls.append((path, params))
+    def fake_request(path, *, params=None, json_body=None, method="GET"):
+        calls.append((path, params, json_body, method))
         return {"data": [{"symbol": "AAPL.US", "last_price": 205.0}]}
 
     monkeypatch.setattr(client, "_request", fake_request)
 
     quotes = client.get_quotes(universes=["US_Equity"])
 
-    assert calls == [("/v1/quotes", {"universes": "US_Equity"})]
+    assert calls == [("/v1/quotes", None, {"universes": ["US_Equity"]}, "POST")]
     assert quotes["AAPL.US"]["last_price"] == 205.0
 
 
@@ -86,3 +86,23 @@ def test_get_klines_batch_parses_payload(monkeypatch):
     ]
     assert list(result) == ["AAPL.US"]
     assert result["AAPL.US"]["close"].tolist() == [101.0, 102.0]
+
+
+def test_get_financial_metrics_chunks_at_one_hundred(monkeypatch):
+    client = TickFlowClient(api_key="test-key")
+    calls = []
+
+    def fake_request(path, *, params=None, json_body=None, method="GET"):
+        calls.append((path, params, json_body, method))
+        first_symbol = str(params["symbols"]).split(",", 1)[0]
+        return {"data": {first_symbol: [{"roe": 0.12}]}}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    monkeypatch.setattr("integrations.tickflow_client.time.sleep", lambda _: None)
+
+    symbols = [f"{idx:06d}.SZ" for idx in range(205)]
+    result = client.get_financial_metrics(symbols)
+
+    assert len(calls) == 3
+    assert [len(call[1]["symbols"].split(",")) for call in calls] == [100, 100, 5]
+    assert len(result) == 3
