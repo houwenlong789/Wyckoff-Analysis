@@ -105,7 +105,7 @@ def test_pick_tail_candidates_filters_prev_trade_day_and_status():
             "signal_date": "2026-04-20",
         },
     ]
-    got = pick_tail_candidates(rows, target_signal_date="2026-04-20")
+    got = pick_tail_candidates(rows, cutoff_date="2026-04-20")
     assert [x.code for x in got] == ["301090", "002217"]
     assert got[0].status == "confirmed"
 

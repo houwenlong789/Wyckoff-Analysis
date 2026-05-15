@@ -1,0 +1,59 @@
+name: Holding Diagnosis
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: holding-diagnosis-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Shanghai
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      TICKFLOW_API_KEY: ${{ secrets.TICKFLOW_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
+      DEFAULT_LLM_PROVIDER: gemini
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SUPABASE_USER_ID: ${{ secrets.SUPABASE_USER_ID }}
+      TAIL_BUY_PORTFOLIO_ID: ${{ secrets.TAIL_BUY_PORTFOLIO_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Prepare logs dir
+        run: mkdir -p logs
+
+      - name: Run holding diagnosis
+        run: |
+          set -o pipefail
+          python -u scripts/holding_diagnosis_job.py \
+            2>&1 | tee -a "${{ github.workspace }}/logs/holding_diagnosis.log"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: holding-diagnosis-logs-${{ github.run_number }}
+          path: logs/*
+          retention-days: 7
+          if-no-files-found: warn

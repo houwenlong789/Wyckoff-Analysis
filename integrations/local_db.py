@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
 
-_SCHEMA_VERSION = 7
+_SCHEMA_VERSION = 8
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -86,6 +86,10 @@ CREATE TABLE IF NOT EXISTS agent_memory (
     memory_type TEXT NOT NULL,
     content TEXT NOT NULL,
     codes TEXT DEFAULT '',
+    memory_level TEXT DEFAULT 'L1',
+    source_ref TEXT DEFAULT '',
+    confidence REAL DEFAULT 1.0,
+    metadata TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -144,6 +148,8 @@ CREATE INDEX IF NOT EXISTS idx_rec_date ON recommendation_tracking(recommend_dat
 CREATE INDEX IF NOT EXISTS idx_sig_status ON signal_pending(status);
 CREATE INDEX IF NOT EXISTS idx_mem_type ON agent_memory(memory_type);
 CREATE INDEX IF NOT EXISTS idx_mem_codes ON agent_memory(codes);
+CREATE INDEX IF NOT EXISTS idx_mem_level ON agent_memory(memory_level);
+CREATE INDEX IF NOT EXISTS idx_mem_source ON agent_memory(source_ref);
 CREATE INDEX IF NOT EXISTS idx_chatlog_session ON chat_log(session_id);
 CREATE INDEX IF NOT EXISTS idx_chatlog_created ON chat_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_tail_run_date ON tail_buy_history(run_date);
@@ -193,6 +199,7 @@ def get_db() -> sqlite3.Connection:
 def init_db() -> None:
     conn = get_db()
     conn.executescript(_DDL)
+    _ensure_agent_memory_columns(conn)
     cur = conn.execute("SELECT MAX(version) FROM schema_version")
     row = cur.fetchone()
     current = row[0] if row and row[0] else 0
@@ -210,12 +217,29 @@ def init_db() -> None:
             conn.execute("ALTER TABLE chat_log ADD COLUMN metadata TEXT DEFAULT ''")
         except Exception:
             logger.warning("migration: add metadata column failed", exc_info=True)
+    if current < 8:
+        _ensure_agent_memory_columns(conn)
     if current < _SCHEMA_VERSION:
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version) VALUES(?)",
             (_SCHEMA_VERSION,),
         )
         conn.commit()
+
+
+def _ensure_agent_memory_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(agent_memory)").fetchall()}
+    columns = {
+        "memory_level": "TEXT DEFAULT 'L1'",
+        "source_ref": "TEXT DEFAULT ''",
+        "confidence": "REAL DEFAULT 1.0",
+        "metadata": "TEXT DEFAULT ''",
+    }
+    for name, ddl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE agent_memory ADD COLUMN {name} {ddl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_level ON agent_memory(memory_level)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_source ON agent_memory(source_ref)")
 
 
 def _backfill_background_tasks_from_chat_log(conn: sqlite3.Connection) -> None:
@@ -392,6 +416,24 @@ def load_signals(*, status: str | None = None, limit: int = 200) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
+def load_signals_by_codes(codes: list[str]) -> dict[str, dict]:
+    if not codes:
+        return {}
+    conn = get_db()
+    ph = ",".join("?" for _ in codes)
+    cur = conn.execute(
+        f"SELECT * FROM signal_pending WHERE code IN ({ph}) ORDER BY signal_date DESC",
+        codes,
+    )
+    result: dict[str, dict] = {}
+    for r in cur.fetchall():
+        row = dict(r)
+        code = row.get("code", "")
+        if code not in result:
+            result[code] = row
+    return result
+
+
 def delete_signals(codes: list[str]) -> int:
     if not codes:
         return 0
@@ -553,19 +595,69 @@ def update_local_free_cash(portfolio_id: str, free_cash: float) -> None:
 
 _MEMORY_KEEP_LIMITS: dict[str, int] = {
     "preference": 50,
+    "persona": 5,
+    "scenario": 20,
+    "session": 50,
+    "fact": 50,
     "stock_opinion": 30,
     "decision": 30,
     "market_view": 20,
 }
 
 
-def save_memory(memory_type: str, content: str, codes: str = "") -> int:
+def _memory_level(memory_type: str) -> str:
+    if memory_type == "persona":
+        return "L3"
+    if memory_type == "scenario":
+        return "L2"
+    return "L1"
+
+
+def _memory_metadata_text(metadata: dict[str, Any] | str | None) -> str:
+    if metadata is None:
+        return ""
+    if isinstance(metadata, str):
+        return metadata
+    return json.dumps(metadata, ensure_ascii=False, default=str)
+
+
+def save_memory(
+    memory_type: str,
+    content: str,
+    codes: str = "",
+    *,
+    memory_level: str | None = None,
+    source_ref: str = "",
+    confidence: float = 1.0,
+    metadata: dict[str, Any] | str | None = None,
+) -> int:
+    content = str(content).strip()
+    if not content:
+        return 0
     conn = get_db()
+    level = memory_level or _memory_level(memory_type)
+    metadata_text = _memory_metadata_text(metadata)
     with conn:
-        cur = conn.execute(
-            """INSERT INTO agent_memory (memory_type, content, codes)
-               VALUES (?, ?, ?)""",
+        existing = conn.execute(
+            """SELECT id FROM agent_memory
+               WHERE memory_type=? AND content=? AND codes=?
+               ORDER BY created_at DESC LIMIT 1""",
             (memory_type, content, codes),
+        ).fetchone()
+        if existing:
+            if source_ref:
+                conn.execute(
+                    """UPDATE agent_memory
+                       SET source_ref = CASE WHEN source_ref='' THEN ? ELSE source_ref END
+                       WHERE id=?""",
+                    (source_ref, existing["id"]),
+                )
+            return int(existing["id"])
+        cur = conn.execute(
+            """INSERT INTO agent_memory
+               (memory_type, content, codes, memory_level, source_ref, confidence, metadata)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (memory_type, content, codes, level, source_ref, confidence, metadata_text),
         )
         limit = _MEMORY_KEEP_LIMITS.get(memory_type, 50)
         conn.execute(
@@ -576,6 +668,13 @@ def save_memory(memory_type: str, content: str, codes: str = "") -> int:
             (memory_type, memory_type, limit),
         )
         return cur.lastrowid or 0
+
+
+def get_memory_by_id(memory_id: int) -> dict | None:
+    conn = get_db()
+    cur = conn.execute("SELECT * FROM agent_memory WHERE id=?", (memory_id,))
+    row = cur.fetchone()
+    return dict(row) if row else None
 
 
 def search_memory(
@@ -704,8 +803,8 @@ def search_memory_hybrid(
                 decay = 0.5
         else:
             decay = 0.5
-        # 偏好记忆不衰减
-        if m.get("memory_type") == "preference":
+        # 高层用户画像不衰减
+        if m.get("memory_type") in ("preference", "persona"):
             decay = 1.0
         m["_score"] = m.get("_score", 0.5) * decay
 
@@ -719,7 +818,7 @@ def prune_memories(keep_days: int = 90) -> int:
     cutoff = (datetime.utcnow() - timedelta(days=keep_days)).isoformat()
     with conn:
         cur = conn.execute(
-            "DELETE FROM agent_memory WHERE created_at < ? AND memory_type != 'preference'",
+            "DELETE FROM agent_memory WHERE created_at < ? AND memory_type NOT IN ('preference', 'persona')",
             (cutoff,),
         )
         return cur.rowcount
@@ -805,8 +904,8 @@ def load_chat_logs(*, session_id: str | None = None, limit: int = 200) -> list[d
     conn = get_db()
     if session_id:
         cur = conn.execute(
-            "SELECT * FROM chat_log WHERE session_id=? ORDER BY created_at ASC",
-            (session_id,),
+            "SELECT * FROM chat_log WHERE session_id=? ORDER BY created_at ASC LIMIT ?",
+            (session_id, limit),
         )
     else:
         cur = conn.execute(
@@ -992,10 +1091,16 @@ def cleanup_old_records(days: int = 30) -> dict[str, int]:
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     deleted: dict[str, int] = {}
     with conn:
-        for table in ("chat_log", "background_task_result", "agent_memory"):
+        for table in ("chat_log", "background_task_result"):
             cur = conn.execute(
                 f"DELETE FROM {table} WHERE created_at < ?",
                 (cutoff,),
             )
             deleted[table] = cur.rowcount
+        cur = conn.execute(
+            """DELETE FROM agent_memory
+               WHERE created_at < ? AND memory_type NOT IN ('preference', 'persona')""",
+            (cutoff,),
+        )
+        deleted["agent_memory"] = cur.rowcount
     return deleted

@@ -16,7 +16,7 @@ import argparse
 import os
 import sys
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # Ensure project root is on sys.path for direct script invocation
@@ -237,6 +237,116 @@ def _run_springboard_scoring(
     return scored
 
 
+def _run_step4_holdings_diagnosis(portfolio_id: str, logs_path: str | None) -> str:
+    tickflow_api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not tickflow_api_key:
+        return ""
+    from integrations.tickflow_client import TickFlowClient
+    from scripts.tail_buy_intraday_job import (
+        _analyze_holdings_actions,
+        _build_holdings_markdown,
+    )
+
+    try:
+        tf_client = TickFlowClient(api_key=tickflow_api_key)
+        h_list, h_limit, h_meta = _analyze_holdings_actions(
+            tickflow_client=tf_client,
+            portfolio_id=portfolio_id,
+            signal_map={},
+            style="conservative",
+            intraday_batch_size=200,
+            hard_stop_pct=6.0,
+            deadline_at=datetime.now(TZ) + timedelta(minutes=5),
+            logs_path=logs_path,
+        )
+        text = _build_holdings_markdown(
+            holdings=h_list,
+            portfolio_meta=h_meta,
+            tickflow_limit_hit=h_limit,
+        )
+        _log(f"持仓分时诊断: {len(h_list)} positions", logs_path)
+        return text
+    except Exception as e:
+        _log(f"持仓分时诊断失败（降级继续）: {e}", logs_path)
+        return ""
+
+
+def _run_step4_pipeline(
+    step4_target: dict,
+    symbols_info: list,
+    step3_springboard_codes: list[str],
+    step3_report_text: str,
+    benchmark_context: dict | None,
+    api_key: str,
+    model: str,
+    logs_path: str | None,
+) -> dict:
+    from core.strategy import run_step4
+    from scripts.step4_rebalancer import STEP4_REASON_MAP
+
+    t0 = datetime.now(TZ)
+    tg_bot_token = os.getenv("TG_BOT_TOKEN", "").strip()
+    tg_chat_id = os.getenv("TG_CHAT_ID", "").strip()
+    if not tg_bot_token or not tg_chat_id:
+        _log("Step4 私人再平衡: 跳过（TG_BOT_TOKEN/TG_CHAT_ID 未配置）", logs_path)
+        return {
+            "step": "私人再平衡",
+            "ok": True,
+            "err": None,
+            "elapsed_s": 0,
+            "output": "skipped (TG_BOT_TOKEN/TG_CHAT_ID 未配置)",
+        }
+
+    user_id = str(step4_target.get("user_id", "") or "").strip()
+    portfolio_id = str(step4_target.get("portfolio_id", "") or "").strip()
+    step4_candidate_meta: list[dict] = []
+    if step3_springboard_codes:
+        allowed_set = set(step3_springboard_codes)
+        for item in symbols_info:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("code", "")).strip()
+            if code in allowed_set:
+                step4_candidate_meta.append(item)
+    _log(f"Step4 私人再平衡: 候选收口为 Step3 起跳板 {len(step4_candidate_meta)} 只", logs_path)
+
+    holdings_diag_text = _run_step4_holdings_diagnosis(portfolio_id, logs_path)
+
+    step4_ok = True
+    step4_reason = "ok"
+    step4_err = None
+    try:
+        step4_ok, step4_reason = run_step4(
+            external_report=step3_report_text,
+            benchmark_context=benchmark_context,
+            api_key=api_key,
+            model=model,
+            candidate_meta=step4_candidate_meta,
+            portfolio_id=portfolio_id,
+            tg_bot_token=tg_bot_token,
+            tg_chat_id=tg_chat_id,
+            holdings_intraday_report=holdings_diag_text,
+        )
+        step4_err = None if step4_ok else STEP4_REASON_MAP.get(step4_reason, step4_reason)
+    except Exception as e:
+        step4_ok = False
+        step4_reason = "unexpected_exception"
+        step4_err = str(e)
+    elapsed4 = (datetime.now(TZ) - t0).total_seconds()
+    _log(
+        f"Step4 私人再平衡: user={user_id}, portfolio={portfolio_id}, "
+        f"ok={step4_ok}, reason={step4_reason}, elapsed={elapsed4:.1f}s, err={step4_err}",
+        logs_path,
+    )
+    return {
+        "step": "私人再平衡",
+        "ok": step4_ok and step4_err is None,
+        "err": step4_err,
+        "elapsed_s": round(elapsed4, 1),
+        "output": f"user={user_id}, portfolio={portfolio_id}, reason={step4_reason}",
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="每日定时任务：Wyckoff Funnel → 批量研报")
     parser.add_argument("--dry-run", action="store_true", help="仅校验配置，不执行任务")
@@ -299,7 +409,6 @@ def main() -> int:
         run_step3,
     )
     from core.funnel_pipeline import run_funnel as run_step2
-    from core.strategy import run_step4
 
     summary: list[dict] = []
     has_blocking_failure = False
@@ -340,6 +449,11 @@ def main() -> int:
     elif benchmark_context:
         _persist_benchmark_context(benchmark_context, logs_path)
 
+    # Step2.5: 信号确认（pending → confirmed/expired）— 必须在推荐写入前执行，
+    # 使 confirmed 信号能沉淀进 recommendation_tracking
+    if step2_ok and step2_details:
+        _run_signal_confirmation(symbols_info, step2_details, benchmark_context, logs_path)
+
     # 形态复盘写库（按 recommend_date=最近交易日）
     if step2_ok and symbols_info:
         try:
@@ -352,10 +466,6 @@ def main() -> int:
         except Exception as e:
             _log(f"推荐记录入库失败: {e}", logs_path)
 
-    # Step2.5: 信号确认（pending → confirmed/expired）
-    if step2_ok and step2_details:
-        _run_signal_confirmation(symbols_info, step2_details, benchmark_context, logs_path)
-
     # Step2.7: 起跳板 A/B/C 量化评分
     if symbols_info and step2_details:
         _scored = _run_springboard_scoring(symbols_info, step2_details)
@@ -366,10 +476,6 @@ def main() -> int:
     step3_err = None
     step3_springboard_codes: list[str] = []
     _regime_for_step3 = (benchmark_context.get("regime") or "").strip().upper() if benchmark_context else ""
-    _step3_block_regimes = {"CRASH", "BLACK_SWAN", "RISK_OFF"}
-    if _regime_for_step3 in _step3_block_regimes:
-        _log(f"Step3 跳过: 当前 regime={_regime_for_step3} 在阻断名单，省略 LLM 推理", logs_path)
-        symbols_info = []
     if symbols_info:
         t0 = datetime.now(TZ)
         try:
@@ -460,73 +566,18 @@ def main() -> int:
         )
         _log(f"Step4 私人再平衡: 跳过（{step4_target_reason}）", logs_path)
     elif not skip_step4:
-        tg_bot_token = os.getenv("TG_BOT_TOKEN", "").strip()
-        tg_chat_id = os.getenv("TG_CHAT_ID", "").strip()
-        if not tg_bot_token or not tg_chat_id:
-            summary.append(
-                {
-                    "step": "私人再平衡",
-                    "ok": True,
-                    "err": None,
-                    "elapsed_s": 0,
-                    "output": "skipped (TG_BOT_TOKEN/TG_CHAT_ID 未配置)",
-                }
+        summary.append(
+            _run_step4_pipeline(
+                step4_target=step4_target,
+                symbols_info=symbols_info,
+                step3_springboard_codes=step3_springboard_codes,
+                step3_report_text=step3_report_text,
+                benchmark_context=benchmark_context,
+                api_key=api_key,
+                model=model,
+                logs_path=logs_path,
             )
-            _log("Step4 私人再平衡: 跳过（TG_BOT_TOKEN/TG_CHAT_ID 未配置）", logs_path)
-            step4_target = None
-        if step4_target is None:
-            pass
-        else:
-            t0 = datetime.now(TZ)
-            user_id = str(step4_target.get("user_id", "") or "").strip()
-            portfolio_id = str(step4_target.get("portfolio_id", "") or "").strip()
-            step4_candidate_meta: list[dict] = []
-            if step3_springboard_codes:
-                allowed_set = set(step3_springboard_codes)
-                for item in symbols_info:
-                    if not isinstance(item, dict):
-                        continue
-                    code = str(item.get("code", "")).strip()
-                    if code in allowed_set:
-                        step4_candidate_meta.append(item)
-            _log(
-                f"Step4 私人再平衡: 候选收口为 Step3 起跳板 {len(step4_candidate_meta)} 只",
-                logs_path,
-            )
-            step4_ok = True
-            step4_reason = "ok"
-            step4_err = None
-            try:
-                step4_ok, step4_reason = run_step4(
-                    external_report=step3_report_text,
-                    benchmark_context=benchmark_context,
-                    api_key=api_key,
-                    model=model,
-                    candidate_meta=step4_candidate_meta,
-                    portfolio_id=portfolio_id,
-                    tg_bot_token=tg_bot_token,
-                    tg_chat_id=tg_chat_id,
-                )
-                step4_err = None if step4_ok else STEP4_REASON_MAP.get(step4_reason, step4_reason)
-            except Exception as e:
-                step4_ok = False
-                step4_reason = "unexpected_exception"
-                step4_err = str(e)
-            elapsed4 = (datetime.now(TZ) - t0).total_seconds()
-            summary.append(
-                {
-                    "step": "私人再平衡",
-                    "ok": step4_ok and step4_err is None,
-                    "err": step4_err,
-                    "elapsed_s": round(elapsed4, 1),
-                    "output": (f"user={user_id}, portfolio={portfolio_id}, reason={step4_reason}"),
-                }
-            )
-            _log(
-                f"Step4 私人再平衡: user={user_id}, portfolio={portfolio_id}, "
-                f"ok={step4_ok}, reason={step4_reason}, elapsed={elapsed4:.1f}s, err={step4_err}",
-                logs_path,
-            )
+        )
 
     # 汇总
     total_elapsed = sum(s.get("elapsed_s", 0) for s in summary)

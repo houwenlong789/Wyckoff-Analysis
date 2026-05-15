@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 import uuid
 from collections import deque
@@ -46,6 +47,24 @@ def _pop_lines(log_widget, n: int) -> None:
         del log_widget.lines[-n:]
         log_widget.virtual_size = Size(log_widget._widest_line_width, len(log_widget.lines))
         log_widget.refresh()
+
+
+def _get_agent_logger() -> logging.Logger:
+    agent_log = logging.getLogger("wyckoff.agent")
+    agent_log.setLevel(logging.DEBUG)
+    if not agent_log.handlers:
+        try:
+            from core.constants import LOCAL_DB_PATH
+
+            log_path = LOCAL_DB_PATH.parent / "agent.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            fh = logging.FileHandler(str(log_path), encoding="utf-8")
+            fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            agent_log.addHandler(fh)
+            agent_log.propagate = False
+        except Exception:
+            logger.debug("agent log file handler setup failed", exc_info=True)
+    return agent_log
 
 
 def _write_counted(log_widget, renderable) -> int:
@@ -402,23 +421,11 @@ class WyckoffTUI(App):
         self._messages: list[dict] = []
         self._session_tokens = {"input": 0, "output": 0, "rounds": 0}
         self._busy = False
+        self._cancel_event = threading.Event()
+        self._last_ctrl_c: float = 0.0
         self._queue: deque[str] = deque()
         self._session_id = uuid.uuid4().hex[:12]
-        # 文件日志（记录流式断开等异常）
-        self._agent_log = logging.getLogger("wyckoff.agent")
-        self._agent_log.setLevel(logging.DEBUG)
-        if not self._agent_log.handlers:
-            try:
-                from core.constants import LOCAL_DB_PATH
-
-                log_path = LOCAL_DB_PATH.parent / "agent.log"
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                fh = logging.FileHandler(str(log_path), encoding="utf-8")
-                fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-                self._agent_log.addHandler(fh)
-                self._agent_log.propagate = False
-            except Exception:
-                logger.debug("agent log file handler setup failed", exc_info=True)
+        self._agent_log = _get_agent_logger()
         # 后台任务管理
         from cli.background import BackgroundTaskManager
 
@@ -498,9 +505,7 @@ class WyckoffTUI(App):
 
     def _request_tool_confirm(self, name: str, args: dict) -> dict:
         """从 worker 线程调用，阻塞直到用户在弹窗中做出选择。"""
-        import threading as _th
-
-        event = _th.Event()
+        event = threading.Event()
         result: list[dict | None] = [None]
         display = self._tools.display_name(name) if self._tools else name
 
@@ -517,36 +522,54 @@ class WyckoffTUI(App):
 
     # ----- 快捷键动作 -----
 
+    def _save_memory_async(
+        self, messages: list[dict] | None = None, *, wait_timeout: float | None = None, skip_layers: bool = False
+    ) -> None:
+        if not self._provider:
+            return
+        msgs = list(messages if messages is not None else self._messages)
+        if not msgs:
+            return
+        try:
+            from cli.memory import save_session_summary
+
+            t = threading.Thread(
+                target=save_session_summary,
+                args=(msgs, self._provider),
+                kwargs={"session_id": self._session_id, "skip_layers": skip_layers},
+                daemon=True,
+            )
+            t.start()
+            if wait_timeout is not None:
+                t.join(timeout=wait_timeout)
+        except Exception:
+            logger.debug("save session summary failed", exc_info=True)
+
     def _save_and_exit(self) -> None:
-        if self._messages and self._provider:
-            try:
-                import threading
-
-                from cli.memory import save_session_summary
-
-                t = threading.Thread(
-                    target=save_session_summary,
-                    args=(list(self._messages), self._provider),
-                    daemon=True,
-                )
-                t.start()
-                t.join(timeout=5)
-            except Exception:
-                logger.debug("save session summary on exit failed", exc_info=True)
+        self._save_memory_async(wait_timeout=5, skip_layers=True)
         self.exit()
 
     def action_quit(self) -> None:
         self._save_and_exit()
 
     def action_smart_copy(self) -> None:
-        """Ctrl+C: 有选中文本 → 复制；无选中 → 退出。"""
+        """Ctrl+C: 选中文本→复制；执行中→中断；空闲双击1s内→退出。"""
         text = self.screen.get_selected_text()
         if text:
             self.copy_to_clipboard(text)
             self.screen.clear_selection()
             self.notify("已复制", timeout=1)
-        else:
+            return
+        if self._busy:
+            self._cancel_event.set()
+            self.notify("已中断", timeout=1)
+            return
+        now = time.monotonic()
+        if now - self._last_ctrl_c < 1.0:
             self._save_and_exit()
+        else:
+            self._last_ctrl_c = now
+            self.notify("再按一次 Ctrl+C 退出", timeout=1)
 
     def action_switch_model(self) -> None:
         self._switch_model_selector()
@@ -1047,9 +1070,6 @@ class WyckoffTUI(App):
                         "refresh_token": session.get("refresh_token", ""),
                     }
                 )
-                from core.stock_cache import set_cli_tokens
-
-                set_cli_tokens(session.get("access_token", ""), session.get("refresh_token", ""))
                 log.write(Text.from_markup(f"  [green]✓ 登录成功 ({session['email']})[/green]"))
                 self._update_status()
             except Exception as e:
@@ -1317,6 +1337,7 @@ class WyckoffTUI(App):
     @work(thread=True, exclusive=True)
     def _run_agent(self) -> None:
         self._busy = True
+        self._cancel_event.clear()
         log = self.query_one("#chat-log", ChatLog)
 
         def _write(renderable):
@@ -1496,6 +1517,17 @@ class WyckoffTUI(App):
 
             runtime = AgentRuntime(self._provider, self._tools, scratchpad=_scratchpad)
             for event in runtime.run_stream(self._messages, with_current_time(self._system_prompt)):
+                if self._cancel_event.is_set():
+                    _spinner_stop()
+                    _flush_stream_line()
+                    _write(Text.from_markup("[yellow]⏹ 已中断[/yellow]"))
+                    _scroll()
+                    while self._messages and self._messages[-1].get("role") != "user":
+                        self._messages.pop()
+                    if self._messages:
+                        self._messages.pop()
+                    break
+
                 event_type = event.get("type")
                 round_number = int(event.get("round") or 0)
                 _ensure_round(round_number)
@@ -1784,19 +1816,7 @@ class WyckoffTUI(App):
             return
 
         # 保存当前会话记忆
-        if self._messages and self._provider:
-            try:
-                import threading
-
-                from cli.memory import save_session_summary
-
-                threading.Thread(
-                    target=save_session_summary,
-                    args=(list(self._messages), self._provider),
-                    daemon=True,
-                ).start()
-            except Exception:
-                logger.debug("save session summary before restore failed", exc_info=True)
+        self._save_memory_async()
 
         self._messages.clear()
         self._queue.clear()
@@ -1841,20 +1861,7 @@ class WyckoffTUI(App):
 
     def action_new_chat(self) -> None:
         # 保存会话记忆
-        if self._messages and self._provider:
-            try:
-                import threading
-
-                from cli.memory import save_session_summary
-
-                msgs_copy = list(self._messages)
-                threading.Thread(
-                    target=save_session_summary,
-                    args=(msgs_copy, self._provider),
-                    daemon=True,
-                ).start()
-            except Exception:
-                logger.debug("save session summary before new chat failed", exc_info=True)
+        self._save_memory_async()
         self._messages.clear()
         self._queue.clear()
         self._session_tokens = {"input": 0, "output": 0, "rounds": 0}

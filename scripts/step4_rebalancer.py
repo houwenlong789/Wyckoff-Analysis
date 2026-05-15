@@ -78,7 +78,7 @@ STEP4_BUY_HARD_STOP_ENABLED = os.getenv("STEP4_BUY_HARD_STOP_ENABLED", "1").stri
     "on",
 }
 STEP4_BUY_HARD_STOP_PCT = max(
-    float(os.getenv("STEP4_BUY_HARD_STOP_PCT", "9.0")),
+    float(os.getenv("STEP4_BUY_HARD_STOP_PCT", "8.0")),
     0.0,
 )
 STEP4_BUY_STOP_MODE = os.getenv("STEP4_BUY_STOP_MODE", "floor").strip().lower()
@@ -1095,6 +1095,7 @@ def _extract_stock_codes(text: str) -> list[str]:
 def _process_one_position(
     pos: PositionItem,
     window,
+    signal_info: dict | None = None,
 ) -> tuple[str, str, float, float, float | None, int | None]:
     """
     处理单个持仓，返回：(meta_block, failure_msg, live_val, latest_close, atr14)
@@ -1142,6 +1143,9 @@ def _process_one_position(
             f"- 持仓股数: {pos.shares}\n"
             f"- 持仓交易日: {(hold_trade_days if hold_trade_days is not None else '-')}\n"
             f"- 买入日期: {pos.buy_dt or '-'}\n"
+            f"- 信号类型: {signal_info.get('signal_type', '未记录') if signal_info else '未记录'}\n"
+            f"- 信号状态: {signal_info.get('status', '未记录') if signal_info else '未记录'}\n"
+            f"- 信号日期: {signal_info.get('signal_date', '-') if signal_info else '-'}\n"
         )
         # 持仓健康诊断：复用 Wyckoff 引擎检测 L2 通道、退出信号、阶段等
         try:
@@ -1203,8 +1207,14 @@ def _format_position_payload(
     if not positions:
         return ("", [], 0.0, {}, {})
 
+    from integrations.local_db import load_signals_by_codes
+
+    signal_map = load_signals_by_codes([p.code for p in positions])
+
     with ThreadPoolExecutor(max_workers=STEP4_MAX_WORKERS) as executor:
-        futures = {executor.submit(_process_one_position, pos, window): pos for pos in positions}
+        futures = {
+            executor.submit(_process_one_position, pos, window, signal_map.get(pos.code)): pos for pos in positions
+        }
         for future in as_completed(futures):
             pos = futures[future]
             try:
@@ -1590,6 +1600,70 @@ def _render_trade_ticket(
     return "\n".join(lines)
 
 
+def _build_user_message(
+    *,
+    benchmark_text: str,
+    portfolio,
+    total_equity: float,
+    candidate_codes: list[str],
+    allowed_codes: set[str],
+    max_new_buy_names: int,
+    positions_payload: str,
+    candidate_payload: str,
+    position_failures: list[str],
+    candidate_failures: list[str],
+    holdings_intraday_report: str,
+    external_report: str,
+) -> str:
+    msg = (
+        benchmark_text
+        + "[账户状态]\n"
+        + f"free_cash={portfolio.free_cash:.2f}\n"
+        + f"total_equity={float(total_equity):.2f}\n"
+        + f"position_count={len(portfolio.positions)}\n"
+        + f"candidate_count={len(candidate_codes)}\n"
+        + f"allowed_codes={','.join(sorted(allowed_codes))}\n\n"
+        + "[组合决策约束]\n"
+        + f"max_new_buy_names={max_new_buy_names}\n"
+        + "external_candidates_are_optional=true\n"
+        + "omit_rejected_candidates_from_decisions=true\n"
+        + "prefer_cash_over_marginal_candidates=true\n"
+        + "all_existing_positions_must_have_action=true\n\n"
+        + "[系统硬规则]\n"
+        + f"buy_stop_mode={STEP4_BUY_STOP_MODE}, buy_stop_pct={STEP4_BUY_HARD_STOP_PCT:.1f}\n"
+        + "仅允许依据结构止损、Distribution 信号与量价破坏做减仓/清仓，不得因为持有天数到期而机械离场。\n\n"
+        + "[持仓管理经验规则（基于历史回放统计）]\n"
+        + "信号优先级: SOS+EVR共振 > SOS > EVR > LPS（LPS不作为主仓买点，仅低仓位观察）\n"
+        + "== 已确认信号(confirmed)持仓 ==\n"
+        + "持有周期: 3-5个交易日，快进快出\n"
+        + "止盈: +8%止盈一半，剩余跟踪移动止盈\n"
+        + "止损: -5%硬止损，不犹豫\n"
+        + "持有3个交易日收益<0: 立即减仓或清仓\n"
+        + "== 未确认信号(非confirmed)持仓 ==\n"
+        + "持有周期: 8-10个交易日；强共振(SOS+EVR)允许到15个交易日\n"
+        + "止盈: +5%先止盈一半；强共振票目标+8%~10%\n"
+        + "止损: -5%减仓预警；-8%硬止损（不解释形态）\n"
+        + "持有3个交易日仍收益<0且无走强迹象: 考虑减仓\n"
+        + "持有10个交易日未达+5%: 不恋战，减仓或退出\n"
+        + "== 通用规则 ==\n"
+        + "反复入选漏斗(recommend_count>5)但持续不涨的票: 视为钝化/滞涨，不加仓\n\n"
+        + "[内部持仓量价切片]\n"
+        + (positions_payload if positions_payload else "当前无持仓，仅现金。")
+        + "\n\n[漏斗候选量价切片]\n"
+        + (candidate_payload if candidate_payload else "无")
+    )
+    data_notes: list[str] = []
+    data_notes.extend(position_failures)
+    data_notes.extend(candidate_failures)
+    if data_notes:
+        msg += "\n\n[数据注意]\n" + "\n".join(f"- {x}" for x in data_notes)
+    if holdings_intraday_report and holdings_intraday_report.strip():
+        msg += "\n\n[持仓分钟级诊断]\n" + holdings_intraday_report.strip()
+    if (not candidate_payload) and external_report and external_report.strip():
+        msg += "\n\n[Step3参考摘要-仅在候选切片缺失时启用]\n" + external_report.strip()
+    return msg
+
+
 def run(
     external_report: str,
     benchmark_context: dict | None,
@@ -1600,6 +1674,7 @@ def run(
     portfolio_id: str,
     tg_bot_token: str,
     tg_chat_id: str,
+    holdings_intraday_report: str = "",
 ) -> tuple[bool, str]:
     if not api_key or not api_key.strip():
         return (False, "missing_api_key")
@@ -1701,35 +1776,20 @@ def run(
     )
 
     max_new_buy_names = _max_new_buy_names(market_regime)
-    user_message = (
-        benchmark_text
-        + "[账户状态]\n"
-        + f"free_cash={portfolio.free_cash:.2f}\n"
-        + f"total_equity={float(total_equity):.2f}\n"
-        + f"position_count={len(portfolio.positions)}\n"
-        + f"candidate_count={len(candidate_codes)}\n"
-        + f"allowed_codes={','.join(sorted(allowed_codes))}\n\n"
-        + "[组合决策约束]\n"
-        + f"max_new_buy_names={max_new_buy_names}\n"
-        + "external_candidates_are_optional=true\n"
-        + "omit_rejected_candidates_from_decisions=true\n"
-        + "prefer_cash_over_marginal_candidates=true\n"
-        + "all_existing_positions_must_have_action=true\n\n"
-        + "[系统硬规则]\n"
-        + f"buy_stop_mode={STEP4_BUY_STOP_MODE}, buy_stop_pct={STEP4_BUY_HARD_STOP_PCT:.1f}\n"
-        + "仅允许依据结构止损、Distribution 信号与量价破坏做减仓/清仓，不得因为持有天数到期而机械离场。\n\n"
-        + "[内部持仓量价切片]\n"
-        + (positions_payload if positions_payload else "当前无持仓，仅现金。")
-        + "\n\n[漏斗候选量价切片]\n"
-        + (candidate_payload if candidate_payload else "无")
+    user_message = _build_user_message(
+        benchmark_text=benchmark_text,
+        portfolio=portfolio,
+        total_equity=total_equity,
+        candidate_codes=candidate_codes,
+        allowed_codes=allowed_codes,
+        max_new_buy_names=max_new_buy_names,
+        positions_payload=positions_payload,
+        candidate_payload=candidate_payload,
+        position_failures=position_failures,
+        candidate_failures=candidate_failures,
+        holdings_intraday_report=holdings_intraday_report,
+        external_report=external_report,
     )
-    data_notes: list[str] = []
-    data_notes.extend(position_failures)
-    data_notes.extend(candidate_failures)
-    if data_notes:
-        user_message += "\n\n[数据注意]\n" + "\n".join(f"- {x}" for x in data_notes)
-    if (not candidate_payload) and external_report and external_report.strip():
-        user_message += "\n\n[Step3参考摘要-仅在候选切片缺失时启用]\n" + external_report.strip()
 
     _dump_model_input(
         model=model,

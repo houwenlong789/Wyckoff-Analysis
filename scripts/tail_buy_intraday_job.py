@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 if __name__ == "__main__" or not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.constants import TABLE_PORTFOLIOS, TABLE_RECOMMENDATION_TRACKING, TABLE_SIGNAL_PENDING
+from core.constants import TABLE_PORTFOLIOS, TABLE_SIGNAL_PENDING
 from core.tail_buy_strategy import (
     DECISION_BUY,
     DECISION_SKIP,
@@ -176,40 +176,11 @@ def _safe_float(raw: Any, default: float = 0.0) -> float:
         return default
 
 
-def _normalize_iso_date(raw: Any) -> str:
-    text = str(raw or "").strip()
-    if not text:
-        return ""
-    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
-        return text[:10]
-    digits = "".join(ch for ch in text if ch.isdigit())
-    if len(digits) == 8:
-        return f"{digits[0:4]}-{digits[4:6]}-{digits[6:8]}"
-    return ""
-
-
-def _normalize_yyyymmdd(raw: Any) -> str:
-    text = str(raw or "").strip()
-    if not text:
-        return ""
-    digits = "".join(ch for ch in text if ch.isdigit())
-    if len(digits) >= 8:
-        return digits[:8]
-    return ""
-
-
 def _normalize_code6(raw: Any) -> str:
     digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
     if not digits:
         return ""
     return digits[-6:].zfill(6)
-
-
-def _safe_bool(raw: Any) -> bool:
-    if isinstance(raw, bool):
-        return raw
-    text = str(raw or "").strip().lower()
-    return text in {"1", "true", "yes", "on", "t"}
 
 
 def _resolve_quote_price(quote: dict[str, Any] | None) -> float:
@@ -654,169 +625,89 @@ def _resolve_trade_dates(logs_path: str | None = None) -> tuple[str, str]:
         return prev_trade, today_trade
 
 
-def _load_signal_pending_candidates(target_signal_date: str, logs_path: str | None = None) -> list[TailBuyCandidate]:
+def _load_signal_pending_candidates(
+    target_signal_date: str,
+    logs_path: str | None = None,
+    lookback_days: int = 15,
+) -> list[TailBuyCandidate]:
     if not is_admin_configured():
         raise RuntimeError("Supabase 凭据未配置，无法读取 signal_pending")
 
-    client = create_admin_client()
-    base_query = (
-        client.table(TABLE_SIGNAL_PENDING)
-        .select("code,name,signal_type,signal_score,status,signal_date")
-        .in_("status", ["pending", "confirmed"])
-    )
-    rows: list[dict] = []
-    try:
-        rows = base_query.eq("signal_date", target_signal_date).limit(5000).execute().data or []
-    except Exception as e:
-        _log(f"按 signal_date 精确查询失败，尝试宽松查询: {e}", logs_path)
-
-    if not rows:
-        try:
-            rows = (
-                client.table(TABLE_SIGNAL_PENDING)
-                .select("code,name,signal_type,signal_score,status,signal_date")
-                .in_("status", ["pending", "confirmed"])
-                .order("signal_date", desc=True)
-                .limit(8000)
-                .execute()
-                .data
-                or []
-            )
-        except Exception as e:
-            raise RuntimeError(f"读取 signal_pending 失败: {e}") from e
-
-    picked = pick_tail_candidates(rows, target_signal_date=target_signal_date)
-    _log(f"signal_pending 候选加载: raw={len(rows)}, picked={len(picked)}, signal_date={target_signal_date}", logs_path)
-    return picked
-
-
-def _parse_rec_rows(
-    rows: list[dict[str, Any]],
-    target_yyyymmdd: str,
-    target_signal_date: str,
-) -> list[TailBuyCandidate]:
-    picked_map: dict[str, TailBuyCandidate] = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        rec_date = _normalize_yyyymmdd(row.get("recommend_date"))
-        if rec_date != target_yyyymmdd:
-            continue
-        code = _normalize_code6(row.get("code"))
-        if not code:
-            continue
-        status = "confirmed" if _safe_bool(row.get("is_ai_recommended")) else "pending"
-        candidate = TailBuyCandidate(
-            code=code,
-            name=str(row.get("name", "") or code).strip() or code,
-            signal_date=_normalize_iso_date(target_signal_date) or target_signal_date,
-            status=status,
-            signal_type="unknown",
-            signal_score=_safe_float(row.get("funnel_score"), 0.0),
-        )
-        old = picked_map.get(code)
-        if old is None:
-            picked_map[code] = candidate
-            continue
-        old_rank = 1 if old.status == "confirmed" else 0
-        new_rank = 1 if candidate.status == "confirmed" else 0
-        if (new_rank, candidate.signal_score) > (old_rank, old.signal_score):
-            picked_map[code] = candidate
-    picked = list(picked_map.values())
-    picked.sort(key=lambda x: (x.status != "confirmed", -x.signal_score, x.code))
-    return picked
-
-
-def _load_recommendation_tracking_candidates(
-    target_signal_date: str,
-    logs_path: str | None = None,
-    *,
-    springboard_only: bool = False,
-) -> list[TailBuyCandidate]:
-    if not is_admin_configured():
-        raise RuntimeError("Supabase 凭据未配置，无法读取 recommendation_tracking")
+    cutoff_date = (
+        datetime.strptime(target_signal_date, "%Y-%m-%d") - timedelta(days=int(lookback_days * 1.5))
+    ).strftime("%Y-%m-%d")
 
     client = create_admin_client()
-    target_yyyymmdd = target_signal_date.replace("-", "")
-    rows: list[dict[str, Any]] = []
     try:
-        q = (
-            client.table(TABLE_RECOMMENDATION_TRACKING)
-            .select("code,name,recommend_date,funnel_score,is_ai_recommended")
-            .eq("recommend_date", int(target_yyyymmdd))
+        rows: list[dict] = (
+            client.table(TABLE_SIGNAL_PENDING)
+            .select("code,name,signal_type,signal_score,status,signal_date")
+            .in_("status", ["pending", "confirmed"])
+            .gte("signal_date", cutoff_date)
+            .order("signal_date", desc=True)
+            .limit(8000)
+            .execute()
+            .data
+            or []
         )
-        if springboard_only:
-            q = q.eq("is_ai_recommended", True)
-        rows = q.limit(5000).execute().data or []
     except Exception as e:
-        _log(f"recommendation_tracking 精确查询失败，尝试宽松查询: {e}", logs_path)
+        raise RuntimeError(f"读取 signal_pending 失败: {e}") from e
 
-    if not rows:
-        try:
-            q_fallback = (
-                client.table(TABLE_RECOMMENDATION_TRACKING)
-                .select("code,name,recommend_date,funnel_score,is_ai_recommended")
-                .order("recommend_date", desc=True)
-            )
-            if springboard_only:
-                q_fallback = q_fallback.eq("is_ai_recommended", True)
-            rows = q_fallback.limit(10000).execute().data or []
-        except Exception as e:
-            raise RuntimeError(f"读取 recommendation_tracking 失败: {e}") from e
-
-    picked = _parse_rec_rows(rows, target_yyyymmdd, target_signal_date)
+    picked = pick_tail_candidates(rows, cutoff_date=cutoff_date)
     _log(
-        f"recommendation_tracking 候选加载: raw={len(rows)}, picked={len(picked)}, recommend_date={target_yyyymmdd}",
+        f"signal_pending 候选加载: raw={len(rows)}, picked={len(picked)}, "
+        f"cutoff={cutoff_date}, target={target_signal_date}",
         logs_path,
     )
     return picked
 
 
-def _load_tail_candidates(target_signal_date: str, logs_path: str | None = None) -> tuple[list[TailBuyCandidate], str]:
-    """加载尾盘候选池。优先使用 T-1 日的起跳板（is_ai_recommended）作为主池，
-    signal_pending 中未被起跳板覆盖的票作为补充。"""
-    springboard: list[TailBuyCandidate] = []
-    pending: list[TailBuyCandidate] = []
-    springboard_err = ""
-    pending_err = ""
-
-    try:
-        springboard = _load_recommendation_tracking_candidates(
-            target_signal_date,
-            logs_path,
-            springboard_only=True,
+def _load_holding_candidates(
+    portfolio_id: str,
+    target_signal_date: str,
+    logs_path: str | None = None,
+) -> list[TailBuyCandidate]:
+    state = load_portfolio_state(portfolio_id)
+    positions = state.get("positions", []) if isinstance(state, dict) else []
+    candidates: list[TailBuyCandidate] = []
+    for pos in positions:
+        code = _normalize_code6(pos.get("code"))
+        if not code:
+            continue
+        candidates.append(
+            TailBuyCandidate(
+                code=code,
+                name=str(pos.get("name", "") or code).strip() or code,
+                signal_date=target_signal_date,
+                status="confirmed",
+                signal_type="holding",
+                signal_score=0.0,
+            )
         )
-    except Exception as e:
-        springboard_err = str(e)
-        _log(f"起跳板候选加载失败（降级继续）: {e}", logs_path)
+    _log(f"持仓候选加载: portfolio={portfolio_id}, count={len(candidates)}", logs_path)
+    return candidates
 
-    try:
-        pending = _load_signal_pending_candidates(target_signal_date, logs_path)
-    except Exception as e:
-        pending_err = str(e)
-        _log(f"signal_pending 加载失败（降级继续）: {e}", logs_path)
 
-    if springboard_err and pending_err:
-        raise RuntimeError(f"候选池双源都失败: springboard={springboard_err}; signal_pending={pending_err}")
+def _load_tail_candidates(
+    target_signal_date: str,
+    portfolio_id: str,
+    logs_path: str | None = None,
+) -> tuple[list[TailBuyCandidate], str]:
+    """加载尾盘候选池：signal_pending 近15日 + 当前持仓，去重合并。"""
+    pending = _load_signal_pending_candidates(target_signal_date, logs_path)
+    holdings = _load_holding_candidates(portfolio_id, target_signal_date, logs_path)
 
-    springboard_codes = {c.code for c in springboard}
-    supplement = [c for c in pending if c.code not in springboard_codes]
+    pending_codes = {c.code for c in pending}
+    supplement = [c for c in holdings if c.code not in pending_codes]
 
-    for c in springboard:
-        c.status = "confirmed"
-
-    merged = springboard + supplement
+    merged = pending + supplement
     merged.sort(key=lambda x: (x.status != "confirmed", -x.signal_score, x.code))
 
     source_desc = (
-        f"springboard={len(springboard)} + signal_pending_supplement={len(supplement)} "
-        f"(recommend_date/signal_date={target_signal_date})"
+        f"signal_pending_15d={len(pending)} + holding={len(supplement)} "
+        f"(target={target_signal_date}, portfolio={portfolio_id})"
     )
-    _log(
-        f"候选池加载完成: 起跳板={len(springboard)}, signal_pending补充={len(supplement)}, "
-        f"合计={len(merged)}, target_date={target_signal_date}",
-        logs_path,
-    )
+    _log(f"候选池加载完成: signal_pending={len(pending)}, 持仓补充={len(supplement)}, 合计={len(merged)}", logs_path)
     return merged, source_desc
 
 
@@ -1377,7 +1268,7 @@ def main() -> int:
 
     prev_trade_date, today_trade_date = _resolve_trade_dates(logs_path)
     try:
-        pending_candidates, candidate_source_desc = _load_tail_candidates(prev_trade_date, logs_path)
+        pending_candidates, candidate_source_desc = _load_tail_candidates(prev_trade_date, portfolio_id, logs_path)
     except Exception as e:
         _log(f"读取候选池失败: {e}", logs_path)
         return 1
@@ -1561,6 +1452,7 @@ def main() -> int:
         extra_sections=[holdings_section],
         extra_sections_first=True,
         candidate_source=candidate_source_desc,
+        buy_only=True,
     )
     feishu_ok, tg_ok = _send_notifications(
         feishu_webhook=feishu_webhook,

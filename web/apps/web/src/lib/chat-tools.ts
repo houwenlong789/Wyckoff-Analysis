@@ -71,15 +71,6 @@ export async function fetchTickFlowKey(deps: ToolDeps, userId: string): Promise<
   return keys.tickflow
 }
 
-async function checkWhitelist(deps: ToolDeps, userId: string): Promise<boolean> {
-  const { data } = await deps.supabase
-    .from('whitelist')
-    .select('user_id')
-    .eq('user_id', userId)
-    .limit(1)
-  return Array.isArray(data) && data.length > 0
-}
-
 function normalizeTushareCode(code: string): string {
   const c = code.replace(/\.\w+$/, '')
   if (c.startsWith('6')) return `${c}.SH`
@@ -204,21 +195,8 @@ async function fetchKlineViaTickFlow(deps: ToolDeps, code: string, apiKey: strin
   return parseTickFlowPayload(await batchResp.json(), symbol)
 }
 
-async function fetchKlineFromCache(deps: ToolDeps, code: string, startIso: string, endIso: string): Promise<KlineRow[]> {
-  const { data } = await deps.supabase
-    .from('stock_hist_cache')
-    .select('date,open,high,low,close,volume')
-    .eq('symbol', code)
-    .eq('adjust', 'qfq')
-    .gte('date', startIso)
-    .lte('date', endIso)
-    .order('date', { ascending: false })
-    .limit(250)
-  if (!data || data.length === 0) return []
-  return parseKlineRows(data).reverse()
-}
 
-export async function fetchKlineForAgent(deps: ToolDeps, code: string, keys: { tickflow: string | null; tushare: string | null }, userId: string): Promise<KlineRow[]> {
+export async function fetchKlineForAgent(deps: ToolDeps, code: string, keys: { tickflow: string | null; tushare: string | null }, _userId: string): Promise<KlineRow[]> {
   const end = new Date(); end.setDate(end.getDate() - 1)
   const start = new Date(); start.setDate(start.getDate() - 500)
   const fmt = (d: Date) => d.toISOString().slice(0, 10).replace(/-/g, '')
@@ -230,9 +208,7 @@ export async function fetchKlineForAgent(deps: ToolDeps, code: string, keys: { t
   if (isCn && keys.tushare) {
     try { const r = await fetchKlineViaTushare(deps, code, keys.tushare, fmt(start), fmt(end)); if (r.length) return r.sort((a, b) => a.date.localeCompare(b.date)) } catch { /* */ }
   }
-  if (!isCn || !(await checkWhitelist(deps, userId))) return []
-  const toIso = (s: string) => `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`
-  return fetchKlineFromCache(deps, code, toIso(fmt(start)), toIso(fmt(end)))
+  return []
 }
 
 export async function fetchQuotes(
@@ -503,13 +479,32 @@ export async function execExecutePortfolioUpdate(
       buy_dt: new Date().toISOString().slice(0, 10),
     }
     if (stop_loss !== undefined) record.stop_loss = stop_loss
-    const { error } = await deps.supabase.from('portfolio_positions').upsert(record)
+    const error = await savePortfolioPosition(deps, portfolioId, code, record)
     return error
-      ? `执行失败: ${error.message}`
+      ? `执行失败: ${error}`
       : `✅ 已${action === 'add' ? '新增' : '更新'} ${code} ${name} ${shares}股 @¥${cost_price}${stop_loss ? ` 止损¥${stop_loss}` : ''}`
   }
 
   return '未知操作'
+}
+
+async function savePortfolioPosition(
+  deps: ToolDeps,
+  portfolioId: string,
+  code: string,
+  record: Record<string, unknown>,
+): Promise<string | null> {
+  const { data, error } = await deps.supabase
+    .from('portfolio_positions')
+    .update(record)
+    .eq('portfolio_id', portfolioId)
+    .eq('code', code)
+    .select('id')
+  if (error) return error.message
+  if (Array.isArray(data) && data.length > 0) return null
+
+  const { error: insertError } = await deps.supabase.from('portfolio_positions').insert(record)
+  return insertError?.message || null
 }
 
 export interface ScreenStockItem {
