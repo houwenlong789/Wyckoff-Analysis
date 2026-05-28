@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -104,13 +103,6 @@ def call_llm_via_litellm(
         max_tokens,
     )
 
-    # LiteLLM reads Gemini credentials from the environment.
-    env_backup = {}
-    provider_lower = (provider or "gemini").strip().lower()
-    if provider_lower == "gemini" and api_key:
-        env_backup["GEMINI_API_KEY"] = os.environ.get("GEMINI_API_KEY")
-        os.environ["GEMINI_API_KEY"] = api_key
-
     try:
         response = litellm.completion(
             model=litellm_model,
@@ -118,7 +110,7 @@ def call_llm_via_litellm(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
-            api_key=api_key if provider_lower != "gemini" else None,
+            api_key=api_key,
             base_url=resolved_base_url,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -127,12 +119,6 @@ def call_llm_via_litellm(
         )
     except Exception as e:
         raise RuntimeError(f"LiteLLM call failed ({litellm_model}): {e}") from e
-    finally:
-        for k, v in env_backup.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
 
     content = response.choices[0].message.content
     if not content or not content.strip():

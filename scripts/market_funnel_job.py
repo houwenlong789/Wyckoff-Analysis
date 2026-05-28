@@ -74,7 +74,7 @@ MARKET_SPECS = {
         label="美股",
         universe="US_Equity",
         symbol_file="us.txt",
-        default_max_symbols=800,
+        default_max_symbols=1500,
         default_min_quote_amount=5_000_000.0,
     ),
     "etf": MarketSpec(
@@ -263,28 +263,25 @@ def _fetch_daily_histories(
     return out, stats
 
 
-def _funnel_config(cfg: RuntimeConfig) -> FunnelConfig:
-    funnel_cfg = FunnelConfig(trading_days=cfg.kline_count)
+def funnel_config_for_market(market: str, *, trading_days: int = 320, min_avg_amount: float = 0.0) -> FunnelConfig:
+    funnel_cfg = FunnelConfig(trading_days=trading_days)
     funnel_cfg.require_cn_main_or_chinext = False
     funnel_cfg.min_market_cap_yi = 0.0
-    funnel_cfg.min_avg_amount_wan = cfg.min_avg_amount / 10000.0
+    funnel_cfg.min_avg_amount_wan = min_avg_amount / 10000.0
     funnel_cfg.enable_rs_filter = False
     funnel_cfg.enable_rs_divergence_channel = False
     funnel_cfg.require_bench_latest_alignment = False
 
-    if cfg.spec.key == "us":
-        # 美股波动率更高，SOS/Spring 门槛收紧避免 meme 股噪音
+    if market == "us":
         funnel_cfg.sos_pct_min = 7.0
         funnel_cfg.sos_vol_ratio = 3.0
         funnel_cfg.spring_vol_ratio = 1.3
         funnel_cfg.evr_max_rise = 3.0
-    elif cfg.spec.key == "hk":
-        # 港股仙股多，Spring 低价回收率天然放大，用 bias 保护 + 放宽吸筹
+    elif market == "hk":
         funnel_cfg.spring_tr_max_range_pct = 25.0
         funnel_cfg.sos_max_bias_200 = 25.0
         funnel_cfg.accum_price_from_low_max = 0.40
-    elif cfg.spec.key == "etf":
-        # ETF 波动率低于个股，放宽触发门槛
+    elif market == "etf":
         funnel_cfg.sos_pct_min = 3.5
         funnel_cfg.sos_vol_ratio = 2.0
         funnel_cfg.spring_vol_ratio = 1.0
@@ -292,6 +289,14 @@ def _funnel_config(cfg: RuntimeConfig) -> FunnelConfig:
         funnel_cfg.evr_max_rise = 2.0
 
     return funnel_cfg
+
+
+def _funnel_config(cfg: RuntimeConfig) -> FunnelConfig:
+    return funnel_config_for_market(
+        cfg.spec.key,
+        trading_days=cfg.kline_count,
+        min_avg_amount=cfg.min_avg_amount,
+    )
 
 
 def _run_layers(
@@ -304,7 +309,7 @@ def _run_layers(
     layer1 = layer1_filter(symbols, name_map, {}, df_map, funnel_cfg)
     layer2, channel_map, _ = layer2_strength_detailed(layer1, df_map, None, funnel_cfg, rps_universe=symbols)
     layer3, top_sectors = layer3_sector_resonance(layer2, {}, funnel_cfg, base_symbols=layer1, df_map=df_map)
-    triggers = layer4_triggers(layer3, df_map, funnel_cfg)
+    triggers = layer4_triggers(layer3, df_map, funnel_cfg, channel_map=channel_map)
     metrics = {
         "layer1": len(layer1),
         "layer2": len(layer2),
@@ -317,11 +322,20 @@ def _run_layers(
     return triggers, metrics
 
 
-def _latest_close(df: pd.DataFrame | None) -> float | None:
+def _latest_history_snapshot(df: pd.DataFrame | None) -> tuple[float | None, int | None]:
     if df is None or df.empty or "close" not in df.columns:
-        return None
+        return (None, None)
+    if "date" in df.columns:
+        work = df[["date", "close"]].copy()
+        work["date"] = pd.to_datetime(work["date"], errors="coerce")
+        work["close"] = pd.to_numeric(work["close"], errors="coerce")
+        work = work.dropna(subset=["date", "close"])
+        work = work[work["close"] > 0].sort_values("date")
+        if not work.empty:
+            latest = work.iloc[-1]
+            return (float(latest["close"]), int(latest["date"].strftime("%Y%m%d")))
     close = pd.to_numeric(df["close"], errors="coerce").dropna()
-    return float(close.iloc[-1]) if not close.empty else None
+    return (float(close.iloc[-1]), None) if not close.empty else (None, None)
 
 
 def _candidate_rows(
@@ -341,7 +355,10 @@ def _candidate_rows(
             item["triggers"].append(TRIGGER_LABELS.get(trigger, trigger))
     out = list(rows.values())
     for item in out:
-        item["latest_close"] = _latest_close(df_map.get(str(item["symbol"])))
+        latest_close, latest_trade_date = _latest_history_snapshot(df_map.get(str(item["symbol"])))
+        item["latest_close"] = latest_close
+        if latest_trade_date is not None:
+            item["latest_trade_date"] = latest_trade_date
     out.sort(key=lambda item: float(item["score"]), reverse=True)
     return out
 
@@ -448,18 +465,28 @@ def _require_tickflow_client() -> TickFlowClient:
     return TickFlowClient(api_key=api_key)
 
 
+def _candidate_trade_date(candidate: dict[str, Any]) -> int | None:
+    try:
+        date_int = int(candidate.get("latest_trade_date"))
+    except (TypeError, ValueError):
+        return None
+    return date_int if 19000101 <= date_int <= 29991231 else None
+
+
 def _upsert_funnel_to_tracking(candidates: list[dict[str, Any]], market: str) -> None:
     if not candidates or market not in ("us", "hk"):
         return
-    from datetime import datetime as _dt
-    from zoneinfo import ZoneInfo as _ZI
 
     from integrations.supabase_recommendation import upsert_global_recommendations
 
-    today_int = int(_dt.now(_ZI("Asia/Shanghai")).strftime("%Y%m%d"))
-    rows = []
+    rows_by_date: dict[int, list[dict[str, Any]]] = {}
+    skipped = 0
     for c in candidates:
-        rows.append(
+        recommend_date = _candidate_trade_date(c)
+        if recommend_date is None:
+            skipped += 1
+            continue
+        rows_by_date.setdefault(recommend_date, []).append(
             {
                 "code": str(c.get("symbol", "")).strip(),
                 "name": str(c.get("name", "")).strip(),
@@ -468,10 +495,56 @@ def _upsert_funnel_to_tracking(candidates: list[dict[str, Any]], market: str) ->
                 "latest_close": float(c.get("latest_close") or 0),
             }
         )
-    ok = upsert_global_recommendations(today_int, rows, market)
-    print(f"[market-funnel] DB write: market={market}, candidates={len(rows)}, ok={ok}")
-    if not ok:
-        raise RuntimeError(f"DB write failed for market={market}, candidates={len(rows)}")
+    if not rows_by_date:
+        raise ValueError("cannot resolve recommendation trade date from market histories")
+    for recommend_date, rows in sorted(rows_by_date.items()):
+        ok = upsert_global_recommendations(recommend_date, rows, market)
+        print(f"[market-funnel] DB write: market={market}, date={recommend_date}, candidates={len(rows)}, ok={ok}")
+        if not ok:
+            raise RuntimeError(f"DB write failed for market={market}, candidates={len(rows)}")
+    if skipped:
+        print(f"[market-funnel] DB write skipped candidates without trade date: {skipped}/{len(candidates)}")
+
+
+def _build_funnel_result(
+    runtime: RuntimeConfig,
+    universe_symbols: list[str],
+    quotes: dict[str, dict[str, Any]],
+    symbols: list[str],
+    df_map: dict[str, pd.DataFrame],
+    fetch_stats: dict[str, Any],
+    metrics: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    report_path: Path | None,
+) -> dict[str, Any]:
+    return {
+        "ok": bool(quotes and df_map),
+        "market": runtime.spec.key,
+        "label": runtime.spec.label,
+        "universe": runtime.spec.universe,
+        "symbol_file": str(runtime.symbol_path),
+        "report_path": str(report_path) if report_path else "",
+        "universe_symbol_count": len(universe_symbols),
+        "quote_count": len(quotes),
+        "selected_count": len(symbols),
+        "fetched_count": len(df_map),
+        "fetch_stats": fetch_stats,
+        "metrics": metrics,
+        "top_candidates": candidates[:100],
+        "limits": {
+            "max_symbols": runtime.max_symbols,
+            "quote_batch_size": runtime.quote_batch_size,
+            "quote_batch_sleep": runtime.quote_batch_sleep,
+            "kline_batch_size": runtime.kline_batch_size,
+            "kline_batch_sleep": runtime.kline_batch_sleep,
+            "min_quote_amount": runtime.min_quote_amount,
+        },
+    }
+
+
+def _write_tracking_candidates_if_enabled(candidates: list[dict[str, Any]], market: str) -> None:
+    if os.getenv("MARKET_FUNNEL_WRITE_DB", "").strip().lower() in {"1", "true", "yes"}:
+        _upsert_funnel_to_tracking(candidates, market)
 
 
 def run_market_funnel(
@@ -502,33 +575,21 @@ def run_market_funnel(
     print(f"[market-funnel] {runtime.spec.label} 漏斗筛选 L1~L4 symbols={len(fetched_symbols)}")
     triggers, metrics = _run_layers(fetched_symbols, name_map, df_map, runtime) if df_map else ({}, {})
     report_path = _report_path(runtime.output_path)
-    result = {
-        "ok": bool(quotes and df_map),
-        "market": runtime.spec.key,
-        "label": runtime.spec.label,
-        "universe": runtime.spec.universe,
-        "symbol_file": str(runtime.symbol_path),
-        "report_path": str(report_path) if report_path else "",
-        "universe_symbol_count": len(universe_symbols),
-        "quote_count": len(quotes),
-        "selected_count": len(symbols),
-        "fetched_count": len(df_map),
-        "fetch_stats": fetch_stats,
-        "metrics": metrics,
-        "top_candidates": _candidate_rows(triggers, name_map=name_map, df_map=df_map)[:50],
-        "limits": {
-            "max_symbols": runtime.max_symbols,
-            "quote_batch_size": runtime.quote_batch_size,
-            "quote_batch_sleep": runtime.quote_batch_sleep,
-            "kline_batch_size": runtime.kline_batch_size,
-            "kline_batch_sleep": runtime.kline_batch_sleep,
-            "min_quote_amount": runtime.min_quote_amount,
-        },
-    }
+    candidates = _candidate_rows(triggers, name_map=name_map, df_map=df_map)
+    result = _build_funnel_result(
+        runtime,
+        universe_symbols,
+        quotes,
+        symbols,
+        df_map,
+        fetch_stats,
+        metrics,
+        candidates,
+        report_path,
+    )
     _write_output(runtime.output_path, result)
     _write_report(report_path, result)
-    if os.getenv("MARKET_FUNNEL_WRITE_DB", "").strip().lower() in {"1", "true", "yes"}:
-        _upsert_funnel_to_tracking(result.get("top_candidates") or [], runtime.spec.key)
+    _write_tracking_candidates_if_enabled(candidates, runtime.spec.key)
     print(
         f"[market-funnel] done ok={result['ok']} market={runtime.spec.key} "
         f"quotes={len(quotes)} selected={len(symbols)} fetched={len(df_map)} "

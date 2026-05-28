@@ -147,6 +147,14 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       TZ: Asia/Shanghai
+      FUNNEL_AI_SELECTION_MODE: "all_formal_l4"
+      FUNNEL_AI_TOTAL_CAP: "8"
+      FUNNEL_AI_RISK_ON_TREND: "3"
+      FUNNEL_AI_RISK_ON_ACCUM: "5"
+      FUNNEL_AI_RISK_OFF_TREND: "0"
+      FUNNEL_AI_RISK_OFF_ACCUM: "0"
+      FUNNEL_AI_NEUTRAL_TREND: "2"
+      FUNNEL_AI_NEUTRAL_ACCUM: "3"
 
     steps:
       - name: Resolve period dates

@@ -42,6 +42,7 @@ jobs:
 
       - name: Run premarket risk job
         run: |
+          set -o pipefail
           python -u scripts/premarket_risk_job.py --logs ${{ github.workspace }}/logs/premarket_risk.log \
             2>&1 | tee -a ${{ github.workspace }}/logs/premarket_risk.console.log
 

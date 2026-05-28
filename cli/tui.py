@@ -6,19 +6,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import re
 import threading
 import time
 import uuid
 from collections import deque
 from typing import Any
-
-logger = logging.getLogger(__name__)
-
-
-import contextlib
-import re
 
 from rich.highlighter import Highlighter
 from rich.markdown import Markdown
@@ -31,10 +27,97 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, OptionList, RichLog, Static
 from textual.widgets.option_list import Option
 
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 禁用 kitty keyboard protocol（与 macOS 中文输入法冲突）
+# CSI-u 序列格式: \x1b[ keycode ; modifiers ; text_codepoints u
+# 中文 IME 产生的序列含冒号分隔的 Unicode codepoints，textual 无法解析
+# 策略：输出侧阻止启用 kitty protocol + 输入侧将 CSI-u 解码为纯文本
+# ---------------------------------------------------------------------------
+_KITTY_ENABLE = "\x1b[>1u"
+_KITTY_DISABLE = "\x1b[<u"
+_CSI_U_IME_RE = re.compile(r"\x1b\[\d+(?::\d+)*;;([\d:]+)u")
+
+
+def _decode_csi_u(m: re.Match[str]) -> str:
+    text_field = m.group(1)
+    try:
+        return "".join(chr(int(cp)) for cp in text_field.split(":") if cp)
+    except (ValueError, OverflowError):
+        return m.group(0)
+
+
+def _make_csi_u_input_thread(driver_self) -> None:
+    """替换 run_input_thread：将 CSI-u 序列解码为纯文本后再交给 XTermParser。"""
+    import os
+    import selectors
+    from codecs import getincrementaldecoder
+
+    from textual._loop import loop_last
+    from textual._xterm_parser import XTermParser
+
+    selector = selectors.SelectSelector()
+    selector.register(driver_self.fileno, selectors.EVENT_READ)
+    fileno = driver_self.fileno
+    EVENT_READ = selectors.EVENT_READ
+
+    parser = XTermParser(driver_self._debug)
+    feed = parser.feed
+    tick = parser.tick
+    utf8_decoder = getincrementaldecoder("utf-8")().decode
+
+    def process_selector_events(selector_events, final=False):
+        for last, (_selector_key, mask) in loop_last(selector_events):
+            if mask & EVENT_READ:
+                raw = os.read(fileno, 1024 * 4)
+                unicode_data = utf8_decoder(raw, final=final and last)
+                if not unicode_data:
+                    break
+                if "\x1b[" in unicode_data and "u" in unicode_data:
+                    unicode_data = _CSI_U_IME_RE.sub(_decode_csi_u, unicode_data)
+                if unicode_data:
+                    for event in feed(unicode_data):
+                        driver_self.process_message(event)
+        for event in tick():
+            driver_self.process_message(event)
+
+    try:
+        while not driver_self.exit_event.is_set():
+            process_selector_events(selector.select(0.1))
+        selector.unregister(driver_self.fileno)
+        process_selector_events(selector.select(0.1), final=True)
+    finally:
+        selector.close()
+        try:
+            for _event in feed(""):
+                pass
+        except Exception:
+            pass
+
+
+def _patch_driver_no_kitty() -> None:
+    from textual.drivers.linux_driver import LinuxDriver
+
+    _orig_write = LinuxDriver.write
+
+    def _filtered_write(self, data: str) -> None:
+        if _KITTY_ENABLE in data or _KITTY_DISABLE in data:
+            data = data.replace(_KITTY_ENABLE, "").replace(_KITTY_DISABLE, "")
+            if not data:
+                return
+        _orig_write(self, data)
+
+    LinuxDriver.write = _filtered_write
+    LinuxDriver.run_input_thread = _make_csi_u_input_thread
+
+
+_patch_driver_no_kitty()
+
 # ---------------------------------------------------------------------------
 # Widget
 # ---------------------------------------------------------------------------
-from cli.runtime import AgentRuntime
+from cli.runtime import AgentCancelled, AgentRuntime
 from cli.scratchpad import AgentScratchpad
 from core.prompts import with_current_time
 
@@ -369,6 +452,31 @@ class ToolConfirmScreen(ModalScreen[dict]):
 
 
 # ---------------------------------------------------------------------------
+# 错误友好化
+# ---------------------------------------------------------------------------
+
+
+def _friendly_error(e: Exception) -> str:
+    """将常见网络/超时异常转为用户可读的中文提示。"""
+    import re
+
+    cls_name = type(e).__name__
+    if isinstance(e, TimeoutError):
+        return "模型响应超时（60s 无数据），请检查网络"
+    if "RemoteProtocolError" in cls_name or "ReadError" in cls_name:
+        return "连接已断开，请检查网络后重试"
+    if "APIConnectionError" in cls_name or "ConnectError" in cls_name:
+        return "API 连接失败，请检查网络"
+    err = str(e)
+    if "<html" in err.lower():
+        title = re.search(r"<title>(.*?)</title>", err, re.IGNORECASE)
+        err = title.group(1) if title else "服务端返回 HTML 错误"
+    if len(err) > 200:
+        err = err[:200] + "..."
+    return err
+
+
+# ---------------------------------------------------------------------------
 # 主应用
 # ---------------------------------------------------------------------------
 
@@ -600,6 +708,9 @@ class WyckoffTUI(App):
                 )
             )
 
+    def action_show_prompt_templates(self) -> None:
+        self._show_prompt_templates()
+
     def action_switch_theme(self) -> None:
         """打开主题切换器并保存选择。"""
         self.action_change_theme()
@@ -678,15 +789,17 @@ class WyckoffTUI(App):
         else:
             log.write(Text.from_markup(f"[bold cyan]❯[/bold cyan] {text}"))
         # 注入记忆上下文
+        mem_ctx = ""
         try:
             from cli.memory import build_memory_context
 
             mem_ctx = build_memory_context(text)
-            if mem_ctx and mem_ctx not in self._system_prompt:
-                self._system_prompt = self._system_prompt.rstrip() + "\n" + mem_ctx
         except Exception:
             logger.debug("memory context injection failed", exc_info=True)
-        self._messages.append({"role": "user", "content": text})
+        user_message = {"role": "user", "content": text}
+        if mem_ctx:
+            user_message["_memory_context"] = mem_ctx
+        self._messages.append(user_message)
         self._start_spinner("thinking")
         self._run_agent()
 
@@ -703,9 +816,12 @@ class WyckoffTUI(App):
         elif cmd == "/new":
             self.action_new_chat()
         elif cmd == "/help":
+            from cli.prompt_templates import load_prompt_templates
             from cli.skills import load_skills
 
+            templates = load_prompt_templates()
             skills = load_skills()
+            template_lines = "".join(f"  /{t.name:<11s}— {t.description}\n" for t in templates.values())
             skill_lines = "".join(f"  /{s.name:<11s}— {s.description}\n" for s in skills.values())
             log.write(
                 Text.from_markup(
@@ -715,12 +831,16 @@ class WyckoffTUI(App):
                     "  /login   — 登录\n"
                     "  /logout  — 退出登录\n"
                     "  /token   — Token 用量\n"
+                    "  /changelog— 版本更新日志\n"
+                    "  /prompt  — Prompt 模板（list/show/<name>）\n"
                     "  /schedule— 定时任务（list/add/rm/on/off）\n"
                     "  /resume  — 恢复历史对话\n"
+                    "  /fork    — 分叉当前会话\n"
                     "  /new     — 新对话 (Ctrl+N)\n"
                     "  /clear   — 清屏 (Ctrl+L)\n"
                     "  /quit    — 退出 (Ctrl+Q)\n"
                     f"\n[bold]Skills[/bold]\n{skill_lines}"
+                    f"\n[bold]Prompt Templates[/bold]\n{template_lines}"
                     "\n[bold]快捷键[/bold]\n"
                     "  Ctrl+P   — 命令面板\n"
                     "  Ctrl+C   — 复制选中文本 / 退出\n"
@@ -775,28 +895,53 @@ class WyckoffTUI(App):
                         "[dim]/model 用法: /model (切换) | /model list | /model add | /model rm <id> | /model default <id>[/dim]"
                     )
                 )
+        elif cmd == "/changelog":
+            self._show_changelog(log)
+        elif cmd == "/prompt":
+            self._handle_prompt_cmd(raw, log)
         elif cmd == "/resume":
             parts = raw.strip().split(maxsplit=1)
             if len(parts) > 1:
                 self._resume_session(parts[1].strip())
             else:
                 self._resume_session_selector()
+        elif cmd == "/fork":
+            self.action_fork_session()
         elif cmd == "/schedule":
             self._handle_schedule_cmd(raw, log)
         else:
             self._try_skill(raw, log)
 
+    def _show_changelog(self, log) -> None:
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parent.parent / "CHANGELOG.md"
+        if not path.exists():
+            log.write(Text.from_markup("[dim]CHANGELOG.md 不存在[/dim]"))
+            return
+        text = path.read_text(encoding="utf-8").strip()
+        lines = text.splitlines()
+        # 只显示最近一个版本段落（到下一个 ## 或结尾）
+        start = next((i for i, l in enumerate(lines) if l.startswith("## ")), 0)
+        end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+        section = "\n".join(lines[start:end]).strip()
+        log.write(Text.from_markup(f"\n[bold]{section}[/bold]\n"))
+
     # ----- Skills -----
 
     def _try_skill(self, raw: str, log) -> None:
+        from cli.prompt_templates import load_prompt_templates
         from cli.skills import load_skills
 
+        templates = load_prompt_templates()
         skills = load_skills()
         parts = raw.strip().split(maxsplit=1)
         cmd_name = parts[0].lstrip("/").lower()
         user_input = parts[1] if len(parts) > 1 else ""
         if cmd_name in skills:
             self._execute_skill(cmd_name, user_input)
+        elif cmd_name in templates:
+            self._execute_prompt_template(cmd_name, user_input)
         else:
             log.write(Text.from_markup(f"[red]未知命令: {raw}[/red]，/help 查看"))
 
@@ -818,6 +963,65 @@ class WyckoffTUI(App):
     def action_run_skill(self, name: str) -> None:
         """命令面板调用 skill 入口。"""
         self._execute_skill(name)
+
+    # ----- Prompt Templates -----
+
+    def _show_prompt_templates(self) -> None:
+        from cli.prompt_templates import load_prompt_templates
+
+        log = self.query_one("#chat-log", ChatLog)
+        templates = load_prompt_templates()
+        if not templates:
+            log.write(Text.from_markup("[dim]暂无 Prompt 模板[/dim]"))
+            return
+        lines = ["\n[bold]Prompt 模板[/bold]"]
+        for tpl in templates.values():
+            hint = f" [dim]{tpl.argument_hint}[/dim]" if tpl.argument_hint else ""
+            lines.append(f"  [cyan]/{tpl.name:<13}[/cyan] {tpl.description}{hint}")
+        lines.append("\n[dim]用法: /prompt <name> [补充说明]，也可以直接输入 /daily 这类模板名[/dim]")
+        log.write(Text.from_markup("\n".join(lines)))
+
+    def _handle_prompt_cmd(self, raw: str, log) -> None:
+        from cli.prompt_templates import load_prompt_templates
+
+        templates = load_prompt_templates()
+        parts = raw.strip().split(maxsplit=2)
+        if len(parts) == 1 or parts[1] == "list":
+            self._show_prompt_templates()
+            return
+        if parts[1] == "show":
+            if len(parts) < 3:
+                log.write(Text.from_markup("[dim]用法: /prompt show <name>[/dim]"))
+                return
+            tpl = templates.get(parts[2].strip().lower())
+            if not tpl:
+                log.write(Text.from_markup(f"[red]未知 Prompt 模板: {parts[2]}[/red]"))
+                return
+            body = tpl.prompt.replace("[", "\\[").replace("]", "\\]")
+            log.write(Text.from_markup(f"\n[bold]{tpl.name}[/bold] — {tpl.description}\n\n[dim]{body}[/dim]"))
+            return
+        name = parts[1].strip().lower()
+        user_input = parts[2] if len(parts) > 2 else ""
+        self._execute_prompt_template(name, user_input)
+
+    def _execute_prompt_template(self, name: str, user_input: str = "") -> None:
+        from cli.prompt_templates import load_prompt_templates, render_prompt_template
+
+        log = self.query_one("#chat-log", ChatLog)
+        templates = load_prompt_templates()
+        template = templates.get(name)
+        if not template:
+            log.write(Text.from_markup(f"[red]未知 Prompt 模板: {name}[/red]"))
+            return
+        if not self._provider:
+            log.write(Text.from_markup("[yellow]⚠ 未配置模型，请先输入 /model add[/yellow]"))
+            return
+        prompt = render_prompt_template(template, user_input)
+        self._send_message(prompt)
+
+    def action_run_template(self, name: str) -> None:
+        """命令面板调用 Prompt 模板入口。"""
+        self._execute_prompt_template(name)
 
     # ----- /config 交互 -----
 
@@ -890,6 +1094,7 @@ class WyckoffTUI(App):
     def _list_models(self) -> None:
         log = self.query_one("#chat-log", ChatLog)
         from cli.auth import load_default_model_id, load_model_configs
+        from cli.model_registry import format_model_metadata, infer_model_info
 
         configs = load_model_configs()
         default_id = load_default_model_id()
@@ -899,7 +1104,12 @@ class WyckoffTUI(App):
         log.write(Text.from_markup("\n[bold]已配置模型[/bold] [dim](↑↓选择 Enter确认 Esc取消)[/dim]"))
         for c in configs:
             mark = " [green]⭐ 默认[/green]" if c["id"] == default_id else ""
-            log.write(Text.from_markup(f"  [bold]{c['id']}[/bold] — {c['provider_name']}/{c.get('model', '?')}{mark}"))
+            metadata = format_model_metadata(infer_model_info(c))
+            log.write(
+                Text.from_markup(
+                    f"  [bold]{c['id']}[/bold] — {c['provider_name']}/{c.get('model', '?')} [dim]{metadata}[/dim]{mark}"
+                )
+            )
         self._switch_model_selector()
 
     def _remove_model(self, model_id: str) -> None:
@@ -993,6 +1203,7 @@ class WyckoffTUI(App):
     def _switch_model_selector(self) -> None:
         """弹出浮层选择器切换当前模型。"""
         from cli.auth import load_default_model_id, load_model_configs
+        from cli.model_registry import format_token_window, infer_model_info
 
         configs = load_model_configs()
         if not configs:
@@ -1003,7 +1214,8 @@ class WyckoffTUI(App):
         options = []
         for c in configs:
             mark = " ⭐" if c["id"] == default_id else ""
-            label = f"{c['id']} ({c.get('model', '?')}){mark}"
+            info = infer_model_info(c)
+            label = f"{c['id']} ({c.get('model', '?')} · ctx {format_token_window(info.context_window)}){mark}"
             options.append((c["id"], label))
         self._show_selector(options, "model_switch")
 
@@ -1332,6 +1544,36 @@ class WyckoffTUI(App):
         except Exception:
             logger.debug("chat log save failed", exc_info=True)
 
+    def _prepare_turn_memory_context(self) -> tuple[int, str]:
+        if not self._messages:
+            return -1, ""
+        turn_index = len(self._messages) - 1
+        user_text = self._messages[turn_index].get("content", "")
+        memory_context = self._messages[turn_index].pop("_memory_context", "")
+        if not memory_context:
+            return turn_index, user_text
+        try:
+            from cli.memory import prepend_memory_context
+
+            self._messages[turn_index]["_raw_content"] = user_text
+            self._messages[turn_index]["content"] = prepend_memory_context(user_text, memory_context)
+        except Exception:
+            logger.debug("memory context prepend failed", exc_info=True)
+        return turn_index, user_text
+
+    def _restore_turn_user_message(self, turn_index: int) -> None:
+        if turn_index < 0 or turn_index >= len(self._messages):
+            return
+        msg = self._messages[turn_index]
+        if msg.get("role") == "user" and msg.get("_raw_content"):
+            msg["content"] = msg.pop("_raw_content")
+
+    def _create_scratchpad(self, user_text: str) -> AgentScratchpad | None:
+        try:
+            return AgentScratchpad(user_text, session_id=self._session_id)
+        except Exception:
+            return None
+
     # ----- Agent 执行（后台 Worker）-----
 
     @work(thread=True, exclusive=True)
@@ -1358,11 +1600,8 @@ class WyckoffTUI(App):
         t_start = time.monotonic()
 
         # 记录用户输入
-        _user_text = self._messages[-1]["content"] if self._messages else ""
-        try:
-            _scratchpad: AgentScratchpad | None = AgentScratchpad(_user_text, session_id=self._session_id)
-        except Exception:
-            _scratchpad = None
+        _turn_user_index, _user_text = self._prepare_turn_memory_context()
+        _scratchpad = self._create_scratchpad(_user_text)
         _model_name = getattr(self._provider, "name", "") if self._provider else ""
         _provider_name = self._state.get("provider_name", "") if self._state else ""
         executed_tool_summaries: list[dict[str, object]] = []
@@ -1515,7 +1754,9 @@ class WyckoffTUI(App):
 
             self._tools._tool_context.on_progress = _on_sub_agent_progress
 
-            runtime = AgentRuntime(self._provider, self._tools, scratchpad=_scratchpad)
+            runtime = AgentRuntime(
+                self._provider, self._tools, scratchpad=_scratchpad, cancel_check=self._cancel_event.is_set
+            )
             for event in runtime.run_stream(self._messages, with_current_time(self._system_prompt)):
                 if self._cancel_event.is_set():
                     _spinner_stop()
@@ -1615,12 +1856,10 @@ class WyckoffTUI(App):
                     final_rounds = int(event.get("rounds", 0))
 
                     if final_text:
-                        if _streaming_started:
-                            _clear_streamed_block(include_separator=False)
-                        else:
+                        if not _streaming_started:
                             _write(Text.from_markup("  [dim]───[/dim]"))
-                        _write(Markdown(final_text))
-                        _scroll()
+                            _write(Markdown(final_text))
+                            _scroll()
 
                     total_input = final_usage.get("input_tokens", 0)
                     total_output = final_usage.get("output_tokens", 0)
@@ -1635,6 +1874,7 @@ class WyckoffTUI(App):
                     _write(Text.from_markup(f"  [dim]{' · '.join(usage_parts)}[/dim]"))
                     _scroll()
                     self.call_from_thread(self._update_status)
+                    self._restore_turn_user_message(_turn_user_index)
 
                     _chatlog_save("user", _user_text, model=_model_name, provider=_provider_name)
                     _tc_json = (
@@ -1671,21 +1911,23 @@ class WyckoffTUI(App):
                     )
                     break
 
-        except Exception as e:
+        except AgentCancelled:
             _spinner_stop()
-            err = str(e)
-            # 清理 HTML 错误响应，只保留关键信息
-            if "<html" in err.lower():
-                import re
+            _flush_stream_line()
+            _write(Text.from_markup("[yellow]⏹ 已中断[/yellow]"))
+            _scroll()
+            while self._messages and self._messages[-1].get("role") != "user":
+                self._messages.pop()
+            if self._messages:
+                self._messages.pop()
 
-                title = re.search(r"<title>(.*?)</title>", err, re.IGNORECASE)
-                err = title.group(1) if title else "服务端返回 HTML 错误"
-            if len(err) > 200:
-                err = err[:200] + "..."
+        except Exception as e:
+            self._restore_turn_user_message(_turn_user_index)
+            _spinner_stop()
+            err = _friendly_error(e)
             if _scratchpad:
                 _scratchpad.record_error(f"{type(e).__name__}: {err}", elapsed_s=time.monotonic() - t_start)
             _write(Text.from_markup(f"[red]错误: {err}[/red]"))
-            # 记录错误到日志和 SQLite
             _elapsed = time.monotonic() - t_start
             self._agent_log.error(
                 "session=%s error after=%.1fs type=%s msg=%s",
@@ -1775,6 +2017,34 @@ class WyckoffTUI(App):
 
     def action_resume_session(self) -> None:
         self._resume_session_selector()
+
+    def action_export_session(self) -> None:
+        from cli.session_tools import SessionToolError, export_session_transcript
+
+        log = self.query_one("#chat-log", ChatLog)
+        try:
+            result = export_session_transcript(session_id=self._session_id)
+        except SessionToolError as exc:
+            log.write(Text.from_markup(f"[red]导出失败: {exc}[/red]"))
+            return
+        log.write(Text.from_markup(f"[green]✓ 会话已导出[/green] [dim]{result.path}[/dim]"))
+
+    def action_fork_session(self) -> None:
+        from cli.session_tools import SessionToolError, fork_session
+
+        log = self.query_one("#chat-log", ChatLog)
+        self._save_memory_async()
+        try:
+            result = fork_session(session_id=self._session_id)
+        except SessionToolError as exc:
+            log.write(Text.from_markup(f"[red]分叉失败: {exc}[/red]"))
+            return
+        log.write(
+            Text.from_markup(
+                f"[green]✓ 会话已分叉[/green] [dim]{result.source_session_id} → {result.new_session_id}[/dim]"
+            )
+        )
+        self._resume_session(result.new_session_id)
 
     def _resume_session_selector(self) -> None:
         """弹出选择器，选择要恢复的历史会话。"""

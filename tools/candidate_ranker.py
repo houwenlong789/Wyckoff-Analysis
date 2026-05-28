@@ -18,6 +18,7 @@ TRIGGER_LABELS = {
     "lps": "LPS（缩量回踩）",
     "evr": "Effort vs Result（放量不跌）",
     "compression": "Compression（压缩蓄势）",
+    "trend_pullback": "TrendPB（趋势回踩）",
 }
 
 TRIGGER_SHORT_LABELS = {
@@ -26,15 +27,17 @@ TRIGGER_SHORT_LABELS = {
     "lps": "LPS",
     "evr": "EVR",
     "compression": "Compress",
+    "trend_pullback": "TrendPB",
 }
 
-# 分组展示优先级：SOS > EVR > Spring > LPS > Compression
-TRIGGER_GROUP_ORDER = ["sos", "evr", "spring", "lps", "compression"]
+# 分组展示优先级：SOS > EVR > Spring > LPS > TrendPB > Compression
+TRIGGER_GROUP_ORDER = ["sos", "evr", "spring", "lps", "trend_pullback", "compression"]
 TRIGGER_GROUP_TITLES = {
     "sos": "⚡ SOS 量价点火",
     "evr": "📊 EVR 放量不跌",
     "spring": "🌀 Spring 终极震仓",
     "lps": "🔄 LPS 缩量回踩",
+    "trend_pullback": "📈 TrendPB 趋势回踩",
     "compression": "🔻 Compression 压缩蓄势",
 }
 

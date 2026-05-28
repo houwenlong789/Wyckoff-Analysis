@@ -4,10 +4,12 @@ Supabase 形态复盘数据存取模块
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from bisect import bisect_right
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -22,6 +24,19 @@ from integrations.supabase_base import create_admin_client as _get_supabase_admi
 from integrations.supabase_base import is_admin_configured as is_supabase_configured
 
 logger = logging.getLogger(__name__)
+RECOMMENDATION_BACKUP_COLUMNS = (
+    "code",
+    "name",
+    "recommend_reason",
+    "recommend_date",
+    "initial_price",
+    "current_price",
+    "change_pct",
+    "recommend_count",
+    "funnel_score",
+    "is_ai_recommended",
+    "updated_at",
+)
 
 
 def _fetch_all_tracking_records(client, select_expr: str = "*", page_size: int = 1000) -> list[dict[str, Any]]:
@@ -100,6 +115,21 @@ def _close_map_from_tickflow_hist(hist: pd.DataFrame | None) -> dict[str, float]
     work = work.dropna(subset=["trade_date", "close"])
     work = work[work["close"] > 0]
     return {str(d): float(px) for d, px in zip(work["trade_date"], work["close"])}
+
+
+def _ohlc_map_from_tickflow_hist(hist: pd.DataFrame | None) -> dict[str, dict[str, float]]:
+    if hist is None or hist.empty or not {"date", "high", "low", "close"}.issubset(hist.columns):
+        return {}
+    work = hist[["date", "high", "low", "close"]].copy()
+    work["trade_date"] = pd.to_datetime(work["date"], errors="coerce").dt.strftime("%Y%m%d")
+    for col in ("high", "low", "close"):
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.dropna(subset=["trade_date", "high", "low", "close"])
+    work = work[(work["high"] > 0) & (work["low"] > 0) & (work["close"] > 0)]
+    return {
+        str(row.trade_date): {"high": float(row.high), "low": float(row.low), "close": float(row.close)}
+        for row in work.itertuples(index=False)
+    }
 
 
 def _fetch_tickflow_tracking_market_data(
@@ -240,6 +270,153 @@ def _resolve_initial_price_from_history(code_str: str, rec_date: date) -> float:
         return 0.0
 
 
+def _load_existing_recommendation_history(client) -> tuple[dict[int, int], dict[int, set[int]]]:
+    existing_counts: dict[int, int] = {}
+    existing_code_dates: dict[int, set[int]] = {}
+    all_rows = _fetch_all_tracking_records(client, "code,recommend_count,recommend_date")
+    for row in all_rows:
+        try:
+            code_int = int(row.get("code"))
+        except (TypeError, ValueError):
+            continue
+        cnt = int(row.get("recommend_count") or 1) if row.get("recommend_count") else 1
+        existing_counts[code_int] = max(existing_counts.get(code_int, 0), cnt)
+        try:
+            d = int(row.get("recommend_date"))
+            existing_code_dates.setdefault(code_int, set()).add(d)
+        except (TypeError, ValueError):
+            logger.debug("invalid recommend_date for code %s", row.get("code"), exc_info=True)
+    return existing_counts, existing_code_dates
+
+
+def _extract_recommendation_code(raw_code: Any) -> int | None:
+    code_str = "".join(filter(str.isdigit, str(raw_code or "").strip()))
+    return int(code_str) if code_str else None
+
+
+def _extract_recommendation_price(row: dict[str, Any]) -> float:
+    for key in ("initial_price", "current_price", "price", "latest_price", "close"):
+        raw_price = row.get(key)
+        if raw_price is None or raw_price == "":
+            continue
+        try:
+            parsed = float(raw_price)
+        except Exception:
+            continue
+        if parsed > 0:
+            return parsed
+    return 0.0
+
+
+def _extract_recommendation_score(row: dict[str, Any]) -> float | None:
+    for score_key in ("funnel_score", "score", "priority_score"):
+        raw_score = row.get(score_key)
+        if raw_score is None or raw_score == "":
+            continue
+        try:
+            return float(raw_score)
+        except Exception:
+            continue
+    return None
+
+
+def _merge_recommendation_payload_row(existing: dict[str, Any], row: dict[str, Any]) -> None:
+    if not existing.get("name") and row.get("name"):
+        existing["name"] = row["name"]
+    old_score = existing.get("funnel_score")
+    new_score = row.get("funnel_score")
+    if new_score is not None and (old_score is None or float(new_score) > float(old_score)):
+        existing["funnel_score"] = new_score
+        existing["recommend_reason"] = row.get("recommend_reason", "")
+    old_price = _safe_float(existing.get("initial_price"), 0.0)
+    new_price = _safe_float(row.get("initial_price"), 0.0)
+    if old_price <= 0 < new_price:
+        existing["initial_price"] = new_price
+        existing["current_price"] = new_price
+
+
+def _build_recommendation_payload(
+    recommend_date: int,
+    symbols_info: list[dict[str, Any]],
+    existing_counts: dict[int, int],
+    existing_code_dates: dict[int, set[int]],
+) -> list[dict[str, Any]]:
+    payload_by_code: dict[int, dict[str, Any]] = {}
+    for item in symbols_info:
+        code_int = _extract_recommendation_code(item.get("code"))
+        if code_int is None:
+            continue
+        old_cnt = existing_counts.get(code_int, 0)
+        seen_dates = existing_code_dates.get(code_int, set())
+        new_cnt = old_cnt if recommend_date in seen_dates else max(old_cnt, 0) + 1
+        price = _extract_recommendation_price(item)
+        row = {
+            "code": code_int,
+            "name": str(item.get("name", "")).strip(),
+            "recommend_reason": str(item.get("tag", "")).strip(),
+            "recommend_date": recommend_date,
+            "initial_price": price,
+            "current_price": price,
+            "change_pct": 0.0,
+            "recommend_count": new_cnt,
+            "funnel_score": _extract_recommendation_score(item),
+            "is_ai_recommended": False,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        existing = payload_by_code.get(code_int)
+        if existing:
+            _merge_recommendation_payload_row(existing, row)
+        else:
+            payload_by_code[code_int] = row
+    return list(payload_by_code.values())
+
+
+def _upsert_recommendation_payload(client, payload: list[dict[str, Any]]) -> None:
+    if not payload:
+        return
+    try:
+        for chunk in _chunked(payload, 500):
+            client.table(TABLE_RECOMMENDATION_TRACKING).upsert(chunk, on_conflict="code,recommend_date").execute()
+    except Exception as e:
+        msg = str(e).lower()
+        optional_cols = ("is_ai_recommended", "funnel_score", "recommend_count")
+        if not any(col in msg for col in optional_cols):
+            raise
+        fallback_payload: list[dict[str, Any]] = []
+        for row in payload:
+            r = dict(row)
+            for col in optional_cols:
+                r.pop(col, None)
+            fallback_payload.append(r)
+        for chunk in _chunked(fallback_payload, 500):
+            client.table(TABLE_RECOMMENDATION_TRACKING).upsert(chunk, on_conflict="code,recommend_date").execute()
+
+
+def prepare_recommendation_payload(recommend_date: int, symbols_info: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not is_supabase_configured() or not symbols_info:
+        return []
+    client = _get_supabase_admin_client()
+    existing_counts, existing_code_dates = _load_existing_recommendation_history(client)
+    return _build_recommendation_payload(
+        recommend_date,
+        symbols_info,
+        existing_counts,
+        existing_code_dates,
+    )
+
+
+def upsert_recommendation_payload(payload: list[dict[str, Any]]) -> bool:
+    if not is_supabase_configured() or not payload:
+        return False
+    try:
+        client = _get_supabase_admin_client()
+        _upsert_recommendation_payload(client, payload)
+        return True
+    except Exception as e:
+        print(f"[supabase_recommendation] upsert_recommendation_payload failed: {e}")
+        return False
+
+
 def upsert_recommendations(recommend_date: int, symbols_info: list[dict[str, Any]]) -> bool:
     """
     将每日选出的股票存入形态复盘表
@@ -248,113 +425,100 @@ def upsert_recommendations(recommend_date: int, symbols_info: list[dict[str, Any
     if not is_supabase_configured() or not symbols_info:
         return False
     try:
-        client = _get_supabase_admin_client()
+        payload = prepare_recommendation_payload(recommend_date, symbols_info)
 
-        existing_counts: dict[int, int] = {}
-        existing_code_dates: dict[int, set[int]] = {}
-        try:
-            all_rows = _fetch_all_tracking_records(client, "code,recommend_count,recommend_date")
-            for row in all_rows:
-                try:
-                    code_int = int(row.get("code"))
-                except (TypeError, ValueError):
-                    continue
-                cnt = int(row.get("recommend_count") or 1) if row.get("recommend_count") else 1
-                existing_counts[code_int] = max(existing_counts.get(code_int, 0), cnt)
-                try:
-                    d = int(row.get("recommend_date"))
-                    existing_code_dates.setdefault(code_int, set()).add(d)
-                except (TypeError, ValueError):
-                    logger.debug("invalid recommend_date for code %s", row.get("code"), exc_info=True)
-        except Exception:
-            existing_counts = {}
-            existing_code_dates = {}
-
-        payload = []
-        for s in symbols_info:
-            raw_code = str(s.get("code", "")).strip()
-            # 提取纯数字部分 (比如 "000001.SZ" -> "000001")
-            code_str = "".join(filter(str.isdigit, raw_code))
-            if not code_str:
-                continue
-
-            # price 优先使用 step2 传入的 initial_price，并做多字段兜底
-            price = 0.0
-            for key in ("initial_price", "current_price", "price", "latest_price", "close"):
-                raw_price = s.get(key)
-                if raw_price is None or raw_price == "":
-                    continue
-                try:
-                    parsed = float(raw_price)
-                except Exception:
-                    continue
-                if parsed > 0:
-                    price = parsed
-                    break
-
-            score_val: float | None = None
-            for score_key in ("funnel_score", "priority_score", "score"):
-                raw_score = s.get(score_key)
-                if raw_score is None or raw_score == "":
-                    continue
-                try:
-                    score_val = float(raw_score)
-                    break
-                except Exception:
-                    continue
-
-            code_int = int(code_str)
-            old_cnt = existing_counts.get(code_int, 0)
-            seen_dates = existing_code_dates.get(code_int, set())
-            if old_cnt <= 0:
-                new_cnt = 1
-            elif recommend_date in seen_dates:
-                new_cnt = old_cnt
-            else:
-                new_cnt = old_cnt + 1
-
-            payload.append(
-                {
-                    "code": code_int,  # 存为 INT，首位0会消失
-                    "name": str(s.get("name", "")).strip(),
-                    "recommend_reason": str(s.get("tag", "")).strip(),
-                    "recommend_date": recommend_date,
-                    "initial_price": price,
-                    "current_price": price,  # 初始时当前价等于加入价
-                    "change_pct": 0.0,  # 初始涨跌幅为 0
-                    "recommend_count": new_cnt,
-                    "funnel_score": score_val,
-                    "is_ai_recommended": False,
-                    "updated_at": datetime.now(UTC).isoformat(),
-                }
-            )
-
-        if payload:
-            # 使用 upsert，基于 (code, recommend_date) 唯一约束：
-            # - 同一只股票在同一天重跑会覆盖更新；
-            # - 跨天会新增一条记录；
-            # - recommend_count 按 code 维度累计。
-            try:
-                client.table(TABLE_RECOMMENDATION_TRACKING).upsert(payload, on_conflict="code,recommend_date").execute()
-            except Exception as e:
-                msg = str(e).lower()
-                optional_cols = ("is_ai_recommended", "funnel_score", "recommend_count")
-                if any(col in msg for col in optional_cols):
-                    fallback_payload: list[dict[str, Any]] = []
-                    for row in payload:
-                        r = dict(row)
-                        for col in optional_cols:
-                            r.pop(col, None)
-                        fallback_payload.append(r)
-                    client.table(TABLE_RECOMMENDATION_TRACKING).upsert(
-                        fallback_payload, on_conflict="code,recommend_date"
-                    ).execute()
-                else:
-                    raise
-        return True
+        # 使用 upsert，基于 (code, recommend_date) 唯一约束：
+        # - 同一只股票在同一天重跑会覆盖更新；
+        # - 跨天会新增一条记录；
+        # - recommend_count 按 code 维度累计。
+        return upsert_recommendation_payload(payload)
     except Exception as e:
         print(f"[supabase_recommendation] upsert_recommendations failed: {e}")
         return False
+
+
+def _clean_backup_value(value: Any) -> Any:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, str | int | float | bool):
+        return value
+    return str(value)
+
+
+def _backup_rows(rows: list[dict[str, Any]], ai_codes: list[str] | None) -> list[dict[str, Any]]:
+    ai_set = {_code6(code) for code in ai_codes or [] if _code6(code)}
+    snapshot = []
+    for row in rows:
+        clean_row = {col: _clean_backup_value(row.get(col)) for col in RECOMMENDATION_BACKUP_COLUMNS if col in row}
+        if ai_codes is not None:
+            clean_row["is_ai_recommended"] = _code6(clean_row.get("code")) in ai_set
+        snapshot.append(clean_row)
+    return sorted(snapshot, key=lambda item: int(item.get("code") or 0))
+
+
+def _sql_literal(value: Any) -> str:
+    value = _clean_backup_value(value)
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _recommendation_restore_sql(rows: list[dict[str, Any]]) -> str:
+    columns = [col for col in RECOMMENDATION_BACKUP_COLUMNS if any(col in row for row in rows)]
+    if not rows or not columns:
+        return "-- no recommendation rows to restore\n"
+    values = []
+    for row in rows:
+        values.append("  (" + ", ".join(_sql_literal(row.get(col)) for col in columns) + ")")
+    updates = ",\n  ".join(f"{col} = excluded.{col}" for col in columns if col not in {"code", "recommend_date"})
+    return "\n".join(
+        [
+            "begin;",
+            f"insert into public.{TABLE_RECOMMENDATION_TRACKING} ({', '.join(columns)})",
+            "values",
+            ",\n".join(values),
+            "on conflict (code, recommend_date) do update set",
+            f"  {updates};",
+            "commit;",
+            "",
+        ]
+    )
+
+
+def write_recommendation_backup_artifact(
+    recommend_date: int,
+    rows: list[dict[str, Any]],
+    output_dir: str,
+    *,
+    ai_codes: list[str] | None = None,
+) -> list[str]:
+    if not output_dir or not rows:
+        return []
+    snapshot = _backup_rows(rows, ai_codes)
+    target = Path(output_dir)
+    target.mkdir(parents=True, exist_ok=True)
+    base = f"recommendation_tracking_{recommend_date}"
+    json_path = target / f"{base}.json"
+    sql_path = target / f"{base}.sql"
+    payload = {
+        "table": f"public.{TABLE_RECOMMENDATION_TRACKING}",
+        "recommend_date": recommend_date,
+        "row_count": len(snapshot),
+        "generated_at": datetime.now(UTC).isoformat(),
+        "rows": snapshot,
+    }
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    sql_path.write_text(_recommendation_restore_sql(snapshot), encoding="utf-8")
+    return [str(json_path), str(sql_path)]
 
 
 def mark_ai_recommendations(recommend_date: int, ai_codes: list[str]) -> bool:
@@ -969,6 +1133,153 @@ def refresh_global_tracking_prices(market: str) -> dict[str, Any]:
         "codes_no_data": codes_no_data,
         "latest_trade_date": latest_td,
     }
+
+
+def _latest_market_records(records: list[dict[str, Any]], max_dates: int) -> list[dict[str, Any]]:
+    limit = max(int(max_dates), 1)
+    dates = sorted(
+        {d for d in (_recommend_date_to_yyyymmdd(row.get("recommend_date")) for row in records) if d},
+        reverse=True,
+    )[:limit]
+    allowed = set(dates)
+    return [row for row in records if _recommend_date_to_yyyymmdd(row.get("recommend_date")) in allowed]
+
+
+def _build_us_performance_update(
+    row: dict[str, Any],
+    code: str,
+    ohlc: dict[str, dict[str, float]],
+    now_iso: str,
+) -> dict[str, Any] | None:
+    trade_dates = sorted(ohlc)
+    rd = _recommend_date_to_yyyymmdd(row.get("recommend_date"))
+    entry_date = _pick_close_on_or_before(trade_dates, rd)
+    if not entry_date:
+        return None
+    entry = _safe_float(ohlc.get(entry_date, {}).get("close"), 0.0)
+    if entry <= 0:
+        entry = _safe_float(row.get("initial_price"), 0.0)
+    if entry <= 0:
+        return None
+    window = [(d, ohlc[d]) for d in trade_dates if d >= entry_date]
+    if not window:
+        return None
+    high_date, high_row = max(window, key=lambda item: item[1]["high"])
+    low_date, low_row = min(window, key=lambda item: item[1]["low"])
+    latest_date, latest_row = window[-1]
+    mfe_price = float(high_row["high"])
+    mae_price = float(low_row["low"])
+    current_price = float(latest_row["close"])
+    return {
+        "id": row.get("id"),
+        "code": code,
+        "recommend_date": int(rd) if rd.isdigit() else None,
+        "initial_price": round(entry, 4),
+        "current_price": round(current_price, 4),
+        "change_pct": round((current_price / entry - 1.0) * 100.0, 2),
+        "mfe_pct": round((mfe_price / entry - 1.0) * 100.0, 2),
+        "mae_pct": round((mae_price / entry - 1.0) * 100.0, 2),
+        "range_amp_pct": round((mfe_price / mae_price - 1.0) * 100.0, 2) if mae_price > 0 else 0.0,
+        "mfe_price": round(mfe_price, 4),
+        "mae_price": round(mae_price, 4),
+        "mfe_date": int(high_date),
+        "mae_date": int(low_date),
+        "performance_days": len(window),
+        "performance_updated_at": now_iso,
+        "updated_at": now_iso,
+    }
+
+
+def refresh_us_tracking_performance(max_dates: int = 60, kline_count: int = 160) -> dict[str, Any]:
+    if not is_supabase_configured():
+        raise ValueError("SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY 未配置")
+    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError("TICKFLOW_API_KEY 未配置")
+
+    client = _get_supabase_admin_client()
+    table = TABLE_RECOMMENDATION_TRACKING_US
+    records = _fetch_records_from_table(client, table, "id,code,recommend_date,initial_price")
+    records = _latest_market_records(records, max_dates)
+    if not records:
+        return _empty_us_performance_summary()
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in records:
+        code = str(row.get("code") or "").strip()
+        if code:
+            grouped.setdefault(code, []).append(row)
+
+    from integrations.tickflow_client import TickFlowClient
+
+    tf_client = TickFlowClient(api_key=api_key)
+    symbols = sorted(grouped)
+    hist_map = tf_client.get_klines_batch(symbols, period="1d", count=max(int(kline_count), 1), adjust="forward")
+    now_iso = datetime.now(UTC).isoformat()
+    updates, codes_no_data, latest_td = _build_us_performance_updates(grouped, hist_map, now_iso)
+    written = _upsert_to_table(client, table, updates)
+    return _us_performance_summary(records, grouped, written, codes_no_data, latest_td, updates)
+
+
+def _build_us_performance_updates(
+    grouped: dict[str, list[dict[str, Any]]],
+    hist_map: dict[str, pd.DataFrame],
+    now_iso: str,
+) -> tuple[list[dict[str, Any]], int, str]:
+    updates: list[dict[str, Any]] = []
+    codes_no_data = 0
+    latest_td = ""
+    for code, rows in grouped.items():
+        ohlc = _ohlc_map_from_tickflow_hist(hist_map.get(code))
+        trade_dates = sorted(ohlc)
+        if not trade_dates:
+            codes_no_data += 1
+            continue
+        latest_td = max(latest_td, trade_dates[-1])
+        for row in rows:
+            update = _build_us_performance_update(row, code, ohlc, now_iso)
+            if update is not None:
+                updates.append(update)
+    return updates, codes_no_data, latest_td
+
+
+def _empty_us_performance_summary() -> dict[str, Any]:
+    return {
+        "rows_total": 0,
+        "rows_updated": 0,
+        "rows_skipped": 0,
+        "codes_total": 0,
+        "codes_no_data": 0,
+        "latest_trade_date": "",
+        "mfe_ge_5": 0,
+        "mfe_ge_10": 0,
+        "mae_le_neg5": 0,
+    }
+
+
+def _us_performance_summary(
+    records: list[dict[str, Any]],
+    grouped: dict[str, list[dict[str, Any]]],
+    written: int,
+    codes_no_data: int,
+    latest_trade_date: str,
+    updates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    summary = _empty_us_performance_summary()
+    summary.update(
+        {
+            "rows_total": len(records),
+            "rows_updated": written,
+            "rows_skipped": max(len(records) - written, 0),
+            "codes_total": len(grouped),
+            "codes_no_data": codes_no_data,
+            "latest_trade_date": latest_trade_date,
+            "mfe_ge_5": sum(_safe_float(row.get("mfe_pct")) >= 5.0 for row in updates),
+            "mfe_ge_10": sum(_safe_float(row.get("mfe_pct")) >= 10.0 for row in updates),
+            "mae_le_neg5": sum(_safe_float(row.get("mae_pct")) <= -5.0 for row in updates),
+        }
+    )
+    return summary
 
 
 def refresh_tracking_prices_with_tickflow_realtime() -> dict[str, Any]:

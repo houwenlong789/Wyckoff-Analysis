@@ -230,6 +230,58 @@ def wyckoff_diagnose(code: str) -> dict:
 
 
 @mcp.tool()
+def intraday_analysis(code: str) -> dict:
+    """单股盘中多周期分析。纯引擎计算，返回分钟线结构化特征。
+
+    **调用时机**：用户问"盘中表现如何"、"现在能买吗"、"今天走势怎样"时调用。
+    返回 VWAP 位置、5m/15m 趋势方向、动量、量能分布、综合强度分等。
+    **结果处理**：strength_score 是核心（0-100），配合趋势和VWAP位置给出通俗建议。
+    """
+    import os
+
+    from core.intraday_analysis import analyze_intraday
+    from integrations.tickflow_client import TickFlowClient
+
+    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not api_key:
+        return {"error": "未配置 TICKFLOW_API_KEY，无法获取分钟线数据"}
+    client = TickFlowClient(api_key=api_key)
+    df_1m = client.get_intraday(code, period="1m", count=500)
+    df_5m = client.get_intraday(code, period="5m", count=100)
+    df_15m = client.get_intraday(code, period="15m", count=50)
+    if df_1m.empty:
+        return {"error": f"{code} 无法获取分钟线数据，可能非交易时段"}
+    profile = analyze_intraday(df_1m, df_5m, df_15m)
+    return {"code": code, **profile.to_dict()}
+
+
+@mcp.tool()
+def intraday_rescue_check(code: str) -> dict:
+    """单股60m结构救援评估：检测平台突破、VWAP收复、趋势确立等中期结构信号。
+
+    **调用时机**：用户问"这票中周期结构怎么样"、"60分钟线能不能救回来"、"主线票日线不行但想看看中期"时调用。
+    """
+    import os
+
+    from core.intraday_analysis import analyze_rescue_structure
+    from integrations.tickflow_client import TickFlowClient
+
+    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not api_key:
+        return {"error": "未配置 TICKFLOW_API_KEY"}
+    client = TickFlowClient(api_key=api_key)
+    df_60m = client.get_klines(code, period="60m", count=100)
+    if df_60m is None or df_60m.empty:
+        return {"error": f"{code} 无法获取60m数据，可能非交易时段"}
+    try:
+        df_30m = client.get_klines(code, period="30m", count=100)
+    except Exception:
+        df_30m = None
+    result = analyze_rescue_structure(df_60m, df_30m)
+    return {"code": code, **result.to_dict()}
+
+
+@mcp.tool()
 def run_funnel_simulation(board: Literal["all", "main_chinext"] = "all") -> dict:
     """运行 Wyckoff 五层漏斗仿真，返回原始结构数据。
 

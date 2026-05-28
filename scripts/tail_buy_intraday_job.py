@@ -39,9 +39,8 @@ from core.tail_buy_strategy import (
     score_tail_features,
     select_llm_overlay_candidates,
 )
-from integrations._llm_types import DEFAULT_GEMINI_MODEL, OPENAI_COMPATIBLE_BASE_URLS
 from integrations.fetch_a_share_csv import _resolve_trading_window
-from integrations.llm_client import call_llm
+from integrations.llm_client import call_llm, provider_fallbacks, provider_route_chain, resolve_provider_name
 from integrations.supabase_base import create_admin_client, is_admin_configured
 from integrations.supabase_market_signal import (
     load_latest_market_signal_daily,
@@ -59,6 +58,7 @@ TICKFLOW_UPGRADE_HINT = TICKFLOW_LIMIT_HINT
 HOLDING_ACTION_ADD = "ADD"
 HOLDING_ACTION_HOLD = "HOLD"
 HOLDING_ACTION_TRIM = "TRIM"
+TAIL_BUY_TRIM_WEAK_LOSS_PCT = -abs(float(os.getenv("TAIL_BUY_TRIM_WEAK_LOSS_PCT", "2.0")))
 
 
 @dataclass
@@ -460,11 +460,13 @@ def _analyze_holdings_actions(
         else:
             signal_item = signal_map.get(code)
             signal_score = _safe_float(signal_item.signal_score, 0.0) if signal_item else 0.0
+            signal_type = str(signal_item.signal_type if signal_item else "")
             status = str(signal_item.status if signal_item else "pending")
             features = compute_tail_features(df_1m)
             score, decision, reasons = score_tail_features(
                 features,
                 signal_score=signal_score,
+                signal_type=signal_type,
                 status=status,
                 style=style,
             )
@@ -481,6 +483,15 @@ def _analyze_holdings_actions(
             close_pos = _safe_float(features.get("close_pos"), 0.0)
             last30_ret_pct = _safe_float(features.get("last30_ret_pct"), 0.0)
             drop_from_high_pct = _safe_float(features.get("drop_from_high_pct"), 0.0)
+            has_actionable_signal = signal_item is not None and signal_type.strip().lower() not in {
+                "",
+                "holding",
+                "unknown",
+            }
+            weak_tail = (
+                dist_vwap_pct <= -0.6 or close_pos < 0.42 or last30_ret_pct <= -0.8 or drop_from_high_pct <= -2.2
+            )
+            severe_tail = (dist_vwap_pct <= -1.0 and close_pos < 0.35) or drop_from_high_pct <= -2.8
 
             base_reasons = _dedupe_texts(reasons, limit=2)
             if advice.current_price > 0 and effective_stop > 0 and advice.current_price <= effective_stop:
@@ -492,7 +503,13 @@ def _analyze_holdings_actions(
                     ],
                     limit=3,
                 )
-            elif decision == DECISION_BUY and dist_vwap_pct >= 0.15 and close_pos >= 0.68 and last30_ret_pct >= 0.2:
+            elif (
+                decision == DECISION_BUY
+                and has_actionable_signal
+                and dist_vwap_pct >= 0.15
+                and close_pos >= 0.68
+                and last30_ret_pct >= 0.2
+            ):
                 advice.action = HOLDING_ACTION_ADD
                 advice.reasons = _dedupe_texts(
                     [
@@ -501,8 +518,10 @@ def _analyze_holdings_actions(
                     ],
                     limit=3,
                 )
-            elif decision == DECISION_SKIP and (
-                dist_vwap_pct <= -0.6 or close_pos < 0.42 or last30_ret_pct <= -0.8 or drop_from_high_pct <= -2.2
+            elif (
+                decision == DECISION_SKIP
+                and weak_tail
+                and (advice.pnl_pct <= TAIL_BUY_TRIM_WEAK_LOSS_PCT or severe_tail)
             ):
                 advice.action = HOLDING_ACTION_TRIM
                 advice.reasons = _dedupe_texts(
@@ -514,9 +533,14 @@ def _analyze_holdings_actions(
                 )
             else:
                 advice.action = HOLDING_ACTION_HOLD
+                hold_reason = "结构中性，先持有观察"
+                if decision == DECISION_BUY and not has_actionable_signal:
+                    hold_reason = "无有效L4信号，不做尾盘加仓"
+                elif decision == DECISION_BUY:
+                    hold_reason = "尾盘强度未达加仓触发线，先持有观察"
                 advice.reasons = _dedupe_texts(
                     [
-                        "结构中性，先持有观察",
+                        hold_reason,
                         *base_reasons,
                     ],
                     limit=3,
@@ -1067,12 +1091,12 @@ def _run_llm_overlay(
 def _build_llm_routes(
     *,
     primary_provider: str,
-    primary_model: str,
-    primary_api_key: str,
-    primary_base_url: str,
 ) -> list[dict[str, str]]:
-    routes: list[dict[str, str]] = []
-    seen: set[tuple[str, str, str]] = set()
+    routes = provider_route_chain(
+        primary_provider,
+        provider_fallbacks("TAIL_BUY_LLM_FALLBACK_PROVIDERS"),
+    )
+    seen = {(r["provider"], r["model"], r["base_url"]) for r in routes}
 
     def _append_route(name: str, provider: str, model: str, api_key: str, base_url: str = "") -> None:
         p = str(provider or "").strip().lower()
@@ -1094,15 +1118,6 @@ def _build_llm_routes(
                 "base_url": b,
             }
         )
-
-    primary_name = f"{primary_provider}:{primary_model}"
-    _append_route(
-        name=primary_name,
-        provider=primary_provider,
-        model=primary_model,
-        api_key=primary_api_key,
-        base_url=primary_base_url,
-    )
 
     # NVIDIA Kimi K2 作为主路由失败时的备用模型。
     nvidia_key = os.getenv("NVIDIA_API_KEY", "").strip()
@@ -1170,7 +1185,43 @@ def _send_notifications(
     return feishu_ok, tg_ok
 
 
-def main() -> int:
+def _tail_buy_persist_row(c: TailBuyCandidate, started_at: datetime) -> dict[str, Any]:
+    initial_price = _safe_float(c.features.get("last_close"), 0.0)
+    return {
+        "code": c.code,
+        "name": c.name,
+        "run_date": started_at.strftime("%Y-%m-%d"),
+        "signal_date": c.signal_date,
+        "signal_type": c.signal_type,
+        "status": c.status,
+        "final_decision": c.final_decision,
+        "rule_decision": c.rule_decision,
+        "rule_score": c.rule_score,
+        "priority_score": c.priority_score,
+        "rule_reasons": json.dumps(c.rule_reasons, ensure_ascii=False),
+        "llm_decision": c.llm_decision or "",
+        "llm_reason": c.llm_reason,
+        "llm_confidence": c.llm_confidence,
+        "llm_model_used": c.llm_model_used,
+        "initial_price": initial_price,
+        "current_price": initial_price,
+        "change_pct": 0.0,
+        "price_updated_at": started_at.isoformat(),
+        "last_close": c.features.get("last_close", 0.0),
+        "vwap": c.features.get("vwap", 0.0),
+        "dist_vwap_pct": c.features.get("dist_vwap_pct", 0.0),
+        "close_pos": c.features.get("close_pos", 0.0),
+        "day_ret_pct": c.features.get("day_ret_pct", 0.0),
+        "last30_ret_pct": c.features.get("last30_ret_pct", 0.0),
+        "last15_ret_pct": c.features.get("last15_ret_pct", 0.0),
+        "tail30_volume_share": c.features.get("tail30_volume_share", 0.0),
+        "drop_from_high_pct": c.features.get("drop_from_high_pct", 0.0),
+        "fetch_error": c.fetch_error,
+        "features_json": json.dumps(c.features, ensure_ascii=False, default=str),
+    }
+
+
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tail Buy Intraday Job")
     parser.add_argument("--max-llm-symbols", type=int, default=int(os.getenv("TAIL_BUY_LLM_TOP_N", "20")))
     parser.add_argument("--deadline-minute", type=int, default=int(os.getenv("TAIL_BUY_TASK_TIMEOUT_MIN", "25")))
@@ -1180,8 +1231,11 @@ def main() -> int:
     )
     parser.add_argument("--logs", default=None, help="日志路径")
     parser.add_argument("--user-id", default=os.getenv("SUPABASE_USER_ID", "").strip(), help="目标用户ID")
-    args = parser.parse_args()
+    return parser.parse_args()
 
+
+def main() -> int:
+    args = _parse_args()
     started_at = _now()
     logs_path = args.logs or os.path.join(
         os.getenv("LOGS_DIR", "logs"),
@@ -1203,19 +1257,9 @@ def main() -> int:
             send_to_telegram(skip_msg, tg_bot_token=tg_bot_token, tg_chat_id=tg_chat_id)
         return 0
 
-    provider = os.getenv("DEFAULT_LLM_PROVIDER", "gemini").strip().lower() or "gemini"
-    api_key = (os.getenv(f"{provider.upper()}_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
-    model = (
-        os.getenv(f"{provider.upper()}_MODEL") or os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
-    ).strip() or DEFAULT_GEMINI_MODEL
-    llm_base_url = (
-        os.getenv(f"{provider.upper()}_BASE_URL") or OPENAI_COMPATIBLE_BASE_URLS.get(provider, "") or ""
-    ).strip()
+    provider = resolve_provider_name("TAIL_BUY_LLM_PROVIDER", "efficiency")
     llm_routes = _build_llm_routes(
         primary_provider=provider,
-        primary_model=model,
-        primary_api_key=api_key,
-        primary_base_url=llm_base_url,
     )
     tickflow_api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
     style = os.getenv("TAIL_BUY_STYLE", "auto").strip().lower() or "auto"
@@ -1239,10 +1283,11 @@ def main() -> int:
     intraday_batch_size = max(min(int(os.getenv("TAIL_BUY_INTRADAY_BATCH_SIZE", "200")), 200), 1)
     holding_hard_stop_pct = max(_safe_float(os.getenv("TAIL_BUY_HOLDING_HARD_STOP_PCT", "6"), 6.0), 0.0)
     portfolio_id = str(args.portfolio_id or "USER_LIVE").strip() or "USER_LIVE"
+    primary_route = llm_routes[0]["name"] if llm_routes else "disabled"
 
     _log("开始 Tail Buy 任务", logs_path)
     _log(
-        f"config: provider={provider}, model={model}, style={style}, "
+        f"config: provider={provider}, primary_route={primary_route}, style={style}, "
         f"fetch_concurrency={fetch_concurrency}, llm_concurrency={llm_concurrency}, "
         f"max_llm_symbols={max_llm_symbols}, llm_min_rule_score={llm_min_rule_score}, "
         f"llm_allowed_rule_decisions={','.join(llm_allowed_rule_decisions)}, deadline={deadline_min}m, "
@@ -1303,7 +1348,9 @@ def main() -> int:
     llm_success = 0
     llm_route_stats: dict[str, int] = {}
 
+    data_fetched_at: str = ""
     if pending_candidates:
+        data_fetched_at = _now_text()
         if use_batch_intraday:
             _log(
                 f"规则扫描模式: batch（batch_size={intraday_batch_size}, candidates={len(pending_candidates)}）",
@@ -1408,24 +1455,7 @@ def main() -> int:
         from integrations.local_db import init_db, save_tail_buy_results
 
         init_db()
-        persistable = [
-            {
-                "code": c.code,
-                "name": c.name,
-                "run_date": started_at.strftime("%Y-%m-%d"),
-                "signal_date": c.signal_date,
-                "signal_type": c.signal_type,
-                "status": c.status,
-                "final_decision": c.final_decision,
-                "rule_score": c.rule_score,
-                "priority_score": c.priority_score,
-                "rule_reasons": json.dumps(c.rule_reasons, ensure_ascii=False),
-                "llm_decision": c.llm_decision or "",
-                "llm_reason": c.llm_reason,
-            }
-            for c in merged
-            if c.final_decision != "SKIP"
-        ]
+        persistable = [_tail_buy_persist_row(c, started_at) for c in merged if c.final_decision != "SKIP"]
         saved = save_tail_buy_results(persistable)
         _log(f"已写入 {saved} 条尾盘结果到本地 SQLite", logs_path)
         # 持久化 BUY 到 Supabase
@@ -1446,13 +1476,12 @@ def main() -> int:
         candidates=merged,
         llm_total=llm_total,
         llm_success=llm_success,
-        llm_route_plan=[x["name"] for x in llm_routes],
-        llm_route_stats=llm_route_stats,
         elapsed_seconds=elapsed,
         extra_sections=[holdings_section],
         extra_sections_first=True,
         candidate_source=candidate_source_desc,
         buy_only=True,
+        data_fetched_at=data_fetched_at,
     )
     feishu_ok, tg_ok = _send_notifications(
         feishu_webhook=feishu_webhook,

@@ -1,6 +1,8 @@
 name: Tail Buy
 
 on:
+  # 不用 schedule：GitHub Actions 定时任务会排队，无法在 14:45 准时跑尾盘扫描。
+  # 由 Cursor Automation（cron 45 14 * * 1-5 北京时间）调用 scripts/trigger_tail_buy_workflow.py 触发。
   workflow_dispatch:
 
 concurrency:
@@ -20,7 +22,11 @@ jobs:
       TICKFLOW_API_KEY: ${{ secrets.TICKFLOW_API_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
-      DEFAULT_LLM_PROVIDER: gemini
+      EFFICIENCY_API_KEY: ${{ secrets.EFFICIENCY_API_KEY }}
+      EFFICIENCY_MODEL: ${{ secrets.EFFICIENCY_MODEL }}
+      EFFICIENCY_BASE_URL: ${{ secrets.EFFICIENCY_BASE_URL }}
+      TAIL_BUY_LLM_PROVIDER: ${{ vars.TAIL_BUY_LLM_PROVIDER || secrets.TAIL_BUY_LLM_PROVIDER || 'efficiency' }}
+      TAIL_BUY_LLM_FALLBACK_PROVIDERS: ${{ vars.TAIL_BUY_LLM_FALLBACK_PROVIDERS || secrets.TAIL_BUY_LLM_FALLBACK_PROVIDERS || '' }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}

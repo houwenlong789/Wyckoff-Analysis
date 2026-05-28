@@ -10,18 +10,24 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_SESSION_SUMMARY_PROMPT = """请将以下对话提取为 L1 原子记忆（中文，≤300字）：
-1. 讨论了哪些股票（代码+结论）
-2. 用户的操作意图和决策
-3. 重要的市场判断
-4. 用户表达的偏好或禁忌（如"不要推荐ST股"、"不追涨"等）
-每条记忆一行，前缀标注类型：[股票] / [决策] / [市场] / [偏好]
-每条只写一个事实或结论，忽略寒暄和工具调用细节。"""
+_SESSION_SUMMARY_PROMPT = """从以下对话中提取值得跨会话记忆的信息（中文）。
 
-_LAYER_REFRESH_PROMPT = """请基于以下 L1 原子记忆，生成更高层的长期记忆：
-- [画像] 用户稳定偏好/风险边界/工作习惯，最多3条
-- [场景] 可复用的交易/复盘场景，最多3条
-每条一行，保留股票代码、条件和结论，不要编造。"""
+只提取这两类：
+- [偏好] 用户表达的投资风格、禁忌、操作习惯（如"不追涨"、"只做威科夫形态"）
+- [决策] 用户非显而易见的决策逻辑/原因（如"因为板块轮动加速所以缩短持仓周期"）
+
+不要提取：
+- 具体买卖了哪只股票（持仓从数据库查询即可）
+- 临时操作（加仓、清仓、调仓的事实）
+- 当前市场状态（行情每天变）
+- 工具调用细节
+
+每条一行，前缀标注 [偏好] 或 [决策]。只写从对话中无法自动推断的洞察，没有则回复"无"。"""
+
+_LAYER_REFRESH_PROMPT = """请基于以下偏好和决策记忆，生成更高层的长期记忆：
+- [画像] 用户稳定偏好/风险边界/操作习惯，最多3条
+- [场景] 可复用的决策模式/场景，最多3条
+每条一行，保留条件和结论，不要编造。"""
 
 _CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 _CJK_RE = re.compile(r"[一-鿿]{2,4}")
@@ -48,16 +54,18 @@ _STOPWORDS = frozenset(
 )
 
 _SUMMARY_TYPES = {
-    "股票": "stock_opinion",
-    "决策": "decision",
-    "市场": "market_view",
     "偏好": "preference",
+    "决策": "decision",
 }
 
 _LAYER_TYPES = {
     "画像": ("persona", "L3"),
     "场景": ("scenario", "L2"),
 }
+
+DEFAULT_MAX_CHARS_PER_MEMORY = 200
+DEFAULT_MAX_TOTAL_RECALL_CHARS = 1200
+_RECALL_TRUNCATION_SUFFIX = "…（已截断，可用 wyckoff memory trace 查看来源）"
 
 
 def extract_stock_codes(text: str) -> list[str]:
@@ -122,11 +130,63 @@ def _provider_text(provider: Any, user_text: str, system_prompt: str) -> str:
     return "".join(c.get("text", "") for c in chunks if c.get("type") == "text_delta")
 
 
-def _save_summary_memories(summary: str, codes: str, source_ref: str) -> int:
+_DEDUP_PROMPT = """判断"新记忆"是否与以下已有记忆语义重复（含义相同或高度相似即为重复）。
+仅回复一行：
+- 重复则回复 DUPLICATE:<id>（id 为最匹配的已有记忆编号）
+- 不重复则回复 NEW"""
+
+
+def _get_dedup_provider() -> Any | None:
+    """获取去重用的 provider：优先 fallback，其次 main。"""
+    try:
+        from cli._provider_factory import _create_provider
+        from cli.auth import load_default_model_id, load_fallback_model_id, load_model_configs
+
+        configs = load_model_configs()
+        if not configs:
+            return None
+        fallback_id = load_fallback_model_id()
+        target_id = fallback_id or load_default_model_id()
+        cfg = next((c for c in configs if c["id"] == target_id), configs[0])
+        provider, err = _create_provider(
+            cfg["provider_name"], cfg["api_key"], cfg.get("model", ""), cfg.get("base_url", "")
+        )
+        return provider if not err else None
+    except Exception:
+        return None
+
+
+def _find_duplicate(memory_type: str, content: str, provider: Any) -> int | None:
+    """用 LLM 判断新记忆是否与同类型已有记忆语义重复，返回重复记忆 id 或 None。"""
+    from integrations.local_db import get_recent_memories
+
+    existing = get_recent_memories(memory_type=memory_type, limit=10)
+    if not existing:
+        return None
+    lines = [f"#{m['id']}: {m['content']}" for m in existing]
+    user_text = "已有记忆:\n" + "\n".join(lines) + f"\n\n新记忆:\n{content}"
+    result = _provider_text(provider, user_text, _DEDUP_PROMPT).strip()
+    match = re.match(r"DUPLICATE[:\s]*#?(\d+)", result)
+    if not match:
+        return None
+    duplicate_id = int(match.group(1))
+    return duplicate_id if any(m["id"] == duplicate_id for m in existing) else None
+
+
+def _save_summary_memories(summary: str, codes: str, source_ref: str, dedup_provider: Any = None) -> int:
     from integrations.local_db import save_memory
 
     saved = 0
     for memory_type, content in _summary_memories(summary):
+        if dedup_provider:
+            try:
+                dup_id = _find_duplicate(memory_type, content, dedup_provider)
+            except Exception:
+                logger.debug("memory dedup check failed", exc_info=True)
+                dup_id = None
+            if dup_id:
+                logger.debug("memory dedup: '%s' duplicates #%d", content[:50], dup_id)
+                continue
         saved += int(
             bool(
                 save_memory(
@@ -144,11 +204,7 @@ def _save_summary_memories(summary: str, codes: str, source_ref: str) -> int:
 def refresh_memory_layers(provider: Any) -> int:
     from integrations.local_db import get_recent_memories, save_memory
 
-    atoms = [
-        m
-        for m in get_recent_memories(limit=30)
-        if m.get("memory_type") in {"stock_opinion", "decision", "market_view", "preference", "fact"}
-    ]
+    atoms = [m for m in get_recent_memories(limit=30) if m.get("memory_type") in {"preference", "decision"}]
     if len(atoms) < 3:
         return 0
     lines = [f"- #{m.get('id')} [{m.get('memory_type')}] {m.get('content')}" for m in atoms]
@@ -160,14 +216,94 @@ def refresh_memory_layers(provider: Any) -> int:
     return saved
 
 
-def _memory_line(memory: dict) -> str:
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    if max_chars <= len(_RECALL_TRUNCATION_SUFFIX):
+        return text[:max_chars]
+    return text[: max_chars - len(_RECALL_TRUNCATION_SUFFIX)].rstrip() + _RECALL_TRUNCATION_SUFFIX
+
+
+def _memory_line(memory: dict, *, max_chars: int = DEFAULT_MAX_CHARS_PER_MEMORY) -> str:
     date_str = str(memory.get("created_at", ""))[:10]
     content = str(memory.get("content", "")).strip()
-    if len(content) > 200:
-        content = content[:200] + "…"
+    content = _truncate_text(content, max_chars)
     source = str(memory.get("source_ref", "")).strip()
     suffix = f" | 源:{source}" if source else ""
     return f"- #{memory.get('id')} [{date_str}] {content}{suffix}"
+
+
+def _budget_recall_lines(lines: list[str], max_total_chars: int) -> list[str]:
+    if max_total_chars <= 0:
+        return lines
+    budgeted: list[str] = []
+    used = 0
+    for line in lines:
+        separator = 1 if budgeted else 0
+        remaining = max_total_chars - used - separator
+        if remaining <= 0:
+            break
+        next_line = _truncate_text(line, remaining) if len(line) > remaining else line
+        budgeted.append(next_line)
+        used += separator + len(next_line)
+        if next_line != line:
+            break
+    return budgeted
+
+
+def _wrap_recall_context(lines: list[str]) -> str:
+    if not lines:
+        return ""
+    body = "\n".join(lines)
+    return (
+        "<relevant-memories>\n"
+        "以下是当前对话召回的相关记忆，不代表当前任务进程，仅作为参考：\n\n"
+        f"{body}\n"
+        "</relevant-memories>"
+    )
+
+
+def prepend_memory_context(user_text: str, memory_context: str) -> str:
+    """Return a current-turn user message with transient recalled memories."""
+
+    if not memory_context.strip():
+        return user_text
+    return f"{memory_context.strip()}\n\n<current-user-message>\n{user_text}\n</current-user-message>"
+
+
+def _append_profile_lines(lines: list[str], personas: list[dict], prefs: list[dict], max_chars: int) -> None:
+    if not personas and not prefs:
+        return
+    lines.append("# 用户画像")
+    for memory in personas + prefs:
+        content = str(memory.get("content", "")).strip()
+        if content:
+            lines.append(f"- {_truncate_text(content, max_chars)}")
+
+
+def _append_scenario_lines(lines: list[str], memories: list[dict], max_chars: int) -> None:
+    scenarios = [m for m in memories if m.get("memory_type") == "scenario"]
+    if not scenarios:
+        return
+    lines.append("# 相关场景")
+    lines.extend(_memory_line(m, max_chars=max_chars) for m in scenarios[:3])
+
+
+def _append_atom_lines(lines: list[str], memories: list[dict], max_chars: int) -> None:
+    atom_types = {"preference", "decision"}
+    atoms = [m for m in memories if m.get("memory_type") in atom_types]
+    if not atoms:
+        return
+    lines.append("# 历史记忆")
+    lines.extend(_memory_line(m, max_chars=max_chars) for m in atoms)
+
+
+def _build_recall_lines(memories: list[dict], personas: list[dict], prefs: list[dict], max_chars: int) -> list[str]:
+    lines: list[str] = []
+    _append_profile_lines(lines, personas, prefs, max_chars)
+    _append_scenario_lines(lines, memories, max_chars)
+    _append_atom_lines(lines, memories, max_chars)
+    return lines
 
 
 def save_session_summary(
@@ -193,14 +329,20 @@ def save_session_summary(
         all_text = " ".join(m.get("content", "") or "" for m in messages)
         codes = extract_stock_codes(all_text)
         codes_str = ",".join(codes[:20])
-        if _save_summary_memories(summary, codes_str, _source_ref(session_id)):
+        dedup_provider = _get_dedup_provider()
+        if _save_summary_memories(summary, codes_str, _source_ref(session_id), dedup_provider):
             if not skip_layers:
                 refresh_memory_layers(provider)
     except Exception:
         logger.debug("save session summary failed", exc_info=True)
 
 
-def build_memory_context(user_message: str) -> str:
+def build_memory_context(
+    user_message: str,
+    *,
+    max_chars_per_memory: int = DEFAULT_MAX_CHARS_PER_MEMORY,
+    max_total_chars: int = DEFAULT_MAX_TOTAL_RECALL_CHARS,
+) -> str:
     try:
         from integrations.local_db import (
             get_recent_memories,
@@ -226,27 +368,7 @@ def build_memory_context(user_message: str) -> str:
         if not memories and not prefs and not personas:
             return ""
 
-        lines = [""]
-        if personas or prefs:
-            lines.append("# 用户画像")
-            for p in personas:
-                content = str(p.get("content", "")).strip()
-                if content:
-                    lines.append(f"- {content}")
-            for p in prefs:
-                content = str(p.get("content", "")).strip()
-                if content:
-                    lines.append(f"- {content}")
-
-        scenarios = [m for m in memories if m.get("memory_type") == "scenario"]
-        if scenarios:
-            lines.append("# 相关场景")
-            lines.extend(_memory_line(m) for m in scenarios[:3])
-
-        if memories:
-            lines.append("# 历史原子记忆")
-            atom_types = {"stock_opinion", "decision", "market_view", "fact", "session"}
-            lines.extend(_memory_line(m) for m in memories if m.get("memory_type") in atom_types)
-        return "\n".join(lines)
+        lines = _build_recall_lines(memories, personas, prefs, max_chars_per_memory)
+        return _wrap_recall_context(_budget_recall_lines(lines, max_total_chars))
     except Exception:
         return ""

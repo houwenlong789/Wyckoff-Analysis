@@ -2,7 +2,7 @@
 Wyckoff Funnel 定时任务：5 层漏斗筛选 → 多渠道推送
 
 Layer 1: 剥离垃圾（ST/北交所/科创板/市值/成交额）
-Layer 2: 六通道甄选（主升/潜伏/吸筹/地量/暗中护盘/点火破局）
+Layer 2: 七通道甄选（主升/潜伏/吸筹/地量/暗中护盘/趋势延续/点火破局）
 Layer 2.5: Markup 加速检测
 Layer 3: 板块共振（行业 Top-N）
 Layer 4: 威科夫狙击（Spring / SOS / LPS / Effort vs Result）
@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Callable
 from datetime import date, datetime
 from pathlib import Path
 
@@ -23,7 +24,14 @@ import pandas as pd
 # Ensure project root is on sys.path for direct script invocation
 if __name__ == "__main__" or not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.dynamic_policy import (
+    build_signal_weight_map,
+    dynamic_policy_mode,
+    filter_triggers_by_registry,
+    resolve_dynamic_candidate_policy,
+)
 from core.sector_rotation import analyze_sector_rotation
+from core.theme_radar import build_theme_radar_snapshot, summarize_theme_radar
 from core.wyckoff_engine import (
     FunnelConfig,
     FunnelResult,
@@ -38,12 +46,22 @@ from core.wyckoff_engine import (
     resolve_ai_candidate_policy,
 )
 from integrations.data_source import (
+    _CONCEPT_HEAT_HISTORY,
+    detect_theme_lines,
+    fetch_concept_heat,
+    fetch_concept_map,
     fetch_index_hist,
     fetch_market_cap_map,
     fetch_sector_map,
+    update_concept_heat_history,
 )
 from integrations.fetch_a_share_csv import (
     _resolve_trading_window,
+)
+from integrations.supabase_signal_feedback import (
+    load_signal_health_snapshot,
+    load_signal_registry,
+    upsert_policy_shadow_run,
 )
 from integrations.tickflow_notice import TICKFLOW_UPGRADE_URL
 
@@ -129,6 +147,72 @@ try:
 except Exception:
     logger.debug("FUNNEL_ETF_DISPLAY_LIMIT parse failed, using default", exc_info=True)
     FUNNEL_ETF_DISPLAY_LIMIT = 0
+FUNNEL_THEME_RADAR_ENABLED = os.getenv("FUNNEL_THEME_RADAR_ENABLED", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+FUNNEL_THEME_RADAR_LINK_ENABLED = os.getenv("FUNNEL_THEME_RADAR_LINK_ENABLED", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+try:
+    FUNNEL_THEME_RADAR_PROMOTE_CAP = max(int(float(os.getenv("FUNNEL_THEME_RADAR_PROMOTE_CAP", "6"))), 0)
+except Exception:
+    logger.debug("FUNNEL_THEME_RADAR_PROMOTE_CAP parse failed, using default", exc_info=True)
+    FUNNEL_THEME_RADAR_PROMOTE_CAP = 6
+try:
+    FUNNEL_THEME_RADAR_BONUS_MAX = max(float(os.getenv("FUNNEL_THEME_RADAR_BONUS_MAX", "18")), 0.0)
+except Exception:
+    logger.debug("FUNNEL_THEME_RADAR_BONUS_MAX parse failed, using default", exc_info=True)
+    FUNNEL_THEME_RADAR_BONUS_MAX = 18.0
+try:
+    FUNNEL_THEME_RADAR_MAX_AGE_DAYS = max(int(float(os.getenv("FUNNEL_THEME_RADAR_MAX_AGE_DAYS", "14"))), 0)
+except Exception:
+    logger.debug("FUNNEL_THEME_RADAR_MAX_AGE_DAYS parse failed, using default", exc_info=True)
+    FUNNEL_THEME_RADAR_MAX_AGE_DAYS = 14
+FUNNEL_STRATEGIC_L2_BYPASS_ENABLED = os.getenv("FUNNEL_STRATEGIC_L2_BYPASS_ENABLED", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+try:
+    FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP = max(int(float(os.getenv("FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP", "12"))), 0)
+except Exception:
+    logger.debug("FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP parse failed, using default", exc_info=True)
+    FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP = 12
+try:
+    FUNNEL_STRATEGIC_L2_BYPASS_MIN_THEME_SCORE = max(
+        float(os.getenv("FUNNEL_STRATEGIC_L2_BYPASS_MIN_THEME_SCORE", "0.45")),
+        0.0,
+    )
+except Exception:
+    logger.debug("FUNNEL_STRATEGIC_L2_BYPASS_MIN_THEME_SCORE parse failed, using default", exc_info=True)
+    FUNNEL_STRATEGIC_L2_BYPASS_MIN_THEME_SCORE = 0.45
+try:
+    FUNNEL_STRATEGIC_L2_BYPASS_MIN_STOCK_SCORE = max(
+        float(os.getenv("FUNNEL_STRATEGIC_L2_BYPASS_MIN_STOCK_SCORE", "0.55")),
+        0.0,
+    )
+except Exception:
+    logger.debug("FUNNEL_STRATEGIC_L2_BYPASS_MIN_STOCK_SCORE parse failed, using default", exc_info=True)
+    FUNNEL_STRATEGIC_L2_BYPASS_MIN_STOCK_SCORE = 0.55
+
+FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_ENABLED = os.getenv(
+    "FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+try:
+    FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE = max(
+        float(os.getenv("FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE", "55")),
+        0.0,
+    )
+except Exception:
+    logger.debug("FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE parse failed, using default", exc_info=True)
+    FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE = 55.0
 
 
 def _resolve_funnel_end_calendar_day() -> date:
@@ -545,9 +629,70 @@ def _merge_trigger_maps(*trigger_maps: dict[str, list[tuple[str, float]]]) -> di
     return merged
 
 
+def _score_star(score: float) -> str:
+    if score >= 10:
+        return "★★"
+    if score >= 5:
+        return "★ "
+    return "  "
+
+
+def _append_formal_l4_sections(
+    lines: list[str],
+    formal_codes: list[str],
+    selected_codes: list[str],
+    name_map: dict[str, str],
+    code_to_trigger_keys: dict[str, list[str]],
+    display_score: Callable[[str], float],
+    theme_badge_map: dict[str, str] | None = None,
+) -> None:
+    selected_set = set(selected_codes)
+    badge_map = theme_badge_map or {}
+
+    def _append_row(code: str, extra: str = "") -> None:
+        score = float(display_score(code))
+        ai_mark = "  →AI" if code in selected_set else ""
+        badge = f"  {badge_map[code]}" if code in badge_map else ""
+        lines.append(f"{_score_star(score)} {code} {name_map.get(code, code)}  {score:.2f}{ai_mark}{extra}{badge}")
+
+    multi_signal = [c for c in formal_codes if len(code_to_trigger_keys.get(c, [])) > 1]
+    if multi_signal:
+        lines.append(f"**【🔥 多信号共振】{len(multi_signal)} 只**")
+        for code in sorted(multi_signal, key=lambda c: -float(display_score(c))):
+            short = "+".join(TRIGGER_SHORT_LABELS.get(k, k) for k in code_to_trigger_keys.get(code, []))
+            _append_row(code, f"  {short}")
+        lines.append("")
+
+    multi_signal_set = set(multi_signal)
+    single_signal_codes = [c for c in formal_codes if c not in multi_signal_set and code_to_trigger_keys.get(c)]
+    code_primary_key = {code: code_to_trigger_keys.get(code, [""])[0] for code in single_signal_codes}
+    for group_key in TRIGGER_GROUP_ORDER:
+        group_codes = [c for c in single_signal_codes if code_primary_key.get(c) == group_key]
+        if not group_codes:
+            continue
+        lines.append(f"**【{TRIGGER_GROUP_TITLES.get(group_key, group_key)}】{len(group_codes)} 只**")
+        for code in sorted(group_codes, key=lambda c: -float(display_score(c))):
+            _append_row(code)
+        lines.append("")
+
+
 def _is_accum_trigger(keys: list[str]) -> bool:
     key_set = {str(k).strip().lower() for k in keys}
     return bool(key_set & {"spring", "lps"}) and not bool(key_set & {"sos", "evr", "compression"})
+
+
+def _split_selected_tracks(
+    selected_codes: list[str],
+    code_to_trigger_keys: dict[str, list[str]],
+) -> tuple[list[str], list[str]]:
+    trend_selected: list[str] = []
+    accum_selected: list[str] = []
+    for code in selected_codes:
+        if _is_accum_trigger(code_to_trigger_keys.get(code, [])):
+            accum_selected.append(code)
+        else:
+            trend_selected.append(code)
+    return trend_selected, accum_selected
 
 
 def _rank_l2_bypass_pool(l2_bypass_pool: list[str], code_to_total_score: dict[str, float]) -> list[str]:
@@ -563,13 +708,19 @@ def _promote_l2_bypass_for_ai(
     code_to_total_score: dict[str, float],
     code_to_trigger_keys: dict[str, list[str]],
     score_map: dict[str, float],
+    *,
+    enabled: bool | None = None,
+    cap: int | None = None,
+    accum_codes: set[str] | None = None,
 ) -> int:
-    if not FUNNEL_L2_BYPASS_AI_ENABLED or not l2_bypass_pool:
+    if not (FUNNEL_L2_BYPASS_AI_ENABLED if enabled is None else enabled) or not l2_bypass_pool:
         return 0
     ranked = _rank_l2_bypass_pool(l2_bypass_pool, code_to_total_score)
-    ranked = ranked if FUNNEL_L2_BYPASS_AI_CAP <= 0 else ranked[:FUNNEL_L2_BYPASS_AI_CAP]
+    budget = FUNNEL_L2_BYPASS_AI_CAP if cap is None else cap
+    ranked = ranked if budget <= 0 else ranked[:budget]
     selected_seen = set(selected_for_ai)
     track_seen = set(trend_selected) | set(accum_selected)
+    accum_set = accum_codes or set()
     added = 0
     for code in ranked:
         if code not in selected_seen:
@@ -579,12 +730,502 @@ def _promote_l2_bypass_for_ai(
         score_map.setdefault(code, float(code_to_total_score.get(code, 0.0) or 0.0))
         if code in track_seen:
             continue
+        if code in accum_set or _is_accum_trigger(code_to_trigger_keys.get(code, [])):
+            accum_selected.append(code)
+        else:
+            trend_selected.append(code)
+        track_seen.add(code)
+    return added
+
+
+def _load_dynamic_policy_context(regime: str, benchmark_context: dict) -> dict:
+    mode = dynamic_policy_mode()
+    if mode == "off":
+        return {"mode": mode, "health": [], "registry": [], "weights": {}, "policy": None}
+    try:
+        health_rows = load_signal_health_snapshot(market="cn")
+        registry_rows = load_signal_registry(market="cn")
+    except Exception as exc:
+        logger.warning("动态策略上下文加载失败，降级为静态: %s", exc)
+        return {"mode": "off", "health": [], "registry": [], "weights": {}, "policy": None}
+    weights = build_signal_weight_map(health_rows, registry_rows, regime=regime)
+    base_policy = resolve_ai_candidate_policy(regime)
+    policy = resolve_dynamic_candidate_policy(
+        base_policy,
+        weights,
+        breadth=(benchmark_context.get("breadth") or {}),
+    )
+    if health_rows or registry_rows:
+        print(
+            "[funnel] 动态策略上下文: "
+            f"mode={mode}, weights={weights or {}}, "
+            f"TrendWeight={policy.get('trend_health_weight', 1)}, "
+            f"AccumWeight={policy.get('accum_health_weight', 1)}"
+        )
+    return {"mode": mode, "health": health_rows, "registry": registry_rows, "weights": weights, "policy": policy}
+
+
+def _attach_shadow_policy(ai_policy: dict, dynamic_ctx: dict) -> None:
+    if str(dynamic_ctx.get("mode") or "off") != "shadow" or not dynamic_ctx.get("policy"):
+        return
+    shadow_policy = dynamic_ctx["policy"]
+    ai_policy["_dynamic_mode"] = "shadow"
+    ai_policy["_shadow_policy"] = shadow_policy
+    ai_policy["_signal_weights"] = dynamic_ctx.get("weights") or {}
+    ai_policy["_registry_rows"] = dynamic_ctx.get("registry") or []
+    ai_policy["_health_rows"] = dynamic_ctx.get("health") or []
+    print(
+        "[funnel] 动态策略shadow: "
+        f"base Trend={ai_policy['trend_quota']}, Accum={ai_policy['accum_quota']} -> "
+        f"shadow Trend={shadow_policy['trend_quota']}, Accum={shadow_policy['accum_quota']}"
+    )
+
+
+def _candidate_result(metrics: dict, triggers: dict[str, list[tuple[str, float]]]) -> FunnelResult:
+    return FunnelResult(
+        layer1_symbols=[],
+        layer2_symbols=[],
+        layer3_symbols=metrics.get("layer3_symbols", []) or [],
+        top_sectors=[],
+        triggers=triggers,
+        stage_map=metrics.get("accum_stage_map", {}) or {},
+        markup_symbols=metrics.get("markup_symbols", []) or [],
+        exit_signals=metrics.get("exit_signals", {}) or {},
+        channel_map=metrics.get("layer2_channel_map", {}) or {},
+    )
+
+
+def _public_policy(policy: dict) -> dict:
+    return {k: v for k, v in policy.items() if not str(k).startswith("_")}
+
+
+def _selection_diff(base_selected: list[str], shadow_selected: list[str]) -> tuple[list[str], list[str]]:
+    base_set = set(base_selected)
+    shadow_set = set(shadow_selected)
+    return ([c for c in shadow_selected if c not in base_set], [c for c in base_selected if c not in shadow_set])
+
+
+def _allocate_candidates_for_ai(
+    metrics: dict,
+    triggers: dict[str, list[tuple[str, float]]],
+    l3_ranked_symbols: list[str],
+    regime: str,
+    sector_map: dict[str, str],
+    benchmark_context: dict,
+) -> tuple[list[str], list[str], dict[str, float], dict]:
+    dynamic_ctx = _load_dynamic_policy_context(str(regime), benchmark_context)
+    dynamic_mode = str(dynamic_ctx.get("mode") or "off")
+    allocation_triggers = triggers
+    if dynamic_mode == "on":
+        allocation_triggers = filter_triggers_by_registry(triggers, dynamic_ctx.get("registry", []) or [])
+    mock_result = _candidate_result(metrics, allocation_triggers)
+    alloc_started = time.monotonic()
+    dynamic_policy = dynamic_ctx.get("policy") if dynamic_mode == "on" else None
+    trend_selected, accum_selected, score_map = allocate_ai_candidates(
+        mock_result,
+        l3_ranked_symbols,
+        regime,
+        sector_map=sector_map,
+        max_per_sector=2,
+        policy_override=dynamic_policy,
+        signal_weight_map=(dynamic_ctx.get("weights") or {}) if dynamic_mode == "on" else None,
+    )
+    ai_policy = dynamic_policy or resolve_ai_candidate_policy(regime)
+    _attach_shadow_policy(ai_policy, dynamic_ctx)
+    alloc_elapsed = time.monotonic() - alloc_started
+    print(
+        f"[funnel] AI候选分配完成: trend={len(trend_selected)}, accum={len(accum_selected)}, "
+        f"elapsed={alloc_elapsed:.3f}s"
+    )
+    return trend_selected, accum_selected, score_map, ai_policy
+
+
+def _shadow_selected_codes(
+    metrics: dict,
+    triggers: dict[str, list[tuple[str, float]]],
+    l3_ranked_symbols: list[str],
+    regime: str,
+    sector_map: dict[str, str],
+    ai_policy: dict,
+) -> tuple[list[str], list[str], dict[str, float]]:
+    shadow_triggers = filter_triggers_by_registry(triggers, ai_policy.get("_registry_rows", []) or [])
+    trend, accum, score_map = allocate_ai_candidates(
+        _candidate_result(metrics, shadow_triggers),
+        l3_ranked_symbols,
+        regime,
+        sector_map=sector_map,
+        max_per_sector=2,
+        policy_override=ai_policy.get("_shadow_policy"),
+        signal_weight_map=ai_policy.get("_signal_weights") or {},
+    )
+    return trend, accum, score_map
+
+
+def _maybe_persist_policy_shadow_run(
+    *,
+    ai_policy: dict,
+    metrics: dict,
+    triggers: dict[str, list[tuple[str, float]]],
+    selected_for_ai: list[str],
+    l3_ranked_symbols: list[str],
+    regime: str,
+    sector_map: dict[str, str],
+) -> dict:
+    if ai_policy.get("_dynamic_mode") != "shadow" or not ai_policy.get("_shadow_policy"):
+        return {}
+    shadow_trend, shadow_accum, _score_map = _shadow_selected_codes(
+        metrics,
+        triggers,
+        l3_ranked_symbols,
+        regime,
+        sector_map,
+        ai_policy,
+    )
+    shadow_selected = shadow_trend + shadow_accum
+    diff_added, diff_removed = _selection_diff(selected_for_ai, shadow_selected)
+    row = {
+        "market": "cn",
+        "trade_date": str(metrics.get("end_trade_date") or date.today().isoformat()),
+        "regime": str(regime or "NEUTRAL").strip().upper() or "NEUTRAL",
+        "base_policy": _public_policy(ai_policy),
+        "shadow_policy": _public_policy(ai_policy.get("_shadow_policy") or {}),
+        "signal_weights": ai_policy.get("_signal_weights") or {},
+        "base_selected": selected_for_ai,
+        "shadow_selected": shadow_selected,
+        "diff_added": diff_added,
+        "diff_removed": diff_removed,
+        "registry_snapshot": ai_policy.get("_registry_rows") or [],
+        "health_snapshot": ai_policy.get("_health_rows") or [],
+        "updated_at": datetime.now(CN_TZ).isoformat(),
+    }
+    written = upsert_policy_shadow_run(row)
+    print(
+        "[funnel] 动态策略shadow已写入 signal_policy_shadow_runs: "
+        f"written={written}, added={len(diff_added)}, removed={len(diff_removed)}"
+    )
+    return {
+        "shadow_table": "signal_policy_shadow_runs",
+        "shadow_written": written,
+        "shadow_added_count": len(diff_added),
+        "shadow_removed_count": len(diff_removed),
+    }
+
+
+def _load_theme_radar_history() -> dict:
+    try:
+        from integrations.supabase_concept_heat import load_concept_heat_history_from_supabase
+
+        history = load_concept_heat_history_from_supabase()
+        if history:
+            return history
+    except Exception as exc:
+        logger.debug("theme radar supabase history unavailable: %s", exc)
+    try:
+        if _CONCEPT_HEAT_HISTORY.exists():
+            with open(_CONCEPT_HEAT_HISTORY, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as exc:
+        logger.debug("theme radar local history unavailable: %s", exc)
+    return {}
+
+
+def _safe_build_theme_radar(
+    *,
+    trade_date: str,
+    concept_heat: list[dict],
+    concept_map: dict[str, list[str]],
+    sector_map: dict[str, str],
+    df_map: dict[str, pd.DataFrame],
+    name_map: dict[str, str],
+) -> dict:
+    if not FUNNEL_THEME_RADAR_ENABLED:
+        return {"trade_date": trade_date, "themes": [], "strategic_candidates": []}
+    try:
+        return build_theme_radar_snapshot(
+            trade_date=trade_date,
+            concept_heat=concept_heat,
+            concept_history=_load_theme_radar_history(),
+            concept_map=concept_map,
+            sector_map=sector_map,
+            df_map=df_map,
+            name_map=name_map,
+        )
+    except Exception as exc:
+        logger.warning("theme radar build failed: %s", exc)
+        return {"trade_date": trade_date, "themes": [], "strategic_candidates": []}
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _theme_snapshot_age_days(snapshot: dict, trade_date: str) -> int:
+    try:
+        snapshot_date = pd.to_datetime(str(snapshot.get("trade_date") or "")).date()
+        current_date = pd.to_datetime(str(trade_date)).date()
+        return abs((current_date - snapshot_date).days)
+    except Exception:
+        return FUNNEL_THEME_RADAR_MAX_AGE_DAYS + 1
+
+
+def _has_theme_radar_payload(snapshot: dict | None) -> bool:
+    if not snapshot:
+        return False
+    return bool(snapshot.get("themes") or snapshot.get("strategic_candidates"))
+
+
+def _resolve_linked_theme_radar(current_snapshot: dict, trade_date: str) -> tuple[dict, str]:
+    if not FUNNEL_THEME_RADAR_ENABLED:
+        return {"trade_date": trade_date, "themes": [], "strategic_candidates": []}, "disabled"
+    if not FUNNEL_THEME_RADAR_LINK_ENABLED:
+        return current_snapshot, "current"
+    try:
+        from integrations.theme_radar_storage import load_latest_theme_radar_snapshot
+
+        persisted = load_latest_theme_radar_snapshot()
+    except Exception as exc:
+        logger.debug("theme radar persisted snapshot unavailable: %s", exc)
+        persisted = None
+    if _has_theme_radar_payload(persisted):
+        age_days = _theme_snapshot_age_days(persisted or {}, trade_date)
+        if age_days <= FUNNEL_THEME_RADAR_MAX_AGE_DAYS:
+            return persisted or current_snapshot, "persisted"
+    return current_snapshot, "current"
+
+
+def _theme_candidate_map(snapshot: dict) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for item in snapshot.get("strategic_candidates") or []:
+        code = str(item.get("code", "") or "").strip()
+        if code:
+            out[code] = item
+    return out
+
+
+def _theme_badge_map(candidate_map: dict[str, dict]) -> dict[str, str]:
+    badges: dict[str, str] = {}
+    for code, item in candidate_map.items():
+        theme = str(item.get("theme", "") or "").strip()
+        theme_score = _safe_float(item.get("theme_score"))
+        if theme:
+            badges[code] = f"战略主线:{theme}({theme_score:.2f})"
+    return badges
+
+
+def _theme_bonus_map(candidate_map: dict[str, dict]) -> dict[str, float]:
+    bonuses: dict[str, float] = {}
+    if FUNNEL_THEME_RADAR_BONUS_MAX <= 0:
+        return bonuses
+    for code, item in candidate_map.items():
+        theme_score = _safe_float(item.get("theme_score"))
+        stock_score = _safe_float(item.get("stock_score"))
+        score = max(min(0.55 * theme_score + 0.45 * stock_score, 1.0), 0.0)
+        if score > 0:
+            bonuses[code] = round(score * FUNNEL_THEME_RADAR_BONUS_MAX, 4)
+    return bonuses
+
+
+def _append_theme_reasons(code_to_reasons: dict[str, list[str]], badge_map: dict[str, str]) -> None:
+    for code, badge in badge_map.items():
+        if code in code_to_reasons and badge not in code_to_reasons[code]:
+            code_to_reasons[code].append(badge)
+
+
+def _apply_theme_bonus_to_scores(score_map: dict[str, float], bonus_map: dict[str, float]) -> None:
+    for code, bonus in bonus_map.items():
+        if code in score_map:
+            score_map[code] = float(score_map.get(code, 0.0) or 0.0) + float(bonus)
+
+
+def _promote_theme_l4_for_ai(
+    selected_for_ai: list[str],
+    trend_selected: list[str],
+    accum_selected: list[str],
+    formal_hit_set: set[str],
+    theme_bonus_map: dict[str, float],
+    code_to_total_score: dict[str, float],
+    code_to_trigger_keys: dict[str, list[str]],
+    score_map: dict[str, float],
+) -> int:
+    ranked = [code for code in formal_hit_set if code in theme_bonus_map]
+    ranked.sort(key=lambda c: (-float(code_to_total_score.get(c, 0.0) or 0.0), c))
+    ranked = ranked if FUNNEL_THEME_RADAR_PROMOTE_CAP <= 0 else ranked[:FUNNEL_THEME_RADAR_PROMOTE_CAP]
+    selected_seen = set(selected_for_ai)
+    track_seen = set(trend_selected) | set(accum_selected)
+    added = 0
+    for code in ranked:
+        score_map.setdefault(code, float(code_to_total_score.get(code, 0.0) or 0.0))
+        if code not in selected_seen:
+            selected_for_ai.append(code)
+            selected_seen.add(code)
+            added += 1
+        if code in track_seen:
+            continue
         if _is_accum_trigger(code_to_trigger_keys.get(code, [])):
             accum_selected.append(code)
         else:
             trend_selected.append(code)
         track_seen.add(code)
     return added
+
+
+def _rerank_selected_codes(codes: list[str], score_map: dict[str, float]) -> list[str]:
+    seen: set[str] = set()
+    deduped = []
+    for code in codes:
+        if code not in seen:
+            deduped.append(code)
+            seen.add(code)
+    return sorted(deduped, key=lambda c: (-float(score_map.get(c, 0.0) or 0.0), c))
+
+
+def _theme_report_fields(code: str, candidate_map: dict[str, dict], bonus_map: dict[str, float]) -> dict:
+    item = candidate_map.get(code) or {}
+    return {
+        "strategic_theme": str(item.get("theme", "") or "").strip(),
+        "strategic_theme_score": _safe_float(item.get("theme_score")),
+        "strategic_stock_score": _safe_float(item.get("stock_score")),
+        "strategic_theme_state": str(item.get("state", "") or "").strip(),
+        "strategic_theme_bonus": _safe_float(bonus_map.get(code)),
+    }
+
+
+def _candidate_reason_text(code: str, code_to_reasons: dict[str, list[str]], badge_map: dict[str, str]) -> str:
+    reasons = list(code_to_reasons.get(code, []) or [])
+    badge = badge_map.get(code, "")
+    if badge and badge not in reasons:
+        reasons.append(badge)
+    return "、".join(reasons) or "威科夫候选"
+
+
+def _strategic_bypass_seed_codes(
+    l1_symbols: list[str],
+    l2_symbols: list[str],
+    candidate_map: dict[str, dict],
+) -> list[str]:
+    if not FUNNEL_STRATEGIC_L2_BYPASS_ENABLED:
+        return []
+    l2_set = {str(code).strip() for code in l2_symbols if str(code).strip()}
+    seeds = []
+    for code in l1_symbols:
+        code_s = str(code).strip()
+        item = candidate_map.get(code_s) or {}
+        if code_s and code_s not in l2_set and _strategic_bypass_candidate_ok(item):
+            seeds.append(code_s)
+    return seeds
+
+
+def _strategic_bypass_candidate_ok(item: dict) -> bool:
+    state = str(item.get("state", "") or "").strip().lower()
+    if state in {"decay", "overheated"}:
+        return False
+    return (
+        _safe_float(item.get("theme_score")) >= FUNNEL_STRATEGIC_L2_BYPASS_MIN_THEME_SCORE
+        and _safe_float(item.get("stock_score")) >= FUNNEL_STRATEGIC_L2_BYPASS_MIN_STOCK_SCORE
+    )
+
+
+def _trigger_hit_codes(trigger_map: dict[str, list[tuple[str, float]]]) -> set[str]:
+    return {str(code).strip() for hits in (trigger_map or {}).values() for code, _ in hits if str(code).strip()}
+
+
+def _strategic_stage_reason_map(stage_map: dict[str, str], markup_symbols: list[str]) -> dict[str, list[str]]:
+    reasons = {str(code).strip(): ["战略阶段:Markup"] for code in markup_symbols if str(code).strip()}
+    for code, stage in stage_map.items():
+        code_s = str(code).strip()
+        stage_s = str(stage or "").strip()
+        if code_s and stage_s in {"Accum_B", "Accum_C"}:
+            reasons.setdefault(code_s, []).append(f"战略阶段:{stage_s}")
+    return reasons
+
+
+def _fetch_rescue_klines(seed_codes: list[str]) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    """为战略旁路候选批量拉取 60m/30m K线。失败时降级为空。"""
+    empty: tuple[dict, dict] = ({}, {})
+    if not FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_ENABLED or not seed_codes:
+        return empty
+    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not api_key:
+        return empty
+    try:
+        from integrations.tickflow_client import TickFlowClient, normalize_cn_symbol
+
+        symbols = [normalize_cn_symbol(code) for code in seed_codes]
+        symbols = [s for s in symbols if s]
+        if not symbols:
+            return empty
+        client = TickFlowClient(api_key=api_key)
+        df_60m_map = client.get_klines_batch(symbols, period="60m", count=100)
+        df_30m_map = client.get_klines_batch(symbols, period="30m", count=100)
+        return df_60m_map, df_30m_map
+    except Exception as e:
+        logger.warning("60m/30m rescue klines fetch failed: %s", e)
+        return empty
+
+
+def _rescue_structure_reason_map(
+    seed_codes: list[str],
+    df_60m_map: dict[str, pd.DataFrame],
+    df_30m_map: dict[str, pd.DataFrame] | None = None,
+) -> dict[str, list[str]]:
+    """对有 60m 数据的候选逐只做结构救援分析。"""
+    if not df_60m_map:
+        return {}
+    from core.intraday_analysis import analyze_rescue_structure
+    from integrations.tickflow_client import normalize_cn_symbol
+
+    threshold = FUNNEL_STRATEGIC_L2_BYPASS_RESCUE_MIN_SCORE
+    df_30m_map = df_30m_map or {}
+    result: dict[str, list[str]] = {}
+    for code in seed_codes:
+        sym = normalize_cn_symbol(code)
+        df_60 = df_60m_map.get(sym)
+        if df_60 is None or getattr(df_60, "empty", True):
+            continue
+        df_30 = df_30m_map.get(sym)
+        rescue = analyze_rescue_structure(df_60, df_30)
+        if rescue.rescue_score >= threshold:
+            result[code] = [f"60m结构救援({rescue.rescue_score:.0f}分)", *rescue.rescue_reasons]
+    return result
+
+
+def _build_strategic_l2_bypass(
+    seed_codes: list[str],
+    df_map: dict[str, pd.DataFrame],
+    cfg: FunnelConfig,
+    channel_map: dict[str, str],
+    market_cap_map: dict[str, float],
+) -> dict:
+    if not seed_codes:
+        return {"pool": [], "triggers": {}, "stage_map": {}, "markup_symbols": [], "reason_map": {}, "rescue_map": {}}
+    trigger_map = layer4_triggers(seed_codes, df_map, cfg, channel_map=channel_map, market_cap_map=market_cap_map)
+    stage_map = detect_accum_stage(seed_codes, df_map, cfg)
+    markup_symbols = detect_markup_stage(seed_codes, df_map, cfg)
+    reason_map = _strategic_stage_reason_map(stage_map, markup_symbols)
+    df_60m_map, df_30m_map = _fetch_rescue_klines(seed_codes)
+    rescue_reason_map = _rescue_structure_reason_map(seed_codes, df_60m_map, df_30m_map)
+    for code, reasons in rescue_reason_map.items():
+        reason_map.setdefault(code, []).extend(reasons)
+    pool = sorted(_trigger_hit_codes(trigger_map) | set(reason_map))
+    return {
+        "pool": pool,
+        "triggers": trigger_map,
+        "stage_map": stage_map,
+        "markup_symbols": markup_symbols,
+        "reason_map": reason_map,
+        "rescue_map": rescue_reason_map,
+    }
+
+
+def _append_extra_reasons(code_to_reasons: dict[str, list[str]], reason_map: dict[str, list[str]]) -> None:
+    for code, reasons in reason_map.items():
+        bucket = code_to_reasons.setdefault(code, [])
+        for reason in reasons:
+            if reason and reason not in bucket:
+                bucket.append(reason)
 
 
 def run_funnel_job(
@@ -624,6 +1265,21 @@ def run_funnel_job(
     except Exception as e:
         logger.warning("行业映射加载失败，降级为空映射: %s", e)
         sector_map = {}
+    print("[funnel] 加载概念映射...")
+    try:
+        concept_map = fetch_concept_map()
+    except Exception as e:
+        logger.warning("概念映射加载失败，降级为空映射: %s", e)
+        concept_map = {}
+    print("[funnel] 加载概念热度...")
+    try:
+        concept_heat = fetch_concept_heat()
+    except Exception as e:
+        logger.warning("概念热度加载失败: %s", e)
+        concept_heat = []
+    if concept_heat:
+        update_concept_heat_history(window.end_trade_date.isoformat(), concept_heat, top_n=cfg.theme_line_top_n)
+    hot_concepts = detect_theme_lines(min_days=cfg.theme_line_min_days)
     print("[funnel] 加载市值数据...")
     try:
         market_cap_map = fetch_market_cap_map()
@@ -724,6 +1380,7 @@ def run_funnel_job(
     l2_accum = sum(1 for v in l2_channel_map.values() if "吸筹通道" in v)
     l2_dry_vol = sum(1 for v in l2_channel_map.values() if "地量蓄势" in v)
     l2_rs_div = sum(1 for v in l2_channel_map.values() if "暗中护盘" in v)
+    l2_trend_cont = sum(1 for v in l2_channel_map.values() if "趋势延续" in v)
     l2_sos = sum(1 for v in l2_channel_map.values() if "点火破局" in v)
 
     # Layer 3 (Sector Resonance) — ETF L2 结果注入板块热度
@@ -734,6 +1391,8 @@ def run_funnel_job(
         cfg,
         base_symbols=l1_passed + list(_etf_codes & set(etf_df_map)),
         df_map=all_df_map,
+        concept_map=concept_map,
+        hot_concepts=hot_concepts,
     )
     l3_passed = [s for s in l3_raw if s not in _etf_codes]
     sector_rotation = analyze_sector_rotation(
@@ -747,7 +1406,20 @@ def run_funnel_job(
 
     # Layer 4 (Wyckoff Triggers)
     # L4 需要 l2_df_map，这里直接用 all_df_map 即可，因为 key 都在里面
-    triggers = layer4_triggers(l3_passed, all_df_map, cfg)
+    triggers = layer4_triggers(l3_passed, all_df_map, cfg, channel_map=l2_channel_map, market_cap_map=market_cap_map)
+    theme_radar_current = _safe_build_theme_radar(
+        trade_date=window.end_trade_date.isoformat(),
+        concept_heat=concept_heat,
+        concept_map=concept_map,
+        sector_map=sector_map,
+        df_map=all_df_map,
+        name_map=name_map,
+    )
+    theme_radar, theme_radar_source = _resolve_linked_theme_radar(
+        theme_radar_current,
+        window.end_trade_date.isoformat(),
+    )
+    theme_candidate_map = _theme_candidate_map(theme_radar)
 
     # L2 旁路观察池：L1通过 + L2被拒 + 在热门板块 + 有L4原始触发
     l2_rejected = [s for s in l1_passed if s not in set(l2_passed)]
@@ -757,7 +1429,9 @@ def run_funnel_job(
     bypass_triggers: dict[str, list[tuple[str, float]]] = {}
     l2_bypass_pool: list[str] = []
     if l2_bypass_in_sector:
-        bypass_triggers = layer4_triggers(l2_bypass_in_sector, all_df_map, cfg)
+        bypass_triggers = layer4_triggers(
+            l2_bypass_in_sector, all_df_map, cfg, channel_map=l2_channel_map, market_cap_map=market_cap_map
+        )
         bypass_hit_set: set[str] = set()
         for hits in bypass_triggers.values():
             for code, _ in hits:
@@ -766,10 +1440,41 @@ def run_funnel_job(
         if l2_bypass_pool:
             print(f"[funnel] L2旁路观察池: {len(l2_bypass_pool)} 只 (L2拒绝但有L4信号+板块共振)")
 
+    strategic_seed_codes = _strategic_bypass_seed_codes(l1_passed, l2_passed, theme_candidate_map)
+    strategic_bypass = _build_strategic_l2_bypass(
+        strategic_seed_codes,
+        all_df_map,
+        cfg,
+        l2_channel_map,
+        market_cap_map,
+    )
+    strategic_l2_bypass_pool = list(strategic_bypass.get("pool") or [])
+    strategic_l2_bypass_triggers = strategic_bypass.get("triggers") or {}
+    strategic_l2_bypass_stage_map = strategic_bypass.get("stage_map") or {}
+    strategic_l2_bypass_markup_symbols = strategic_bypass.get("markup_symbols") or []
+    strategic_l2_bypass_reason_map = strategic_bypass.get("reason_map") or {}
+    strategic_l2_bypass_rescue_map = strategic_bypass.get("rescue_map") or {}
+    if strategic_l2_bypass_pool:
+        print(
+            "[funnel] 战略L2旁路: "
+            f"seeds={len(strategic_seed_codes)}, pool={len(strategic_l2_bypass_pool)}, "
+            f"L4={len(_trigger_hit_codes(strategic_l2_bypass_triggers))}, "
+            f"stage={len(strategic_l2_bypass_reason_map)}, "
+            f"rescue={len(strategic_l2_bypass_rescue_map)}"
+        )
+
     # Markup 阶段、Accumulation ABC 细化、Exit 信号
-    markup_symbols = detect_markup_stage(l3_passed, all_df_map, cfg)
+    markup_symbols = sorted(
+        set(detect_markup_stage(l3_passed, all_df_map, cfg)) | set(strategic_l2_bypass_markup_symbols)
+    )
     accum_stage_map = detect_accum_stage(l2_passed, all_df_map, cfg)
-    exit_signals = layer5_exit_signals(l2_passed + markup_symbols, all_df_map, accum_stage_map, cfg)
+    accum_stage_map.update(strategic_l2_bypass_stage_map)
+    exit_signals = layer5_exit_signals(
+        sorted(set(l2_passed + markup_symbols + strategic_l2_bypass_pool)),
+        all_df_map,
+        accum_stage_map,
+        cfg,
+    )
 
     total_hits = sum(len(v) for v in triggers.values())
     latest_close_map: dict[str, float] = {}
@@ -801,6 +1506,7 @@ def run_funnel_job(
         "pool_merged": len(merged_symbols),
         "pool_st_excluded": len(st_symbols),
         "pool_batches": total_batches,
+        "end_trade_date": window.end_trade_date.isoformat(),
         "fetch_ok": int(fetch_stats.get("fetch_ok", len(all_df_map)) or 0),
         "fetch_fail": int(fetch_stats.get("fetch_fail", 0) or 0),
         "fetch_date_mismatch": int(fetch_stats.get("fetch_date_mismatch", 0) or 0),
@@ -813,10 +1519,18 @@ def run_funnel_job(
         "layer2_accum": l2_accum,
         "layer2_dry_vol": l2_dry_vol,
         "layer2_rs_div": l2_rs_div,
+        "layer2_trend_cont": l2_trend_cont,
         "layer2_sos": l2_sos,
         "layer2_channel_map": l2_channel_map,
         "layer3": len(l3_passed),
         "top_sectors": top_sectors,
+        "concept_heat": concept_heat[:20],
+        "concept_heat_full": concept_heat,
+        "theme_lines": hot_concepts,
+        "theme_radar": theme_radar,
+        "theme_radar_current": theme_radar_current,
+        "theme_radar_source": theme_radar_source,
+        "candidate_concepts": {s: concept_map.get(s, []) for s in (ranked_l3_symbols or l3_passed)},
         "etf_enhancement": _etf_metrics(etf_symbols, etf_df_map, etf_l2_passed, etf_sector_map, etf_candidates),
         "etf_candidates": etf_candidates,
         "sector_rotation": sector_rotation,
@@ -830,6 +1544,13 @@ def run_funnel_job(
         # L2 旁路观察池
         "l2_bypass_pool": l2_bypass_pool,
         "l2_bypass_triggers": bypass_triggers,
+        "strategic_l2_bypass_seed_count": len(strategic_seed_codes),
+        "strategic_l2_bypass_pool": strategic_l2_bypass_pool,
+        "strategic_l2_bypass_triggers": strategic_l2_bypass_triggers,
+        "strategic_l2_bypass_stage_map": strategic_l2_bypass_stage_map,
+        "strategic_l2_bypass_rescue_map": strategic_l2_bypass_rescue_map,
+        "strategic_l2_bypass_markup_symbols": strategic_l2_bypass_markup_symbols,
+        "strategic_l2_bypass_reason_map": strategic_l2_bypass_reason_map,
         # 阶段识别和退出信号
         "markup_symbols": markup_symbols,
         "accum_stage_map": accum_stage_map,
@@ -853,10 +1574,12 @@ def run_funnel_job(
         }
     print(
         f"[funnel] L1={metrics['layer1']}, L2={metrics['layer2']}, "
-        f"(主升={l2_momentum}, 潜伏={l2_ambush}, 吸筹={l2_accum}, 地量={l2_dry_vol}, 护盘={l2_rs_div}, 点火={l2_sos}), "
+        f"(主升={l2_momentum}, 潜伏={l2_ambush}, 吸筹={l2_accum}, 地量={l2_dry_vol}, 护盘={l2_rs_div}, 趋势={l2_trend_cont}, 点火={l2_sos}), "
         f"L3={metrics['layer3']}, 命中={total_hits}, "
-        f"Top行业={top_sectors}, 各触发={metrics['by_trigger']}"
+        f"Top板块={top_sectors}, 主线={hot_concepts[:3] if hot_concepts else []}, "
+        f"战略旁路={len(strategic_l2_bypass_pool)}, 各触发={metrics['by_trigger']}"
     )
+    print(f"[funnel] 主题雷达({theme_radar_source}): {summarize_theme_radar(theme_radar)}")
     report_progress("筛选完成", f"命中={total_hits}只", 1.0)
 
     return triggers, metrics
@@ -890,11 +1613,20 @@ def run(
     if latest_close_map:
         benchmark_context["latest_close_map"] = latest_close_map
 
+    theme_radar = metrics.get("theme_radar") or {}
+    theme_candidate_map = _theme_candidate_map(theme_radar)
+    theme_badge_map = _theme_badge_map(theme_candidate_map)
+    theme_bonus_map = _theme_bonus_map(theme_candidate_map)
     l2_bypass_pool = metrics.get("l2_bypass_pool", []) or []
     bypass_triggers = metrics.get("l2_bypass_triggers", {}) or {}
-    review_triggers = _merge_trigger_maps(triggers, bypass_triggers)
+    strategic_l2_bypass_pool = metrics.get("strategic_l2_bypass_pool", []) or []
+    strategic_l2_bypass_triggers = metrics.get("strategic_l2_bypass_triggers", {}) or {}
+    strategic_l2_bypass_reason_map = metrics.get("strategic_l2_bypass_reason_map", {}) or {}
+    strategic_l2_bypass_stage_map = metrics.get("strategic_l2_bypass_stage_map", {}) or {}
+    review_triggers = _merge_trigger_maps(triggers, bypass_triggers, strategic_l2_bypass_triggers)
     formal_hit_set = {str(code).strip() for hits in triggers.values() for code, _ in hits if str(code).strip()}
     l2_bypass_set = set(l2_bypass_pool)
+    strategic_l2_bypass_set = {str(c).strip() for c in strategic_l2_bypass_pool if str(c).strip()}
     code_to_reasons: dict[str, list[str]] = {}
     code_to_trigger_keys: dict[str, list[str]] = {}
     code_to_total_score: dict[str, float] = {}
@@ -908,6 +1640,13 @@ def run(
             code_to_trigger_keys[code].append(key)
             code_to_total_score[code] += score
 
+    for code in strategic_l2_bypass_set:
+        code_to_reasons.setdefault(code, [])
+        code_to_trigger_keys.setdefault(code, [])
+        code_to_total_score.setdefault(code, 0.0)
+    _append_extra_reasons(code_to_reasons, strategic_l2_bypass_reason_map)
+    _append_theme_reasons(code_to_reasons, theme_badge_map)
+    _apply_theme_bonus_to_scores(code_to_total_score, theme_bonus_map)
     # 兼容旧变量名（下游可能引用）
     code_to_best_score = code_to_total_score
     sorted_codes = sorted(
@@ -918,6 +1657,13 @@ def run(
     unique_hit_count = len(formal_hit_set)
     review_unique_count = len(sorted_codes)
     l2_bypass_ranked = _rank_l2_bypass_pool(l2_bypass_pool, code_to_total_score)
+    strategic_l2_bypass_ranked = _rank_l2_bypass_pool(strategic_l2_bypass_pool, code_to_total_score)
+    use_full_formal_l4_selection = FUNNEL_AI_SELECTION_MODE in {
+        "all_formal_l4",
+        "all_l4",
+        "full_formal_l4",
+        "full_l4",
+    }
     use_legacy_selection = FUNNEL_AI_SELECTION_MODE in {
         "legacy_full_hits",
         "legacy_hits",
@@ -940,51 +1686,48 @@ def run(
     sector_rotation_map = sector_rotation.get("state_map", {}) or {}
     etf_metrics = metrics.get("etf_enhancement", {}) or {}
     etf_candidates = metrics.get("etf_candidates", []) or []
+    theme_l4_count = sum(1 for c in formal_hit_set if c in theme_candidate_map)
+    theme_radar_source = str(metrics.get("theme_radar_source") or "current")
+    strategic_accum_codes = {
+        str(code).strip()
+        for code, stage in strategic_l2_bypass_stage_map.items()
+        if str(stage or "").strip() in {"Accum_B", "Accum_C"}
+    }
     # 策略：大盘水温驱动的双轨制（Top-Down 择时顺势策略）
     regime = benchmark_context.get("regime", "NEUTRAL")
-    if use_legacy_selection:
-        trend_selected = []
-        accum_selected = []
+    if use_full_formal_l4_selection or use_legacy_selection:
+        selected_for_ai = list(formal_sorted_codes)
+        trend_selected, accum_selected = _split_selected_tracks(selected_for_ai, code_to_trigger_keys)
         score_map = {c: float(code_to_best_score.get(c, 0.0)) for c in formal_sorted_codes}
         ai_policy = {
             "total_cap": len(formal_sorted_codes),
-            "trend_quota": 0,
-            "accum_quota": 0,
-            "requested_trend_quota": 0,
-            "requested_accum_quota": 0,
-            "quota_family": "LEGACY_FULL_HITS",
+            "trend_quota": len(trend_selected),
+            "accum_quota": len(accum_selected),
+            "requested_trend_quota": len(trend_selected),
+            "requested_accum_quota": len(accum_selected),
+            "quota_family": "FULL_FORMAL_L4",
             "max_trend_l3_fill": 0,
             "max_accum_l3_fill": 0,
         }
-        selected_for_ai = list(formal_sorted_codes)
-        print(f"[funnel] AI候选分配完成(legacy_full_hits): total={len(selected_for_ai)}")
-    else:
-        mock_result = FunnelResult(
-            layer1_symbols=[],
-            layer2_symbols=[],
-            layer3_symbols=metrics.get("layer3_symbols", []) or [],
-            top_sectors=[],
-            triggers=triggers,
-            stage_map=accum_stage_map,
-            markup_symbols=markup_symbols,
-            exit_signals=exit_signals,
-            channel_map=l2_channel_map,
-        )
-        alloc_started = time.monotonic()
-        trend_selected, accum_selected, score_map = allocate_ai_candidates(
-            mock_result,
-            l3_ranked_symbols,
-            regime,
-            sector_map=sector_map,
-            max_per_sector=2,
-        )
-        ai_policy = resolve_ai_candidate_policy(regime)
-        alloc_elapsed = time.monotonic() - alloc_started
         print(
-            f"[funnel] AI候选分配完成: trend={len(trend_selected)}, accum={len(accum_selected)}, "
-            f"elapsed={alloc_elapsed:.3f}s"
+            f"[funnel] AI候选分配完成(full_formal_l4): "
+            f"Trend={len(trend_selected)}, Accum={len(accum_selected)}, total={len(selected_for_ai)}"
+        )
+        if dynamic_policy_mode() == "shadow":
+            _attach_shadow_policy(ai_policy, _load_dynamic_policy_context(str(regime), benchmark_context))
+    else:
+        trend_selected, accum_selected, score_map, ai_policy = _allocate_candidates_for_ai(
+            metrics,
+            triggers,
+            l3_ranked_symbols,
+            str(regime),
+            sector_map,
+            benchmark_context,
         )
         selected_for_ai = trend_selected + accum_selected
+
+    if not (use_full_formal_l4_selection or use_legacy_selection):
+        _apply_theme_bonus_to_scores(score_map, theme_bonus_map)
 
     bypass_added = _promote_l2_bypass_for_ai(
         selected_for_ai,
@@ -1001,6 +1744,41 @@ def run(
             f"budget={FUNNEL_L2_BYPASS_AI_CAP or 'unlimited'}, pool={len(l2_bypass_pool)}"
         )
 
+    strategic_bypass_added = _promote_l2_bypass_for_ai(
+        selected_for_ai,
+        trend_selected,
+        accum_selected,
+        strategic_l2_bypass_pool,
+        code_to_total_score,
+        code_to_trigger_keys,
+        score_map,
+        enabled=FUNNEL_STRATEGIC_L2_BYPASS_ENABLED,
+        cap=FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP,
+        accum_codes=strategic_accum_codes,
+    )
+    if strategic_bypass_added:
+        print(
+            f"[funnel] 战略L2旁路送审: added={strategic_bypass_added}, "
+            f"budget={FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP or 'unlimited'}, "
+            f"pool={len(strategic_l2_bypass_pool)}"
+        )
+
+    theme_promoted_count = _promote_theme_l4_for_ai(
+        selected_for_ai,
+        trend_selected,
+        accum_selected,
+        formal_hit_set,
+        theme_bonus_map,
+        code_to_total_score,
+        code_to_trigger_keys,
+        score_map,
+    )
+    if theme_promoted_count:
+        print(
+            f"[funnel] 战略主线联动送审: added={theme_promoted_count}, "
+            f"cap={FUNNEL_THEME_RADAR_PROMOTE_CAP or 'unlimited'}, l4_hit={theme_l4_count}"
+        )
+
     min_funnel_score = float(metrics.get("min_funnel_score", 0.0) or 0.0)
     if score_map and min_funnel_score > 0:
         before = len(selected_for_ai)
@@ -1011,6 +1789,23 @@ def run(
         dropped = before - len(selected_for_ai)
         if dropped:
             print(f"[funnel] min_funnel_score={min_funnel_score} 过滤掉 {dropped} 只低质量候选")
+
+    selected_for_ai = _rerank_selected_codes(selected_for_ai, score_map)
+    trend_set = set(trend_selected)
+    accum_set = set(accum_selected)
+    trend_selected = [c for c in selected_for_ai if c in trend_set]
+    accum_selected = [c for c in selected_for_ai if c in accum_set]
+
+    shadow_meta = _maybe_persist_policy_shadow_run(
+        ai_policy=ai_policy,
+        metrics=metrics,
+        triggers=triggers,
+        selected_for_ai=selected_for_ai,
+        l3_ranked_symbols=l3_ranked_symbols,
+        regime=str(regime),
+        sector_map=sector_map,
+    )
+    ai_policy.update(shadow_meta)
 
     if use_legacy_card and use_legacy_selection:
         bench_line = "未知"
@@ -1038,10 +1833,17 @@ def run(
             f"**漏斗概览**: {metrics['total_symbols']}只 → L1:{metrics['layer1']} → L2:{metrics['layer2']} → L3:{metrics['layer3']} → 命中:{metrics['total_hits']}",
             f"**大盘水温**: {bench_line}",
             f"**大盘量价推演**: {pv_line}",
+            f"**中长线主线**: {summarize_theme_radar(metrics.get('theme_radar') or {})} ({theme_radar_source})",
+            (
+                f"**战略主线联动**: 观察池{len(theme_candidate_map)}只 / "
+                f"正式L4命中{theme_l4_count}只 / 战略L2旁路{len(strategic_l2_bypass_pool)}只 / "
+                f"加权送审{theme_promoted_count}只"
+            ),
             f"**候选分层**: 正式L4命中{unique_hit_count}只 / L2明珠池{len(l2_bypass_pool)}只 "
             f"-> AI输入{len(selected_for_ai)}只 "
             f"(正式L4 {sum(1 for c in selected_for_ai if c in formal_hit_set)} / "
-            f"L2明珠 {sum(1 for c in selected_for_ai if c in l2_bypass_set)}; "
+            f"L2明珠 {sum(1 for c in selected_for_ai if c in l2_bypass_set)} / "
+            f"战略旁路 {sum(1 for c in selected_for_ai if c in strategic_l2_bypass_set)}; "
             f"旁路预算 {FUNNEL_L2_BYPASS_AI_CAP or 'unlimited'})",
             f"**Top 行业**: {', '.join(metrics['top_sectors']) if metrics['top_sectors'] else '无'}",
             "",
@@ -1059,18 +1861,23 @@ def run(
             return "  "
 
         # 1) 多信号共振组（置顶）
-        multi_signal = [c for c in selected_for_ai if len(code_to_trigger_keys.get(c, [])) > 1]
+        multi_signal = [
+            c for c in selected_for_ai if c not in strategic_l2_bypass_set and len(code_to_trigger_keys.get(c, [])) > 1
+        ]
         if multi_signal:
             lines.append(f"**【🔥 多信号共振】{len(multi_signal)} 只**")
             for code in sorted(multi_signal, key=lambda c: -code_to_total_score.get(c, 0)):
                 name = name_map.get(code, code)
                 short = "+".join(TRIGGER_SHORT_LABELS.get(k, k) for k in code_to_trigger_keys.get(code, []))
                 score = code_to_total_score.get(code, 0)
-                lines.append(f"{_score_star(score)} {code} {name}  {score:.2f}  {short}")
+                theme_badge = f"  {theme_badge_map[code]}" if code in theme_badge_map else ""
+                lines.append(f"{_score_star(score)} {code} {name}  {score:.2f}  {short}{theme_badge}")
             lines.append("")
 
         # 2) 各信号分组
-        single_signal_codes = [c for c in selected_for_ai if c not in set(multi_signal)]
+        single_signal_codes = [
+            c for c in selected_for_ai if c not in set(multi_signal) and c not in strategic_l2_bypass_set
+        ]
         # 为每个 code 确定主信号（取第一个 trigger key）
         code_primary_key: dict[str, str] = {}
         for code in single_signal_codes:
@@ -1086,7 +1893,8 @@ def run(
             for code in sorted(group_codes, key=lambda c: -code_to_total_score.get(c, 0)):
                 name = name_map.get(code, code)
                 score = code_to_total_score.get(code, 0)
-                lines.append(f"{_score_star(score)} {code} {name}  {score:.2f}")
+                theme_badge = f"  {theme_badge_map[code]}" if code in theme_badge_map else ""
+                lines.append(f"{_score_star(score)} {code} {name}  {score:.2f}{theme_badge}")
             lines.append("")
 
         if not selected_for_ai:
@@ -1109,8 +1917,32 @@ def run(
                         if c == code:
                             bp_reasons.append(TRIGGER_SHORT_LABELS.get(key, key))
                 industry = str(sector_map.get(code, "") or "")
-                lines.append(f"  {code} {name}  {'+'.join(bp_reasons)}  [{industry}]")
+                theme_badge = f"  {theme_badge_map[code]}" if code in theme_badge_map else ""
+                lines.append(f"  {code} {name}  {'+'.join(bp_reasons)}  [{industry}]{theme_badge}")
             omitted = len(l2_bypass_pool) - len(display_pool)
+            if omitted > 0:
+                lines.append(f"  ... 另 {omitted} 只略")
+
+        if strategic_l2_bypass_pool:
+            lines.append("")
+            lines.append(f"**【🧭 战略L2旁路】{len(strategic_l2_bypass_pool)} 只**")
+            lines.append(
+                f"L1通过但L2未过，需同时满足战略观察池与L4/阶段复核；"
+                f"送AI复核 {sum(1 for c in selected_for_ai if c in strategic_l2_bypass_set)} 只"
+            )
+            display_pool = (
+                strategic_l2_bypass_ranked
+                if FUNNEL_BYPASS_DISPLAY_LIMIT <= 0
+                else strategic_l2_bypass_ranked[:FUNNEL_BYPASS_DISPLAY_LIMIT]
+            )
+            for code in display_pool:
+                name = name_map.get(code, code)
+                short = "+".join(TRIGGER_SHORT_LABELS.get(k, k) for k in code_to_trigger_keys.get(code, []))
+                stage = str(strategic_l2_bypass_stage_map.get(code, "") or "").strip()
+                reason = " / ".join(x for x in [short, stage] if x) or "战略复核"
+                theme_badge = f"  {theme_badge_map[code]}" if code in theme_badge_map else ""
+                lines.append(f"  {code} {name}  {reason}{theme_badge}")
+            omitted = len(strategic_l2_bypass_pool) - len(display_pool)
             if omitted > 0:
                 lines.append(f"  ... 另 {omitted} 只略")
 
@@ -1139,13 +1971,21 @@ def run(
             {
                 "code": c,
                 "name": name_map.get(c, c),
-                "tag": "、".join(code_to_reasons.get(c, [])),
+                "tag": _candidate_reason_text(c, code_to_reasons, theme_badge_map),
                 "track": _infer_track(c),
                 "stage": _legacy_stage(c),
-                "score": float((metrics.get("layer3_score_map", {}) or {}).get(c, 0.0)),
+                "score": float(
+                    code_to_total_score.get(c, 0.0) or (metrics.get("layer3_score_map", {}) or {}).get(c, 0.0)
+                ),
                 "priority_score": float(code_to_best_score.get(c, 0.0)),
                 "priority_rank": idx + 1,
-                "selection_source": "l2_bypass" if c in l2_bypass_set else "l4_hit",
+                "selection_source": (
+                    "strategic_l2_bypass"
+                    if c in strategic_l2_bypass_set
+                    else "l2_bypass"
+                    if c in l2_bypass_set
+                    else "l4_hit"
+                ),
                 "selection_is_fill": False,
                 "initial_price": float(latest_close_map.get(c, 0.0) or 0.0),
                 "industry": str(sector_map.get(c, "") or "未知行业"),
@@ -1167,6 +2007,7 @@ def run(
                 "exit_signal": str((exit_signals.get(c, {}) or {}).get("signal", "")).strip(),
                 "exit_price": (exit_signals.get(c, {}) or {}).get("price"),
                 "exit_reason": str((exit_signals.get(c, {}) or {}).get("reason", "")).strip(),
+                **_theme_report_fields(c, theme_candidate_map, theme_bonus_map),
             }
             for idx, c in enumerate(selected_for_ai)
         ]
@@ -1179,6 +2020,9 @@ def run(
                 "l2_bypass_triggers": bypass_triggers,
                 "l2_bypass_selected": [c for c in selected_for_ai if c in l2_bypass_set],
                 "l2_bypass_budget": FUNNEL_L2_BYPASS_AI_CAP,
+                "strategic_l2_bypass_triggers": strategic_l2_bypass_triggers,
+                "strategic_l2_bypass_selected": [c for c in selected_for_ai if c in strategic_l2_bypass_set],
+                "strategic_l2_bypass_budget": FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP,
                 "content": content,
                 "title": title,
                 "symbols_for_report": symbols_for_report,
@@ -1195,6 +2039,7 @@ def run(
 
     formal_event_count = sum(len(v) for v in triggers.values())
     bypass_selected_count = sum(1 for c in selected_for_ai if c in l2_bypass_set)
+    strategic_bypass_selected_count = sum(1 for c in selected_for_ai if c in strategic_l2_bypass_set)
 
     def _stage_name(code: str) -> str:
         if code in markup_symbols:
@@ -1202,8 +2047,9 @@ def run(
         return str(accum_stage_map.get(code, "") or "").strip()
 
     hit_selected_count = sum(1 for c in selected_for_ai if c in formal_hit_set)
-    l3_only_count = max(len(selected_for_ai) - hit_selected_count - bypass_selected_count, 0)
-    l3_score_map = metrics.get("layer3_score_map", {}) or {}
+    l3_only_count = max(
+        len(selected_for_ai) - hit_selected_count - bypass_selected_count - strategic_bypass_selected_count, 0
+    )
     sector_rotation = metrics.get("sector_rotation", {}) or {}
     sector_rotation_map = sector_rotation.get("state_map", {}) or {}
 
@@ -1223,7 +2069,8 @@ def run(
         f"requested Accum={requested_accum_quota}, effective Trend={trend_quota}, "
         f"effective Accum={accum_quota}, 总上限={total_cap}, "
         f"l3_fill_limit Trend={max_trend_l3_fill}, Accum={max_accum_l3_fill}], "
-        f"最终选入: Trend={len(trend_selected)}, Accum={len(accum_selected)}, 总计={len(selected_for_ai)}"
+        f"最终选入: Trend={len(trend_selected)}, Accum={len(accum_selected)}, "
+        f"战略旁路={strategic_bypass_selected_count}, 总计={len(selected_for_ai)}"
     )
 
     bench_line = "未知"
@@ -1250,57 +2097,55 @@ def run(
         f"**漏斗概览**: {metrics['total_symbols']}只 → L1:{metrics['layer1']} → L2:{metrics['layer2']} → L3:{metrics['layer3']} → 正式L4:{unique_hit_count}",
         f"**大盘水温**: {bench_line}",
         f"**大盘量价推演**: {pv_line}",
+        f"**中长线主线**: {summarize_theme_radar(metrics.get('theme_radar') or {})} ({theme_radar_source})",
+        (
+            f"**战略主线联动**: 观察池{len(theme_candidate_map)}只 / "
+            f"正式L4命中{theme_l4_count}只 / 战略L2旁路{len(strategic_l2_bypass_pool)}只 / "
+            f"加权送审{theme_promoted_count}只"
+        ),
         (
             f"**候选分层**: 正式L4命中{unique_hit_count}只 / L2明珠池{len(l2_bypass_pool)}只 "
             f"-> AI输入{len(selected_for_ai)}只 "
-            f"(Trend {len(trend_selected)} / Accum {len(accum_selected)}; "
+            f"(配额 {quota_family}: Trend {len(trend_selected)}/{trend_quota}, "
+            f"Accum {len(accum_selected)}/{accum_quota}; "
             f"正式L4 {hit_selected_count} / L3补充{l3_only_count} / "
-            f"L2明珠 {bypass_selected_count}; 旁路预算 {FUNNEL_L2_BYPASS_AI_CAP or 'unlimited'})"
+            f"L2明珠 {bypass_selected_count} / 战略旁路 {strategic_bypass_selected_count}; "
+            f"旁路预算 {FUNNEL_L2_BYPASS_AI_CAP or 'unlimited'})"
         ),
         f"**Top 行业**: {', '.join(metrics['top_sectors']) if metrics['top_sectors'] else '无'}",
         "",
     ]
+    if ai_policy.get("shadow_table"):
+        lines.insert(
+            -1,
+            f"**动态策略 Shadow**: `{ai_policy['shadow_table']}` 写入{ai_policy.get('shadow_written', 0)}行；"
+            f"shadow新增{ai_policy.get('shadow_added_count', 0)}只，移除{ai_policy.get('shadow_removed_count', 0)}只",
+        )
     _append_etf_section(lines, etf_metrics, etf_candidates)
     if etf_metrics or etf_candidates:
         lines.append("")
-
-    def _score_star(s: float) -> str:
-        if s >= 10:
-            return "★★"
-        if s >= 5:
-            return "★ "
-        return "  "
 
     def _display_score(code: str) -> float:
         trigger_score = float(code_to_total_score.get(code, 0.0) or 0.0)
         return trigger_score if trigger_score > 0 else float(score_map.get(code, 0.0) or 0.0)
 
-    multi_signal = [c for c in selected_for_ai if len(code_to_trigger_keys.get(c, [])) > 1]
-    if multi_signal:
-        lines.append(f"**【🔥 多信号共振】{len(multi_signal)} 只**")
-        for code in sorted(multi_signal, key=lambda c: -_display_score(c)):
-            name = name_map.get(code, code)
-            short = "+".join(TRIGGER_SHORT_LABELS.get(k, k) for k in code_to_trigger_keys.get(code, []))
-            score = _display_score(code)
-            lines.append(f"{_score_star(score)} {code} {name}  {score:.2f}  {short}")
-        lines.append("")
+    if formal_sorted_codes:
+        lines.append("**正式L4展开**: 以下列出全部正式L4；标记 →AI 的进入 Step3 研报")
+        _append_formal_l4_sections(
+            lines,
+            formal_sorted_codes,
+            selected_for_ai,
+            name_map,
+            code_to_trigger_keys,
+            _display_score,
+            theme_badge_map,
+        )
 
-    grouped_codes = set(multi_signal)
-    single_signal_codes = [c for c in selected_for_ai if c not in grouped_codes and code_to_trigger_keys.get(c)]
-    code_primary_key = {code: code_to_trigger_keys.get(code, [""])[0] for code in single_signal_codes}
-    for group_key in TRIGGER_GROUP_ORDER:
-        group_codes = [c for c in single_signal_codes if code_primary_key.get(c) == group_key]
-        if not group_codes:
-            continue
-        group_title = TRIGGER_GROUP_TITLES.get(group_key, group_key)
-        lines.append(f"**【{group_title}】{len(group_codes)} 只**")
-        for code in sorted(group_codes, key=lambda c: -_display_score(c)):
-            name = name_map.get(code, code)
-            score = _display_score(code)
-            lines.append(f"{_score_star(score)} {code} {name}  {score:.2f}")
-        lines.append("")
-
-    fill_codes = [c for c in selected_for_ai if c not in grouped_codes and not code_to_trigger_keys.get(c)]
+    fill_codes = [
+        c
+        for c in selected_for_ai
+        if c not in formal_hit_set and c not in l2_bypass_set and c not in strategic_l2_bypass_set
+    ]
     if fill_codes:
         lines.append(f"**【🧭 L3/阶段补位】{len(fill_codes)} 只**")
         for code in sorted(fill_codes, key=lambda c: -_display_score(c)):
@@ -1309,7 +2154,10 @@ def run(
             channel = str(l2_channel_map.get(code, "")).strip()
             suffix = " / ".join(x for x in [stage, channel] if x)
             score = _display_score(code)
-            lines.append(f"{_score_star(score)} {code} {name}  {score:.2f}" + (f"  {suffix}" if suffix else ""))
+            theme_badge = f"  {theme_badge_map[code]}" if code in theme_badge_map else ""
+            lines.append(
+                f"{_score_star(score)} {code} {name}  {score:.2f}" + (f"  {suffix}" if suffix else "") + theme_badge
+            )
         lines.append("")
 
     if not selected_for_ai:
@@ -1330,8 +2178,35 @@ def run(
                     if c == code:
                         bp_reasons.append(TRIGGER_SHORT_LABELS.get(key, key))
             bp_industry = str(sector_map.get(code, "") or "")
-            lines.append(f"  {code} {bp_name}  {'+'.join(bp_reasons)}  [{bp_industry}]")
+            theme_badge = f"  {theme_badge_map[code]}" if code in theme_badge_map else ""
+            lines.append(f"  {code} {bp_name}  {'+'.join(bp_reasons)}  [{bp_industry}]{theme_badge}")
         omitted = len(l2_bypass_pool) - len(display_pool)
+        if omitted > 0:
+            lines.append(f"  ... 另 {omitted} 只略")
+
+    if strategic_l2_bypass_pool:
+        lines.append("")
+        lines.append(f"**【🧭 战略L2旁路】{len(strategic_l2_bypass_pool)} 只**")
+        lines.append(
+            f"L1通过但L2未过，需同时满足战略观察池与L4/阶段复核；送AI复核 {strategic_bypass_selected_count} 只"
+        )
+        display_pool = (
+            strategic_l2_bypass_ranked
+            if FUNNEL_BYPASS_DISPLAY_LIMIT <= 0
+            else strategic_l2_bypass_ranked[:FUNNEL_BYPASS_DISPLAY_LIMIT]
+        )
+        for code in display_pool:
+            bp_name = name_map.get(code, code)
+            bp_reasons = []
+            for key in TRIGGER_LABELS:
+                for c, _ in strategic_l2_bypass_triggers.get(key, []):
+                    if c == code:
+                        bp_reasons.append(TRIGGER_SHORT_LABELS.get(key, key))
+            stage = str(strategic_l2_bypass_stage_map.get(code, "") or "").strip()
+            reason = " / ".join(x for x in ["+".join(bp_reasons), stage] if x) or "战略复核"
+            theme_badge = f"  {theme_badge_map[code]}" if code in theme_badge_map else ""
+            lines.append(f"  {code} {bp_name}  {reason}{theme_badge}")
+        omitted = len(strategic_l2_bypass_pool) - len(display_pool)
         if omitted > 0:
             lines.append(f"  ... 另 {omitted} 只略")
 
@@ -1340,6 +2215,8 @@ def run(
     ok = True if not notify else send_feishu_notification(webhook_url, title, content)
 
     def _selection_source(code: str) -> str:
+        if code in strategic_l2_bypass_set:
+            return "strategic_l2_bypass"
         if code in l2_bypass_set:
             return "l2_bypass"
         if code in formal_hit_set:
@@ -1355,12 +2232,12 @@ def run(
             "code": c,
             "name": name_map.get(c, c),
             "tag": (
-                f"{'L2旁路观察' if c in l2_bypass_set else str(l2_channel_map.get(c, '')).strip()} | "
-                f"{'、'.join(code_to_reasons.get(c, [])) or '威科夫候选'}"
+                f"{'战略L2旁路' if c in strategic_l2_bypass_set else 'L2旁路观察' if c in l2_bypass_set else str(l2_channel_map.get(c, '')).strip()} | "
+                f"{_candidate_reason_text(c, code_to_reasons, theme_badge_map)}"
             ).strip(" |"),
             "track": ("Trend" if c in trend_selected else "Accum" if c in accum_selected else ""),
             "stage": _stage_name(c),
-            "score": float(l3_score_map.get(c, 0.0)),
+            "score": float(_display_score(c)),
             "priority_score": float(score_map.get(c, 0.0)),
             "priority_rank": idx + 1,
             "selection_source": _selection_source(c),
@@ -1385,6 +2262,7 @@ def run(
             "exit_signal": str((exit_signals.get(c, {}) or {}).get("signal", "")).strip(),
             "exit_price": (exit_signals.get(c, {}) or {}).get("price"),
             "exit_reason": str((exit_signals.get(c, {}) or {}).get("reason", "")).strip(),
+            **_theme_report_fields(c, theme_candidate_map, theme_bonus_map),
         }
         for idx, c in enumerate(selected_for_ai)
     ]
@@ -1397,6 +2275,9 @@ def run(
             "l2_bypass_triggers": bypass_triggers,
             "l2_bypass_selected": [c for c in selected_for_ai if c in l2_bypass_set],
             "l2_bypass_budget": FUNNEL_L2_BYPASS_AI_CAP,
+            "strategic_l2_bypass_triggers": strategic_l2_bypass_triggers,
+            "strategic_l2_bypass_selected": [c for c in selected_for_ai if c in strategic_l2_bypass_set],
+            "strategic_l2_bypass_budget": FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP,
             "content": content,
             "title": title,
             "symbols_for_report": symbols_for_report,

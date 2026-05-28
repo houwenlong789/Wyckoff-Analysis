@@ -18,7 +18,7 @@
 
 用自然语言和一位威科夫大师对话。系统把 A 股日线行情、威科夫结构识别、AI 研报、持仓风控、形态复盘和通知推送串成一条自动化链路，并已扩展支持港股与美股漏斗扫描。
 
-React Web、CLI、MCP 与 GitHub Actions 共同组成当前产品形态；日线行情通过 TickFlow 实时拉取（无 Supabase 行情缓存），Supabase 仅用于用户配置、持仓、形态复盘、市场信号与任务结果。
+React Web、CLI、MCP 与 GitHub Actions 共同组成当前产品形态；日线行情通过 TickFlow 实时拉取（无 Supabase 行情缓存），Supabase 仅用于用户配置、持仓、形态复盘、市场信号、信号反馈与任务结果。
 
 > Risk disclosure: WyckoffAgent is for educational, research, and informational use. It does not provide investment advice, does not account for every personal financial circumstance, and does not guarantee future performance.
 
@@ -118,22 +118,9 @@ wyckoff dashboard  # 启动本地可视化面板
 
 </details>
 
-### Streamlit（维护入口）
+### Streamlit MVP 已下线
 
-在线地址：**[wyckoff-analysis-youngcanphoenix.streamlit.app](https://wyckoff-analysis-youngcanphoenix.streamlit.app/)**
-
-<p align="center">
-  <img src="attach/demo/streamlit-chat.png" alt="Streamlit 读盘室" width="900" />
-</p>
-
-<details>
-<summary><strong>展开更多 Streamlit 截图</strong></summary>
-
-| 数据导出 |
-|:---:|
-| <img src="attach/demo/streamlit-export.png" width="450" /> |
-
-</details>
+Streamlit 已经不再迭代维护，主分支已全面移除 Streamlit 运行代码。相关代码仍保留在 `release/streamlit` 分支；Streamlit MVP 时期的产品架构和效果图见 [docs/STREAMLIT_MVP_ARCHITECTURE.md](docs/STREAMLIT_MVP_ARCHITECTURE.md)。
 
 ### 本地可视化面板（Dashboard）
 
@@ -185,9 +172,15 @@ wyckoff dashboard
 - **五层漏斗筛选** — A 股全市场约 4500 股，港股 / 美股独立 universe 扫描（六通道 + 板块共振 + 微观狙击 + AI 审判）
 - **跨市场** — A 股 / 港股 / 美股漏斗独立 workflow
 - **AI 三阵营研报** — 逻辑破产 / 储备营地 / 起跳板，LLM 独立审判
+- **信号反馈闭环** — 漏斗记录 observations，盘后 feedback 聚合 health / registry，支持 shadow 动态策略验证
 - **持仓诊断 & 私人决断** — 批量体检 + EXIT/TRIM/HOLD/PROBE/ATTACK 指令
-- **Agent 记忆** — FTS5 全文检索 + 时间衰减混合召回，跨会话记忆
+- **Agent 分层记忆** — L1 原子记忆 + L2 场景 + L3 画像，FTS5/代码/关键词混合召回并保留来源追溯
 - **Skills 扩展** — 内置 `/screen`、`/checkup`、`/report`、`/backtest`，用户可自定义
+- **Prompt 模板** — 内置 `/daily`、`/review-l4`、`/step3-audit` 等高频投研模板，也支持 `~/.wyckoff/prompts/*.md`
+- **模型元数据与成本可见性** — `wyckoff model list/usage/cost` 展示上下文窗口、reasoning 能力和本地 token 成本估算
+- **会话分叉与导出** — `wyckoff session export/fork` 或 TUI `/fork` 把历史对话变成可复盘、可继续的新分支
+- **标准事件流** — `wyckoff trace --events <scratchpad.jsonl>` / `wyckoff diag` 产出统一 JSONL，方便复盘工具调用时间线
+- **依赖卫生检查** — CI 运行 `scripts/check_dependency_hygiene.py`，提示 Python/Web 依赖锁定和 lockfile 风险
 - **MCP Server** — 10 个工具通过 MCP 协议对外暴露，Claude Code / Cursor 即插即用
 - **多通道推送** — 飞书 / 企微 / 钉钉 / Telegram
 - **本地面板** — `wyckoff dashboard` 一条命令启动可视化
@@ -217,6 +210,9 @@ wyckoff dashboard
 | 想了解 | 去哪里看 |
 |--------|----------|
 | 架构、Actions、数据表、缓存 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| **A 股主漏斗执行流程（上下游 + 流程图）** | [docs/A_SHARE_FUNNEL_FLOW.md](docs/A_SHARE_FUNNEL_FLOW.md) |
+| 信号反馈闭环、shadow/on 动态策略 | [docs/SIGNAL_FEEDBACK_LOOP.md](docs/SIGNAL_FEEDBACK_LOOP.md) |
+| 系统迭代策略与落地状态 | [docs/ITERATION_STRATEGY.md](docs/ITERATION_STRATEGY.md) |
 | 运营成本、规模化预算 | [docs/COST_MODEL.md](docs/COST_MODEL.md) |
 | 漏斗、AI 研报、OMS、回测 | [README_STRATEGY.md](README_STRATEGY.md) |
 | 术语速查 | [GLOSSARY.md](GLOSSARY.md) |

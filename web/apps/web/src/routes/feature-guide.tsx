@@ -1,5 +1,7 @@
-import { BarChart3, Bot, Briefcase, Download, MessageSquare, Moon, RadioTower, Settings, TrendingUp, type LucideIcon } from 'lucide-react'
-import { usePreferences, type TranslationKey } from '@/lib/preferences'
+import { useEffect } from 'react'
+import { useLocation } from 'react-router'
+import { AlertTriangle, BarChart3, Bot, Briefcase, CalendarDays, CheckCircle2, CloudCog, Download, ExternalLink, GitBranch, MessageSquare, Moon, RadioTower, Rocket, Settings, Swords, Terminal, TrendingUp, Users, type LucideIcon } from 'lucide-react'
+import { usePreferences, type Locale, type TranslationKey } from '@/lib/preferences'
 
 const workflows = [
   {
@@ -11,6 +13,11 @@ const workflows = [
     icon: BarChart3,
     titleKey: 'guide.workflow.analysis.title',
     descKey: 'guide.workflow.analysis.desc',
+  },
+  {
+    icon: Swords,
+    titleKey: 'guide.workflow.battle.title',
+    descKey: 'guide.workflow.battle.desc',
   },
   {
     icon: Briefcase,
@@ -25,6 +32,7 @@ const tools = [
   { nameKey: 'guide.tool.signal', detailKey: 'guide.tool.signal.detail' },
   { nameKey: 'guide.tool.tail', detailKey: 'guide.tool.tail.detail' },
   { nameKey: 'guide.tool.export', detailKey: 'guide.tool.export.detail' },
+  { nameKey: 'guide.tool.history', detailKey: 'guide.tool.history.detail' },
   { nameKey: 'guide.tool.model', detailKey: 'guide.tool.model.detail' },
 ] satisfies { nameKey: TranslationKey; detailKey: TranslationKey }[]
 
@@ -51,8 +59,116 @@ const playbooks = [
   },
 ] satisfies { labelKey: TranslationKey; icon: LucideIcon; textKey: TranslationKey }[]
 
+const capabilityCopy = {
+  'zh-CN': {
+    eyebrow: '能力边界',
+    title: 'Web 是日常工作台，后台负责重任务',
+    intro: '当前 Web 端已经覆盖读盘、单股、多股、持仓、跟踪和导出这些高频动作；全市场漏斗、回测、回刷和运维任务继续放在 GitHub Actions、CLI 或数据库后台，避免把长任务和敏感权限塞进浏览器。',
+    webTitle: 'Web 端已经接入',
+    webItems: ['单股 320 日日线结构图、价值快照、AI 报告与本地历史', '多股对抗的相对强弱、叠加/分图、价值面校准与本地历史', '持仓诊断支持数据库持仓和手动持仓，结果保存在当前浏览器', '形态跟踪、尾盘记录、批量行情导出、模型和数据源配置'],
+    gapTitle: '系统有，但不放在 Web 里主跑',
+    whyTitle: '为什么不全塞进 Web',
+    costLinkText: '成本详见：COST_MODEL.md',
+    accessTitle: '当前入口',
+  },
+  'en-US': {
+    eyebrow: 'Capability Map',
+    title: 'The web UI is the daily desk; background jobs carry the heavy work',
+    intro: 'The web UI now covers the high-frequency loops: reading, single-stock analysis, stock battle, portfolio diagnosis, tracking, and export. Full-market funnels, backtests, repricing, and maintenance stay in GitHub Actions, CLI, or database-side jobs instead of pushing long jobs and sensitive permissions into the browser.',
+    webTitle: 'Covered by the web UI',
+    webItems: ['Single-stock 320-day chart, value snapshot, AI report, and local history', 'Stock battle with relative strength, overlay/separate charts, value calibration, and local history', 'Portfolio diagnosis for database or manual positions, with browser-local result history', 'Pattern tracking, tail-buy logs, batch market-data export, model and data-source settings'],
+    gapTitle: 'Available in the system, but not browser-first',
+    whyTitle: 'Why not put everything in the browser',
+    costLinkText: 'Cost details: COST_MODEL.md',
+    accessTitle: 'Where to use them today',
+  },
+} satisfies Record<Locale, {
+  eyebrow: string
+  title: string
+  intro: string
+  webTitle: string
+  webItems: string[]
+  gapTitle: string
+  whyTitle: string
+  costLinkText: string
+  accessTitle: string
+}>
+
+const capabilityGaps = {
+  'zh-CN': [
+    ['全市场漏斗任务', 'A股、港股、美股每日全市场扫描、L1-L4 分层、信号写库与飞书推送仍主要跑在 GitHub Actions。'],
+    ['LLM 输入预览与飞书产物', '每日审核输入、完整报告、文件/文档分发更适合由 Actions 产出，Web 只承接查询和轻量分析。'],
+    ['回测与参数网格', '牛熊周期、TopN、止损/止盈/持仓天数等批量计算适合后台长任务，Web 目前只展示部分结果。'],
+    ['信号生命周期与补价回刷', 'pending/confirmed/expired、推荐表现回刷、30 个交易日保留、MFE/MAE 统计都在后台维护。'],
+    ['CLI Agent 与本机文件流', 'CLI/TUI、长上下文 Agent、诊断导出、本机环境变量和文件产物不适合直接暴露给浏览器。'],
+    ['Streamlit 历史页面', 'Streamlit MVP 已在 main 退场并归档到 release/streamlit；新能力默认进入 CF Pages、CLI、MCP 或 Actions。'],
+    ['维护与数据库任务', '缓存清理、RLS/服务端密钥操作、日志 artifact、全量清库/回刷属于运维能力，Web 只保留安全入口。'],
+  ],
+  'en-US': [
+    ['Full-market funnel jobs', 'A-share, HK, and US market scans, L1-L4 layering, signal writes, and Feishu pushes mainly run in GitHub Actions.'],
+    ['LLM input previews and Feishu artifacts', 'Daily review inputs, full reports, and file/doc distribution fit Actions better; the web UI handles querying and lightweight analysis.'],
+    ['Backtests and parameter grids', 'Bull/bear windows, TopN, stop-loss, take-profit, and holding-day grids are long-running backend workloads.'],
+    ['Signal lifecycle and repricing', 'pending/confirmed/expired updates, recommendation repricing, 30-trading-day retention, and MFE/MAE stats run in background jobs.'],
+    ['CLI Agent and local file flows', 'CLI/TUI, long-context agents, diagnostic exports, local env vars, and file artifacts should stay on the user machine.'],
+    ['Archived Streamlit pages', 'The Streamlit MVP is retired from main and archived on release/streamlit; new work goes to CF Pages, CLI, MCP, or Actions.'],
+    ['Maintenance and database jobs', 'Cache cleanup, service-role operations, log artifacts, full cleanup, and repricing are operational tools, not browser-first UI.'],
+  ],
+} satisfies Record<Locale, [string, string][]>
+
+const capabilityReasons = {
+  'zh-CN': ['全市场漏斗、回测网格、LLM 审核和回刷统计都是长时间计算；浏览器适合发起、查看和轻量分析，不适合作为任务队列。', '服务端密钥、RLS、批量清库和全量回刷有权限风险；这些动作留在 Actions/CLI/运维脚本里更可控。', 'Web 本地历史只保存在当前浏览器，是为了避免把用户临时分析结果写库；跨设备沉淀再单独做同步策略。'],
+  'en-US': ['Full-market funnels, backtest grids, LLM reviews, and repricing stats are long-running computations; the browser is better for launching, viewing, and lightweight analysis than acting as a job queue.', 'Service-role keys, RLS, bulk cleanup, and full repricing carry permission risk, so they stay in Actions, CLI, or ops scripts.', 'Web local history is intentionally browser-local to avoid writing temporary analysis results to the database; cross-device sync needs a separate policy.'],
+} satisfies Record<Locale, string[]>
+
+const capabilityLaunch = {
+  'zh-CN': {
+    kicker: '开放预告',
+    date: '2026-06-03',
+    title: '将开放知识星球、闲鱼等加入方式',
+    desc: '如果你对这个项目感兴趣，可以和我一起使用漏斗、回测、单票复盘、尾盘策略、持仓诊断等完整能力，而不只停留在 Web 端的轻量入口。',
+    badge: '完整能力',
+    tags: ['完整漏斗能力', '回测与复盘', '多市场数据', '一起迭代'],
+  },
+  'en-US': {
+    kicker: 'Access preview',
+    date: '2026-06-03',
+    title: 'Knowledge Planet, Xianyu, and similar access channels will open',
+    desc: 'If this project resonates with you, you can join me to use the full funnel, backtest, replay, tail-buy, and portfolio diagnosis workflows beyond the lightweight web cockpit.',
+    badge: 'Full Access',
+    tags: ['Full funnel', 'Backtest & replay', 'Multi-market data', 'Build together'],
+  },
+} satisfies Record<Locale, {
+  kicker: string
+  date: string
+  title: string
+  desc: string
+  badge: string
+  tags: string[]
+}>
+
+const capabilityAccess = {
+  'zh-CN': [
+    ['GitHub Actions', '漏斗、审核输入、飞书产物、回测、回刷、维护任务'],
+    ['本地 CLI', '准点触发、长任务、本地密钥、诊断导出和文件工作流'],
+    ['运维脚本 / 数据库控制台', '偏后台的配置、调试和数据库维护能力'],
+    ['Web 端', '读盘、单股、多股、持仓、跟踪、导出、配置和本地历史'],
+  ],
+  'en-US': [
+    ['GitHub Actions', 'Funnel, review input, Feishu artifacts, backtest, repricing, maintenance jobs'],
+    ['Local CLI', 'On-time triggers, long jobs, local secrets, diagnostic exports, and file workflows'],
+    ['Ops scripts / database console', 'Admin-like configuration, debugging, and database maintenance'],
+    ['Web UI', 'Reading, single-stock, battle, portfolio, tracking, export, settings, and local history'],
+  ],
+} satisfies Record<Locale, [string, string][]>
+
 export function FeatureGuidePage() {
-  const { t } = usePreferences()
+  const { locale, t } = usePreferences()
+  const location = useLocation()
+
+  useEffect(() => {
+    if (location.hash !== '#capability-boundary') return
+    requestAnimationFrame(() => document.getElementById('capability-boundary')?.scrollIntoView({ block: 'start' }))
+  }, [location.hash])
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-8 p-6">
@@ -77,7 +193,7 @@ export function FeatureGuidePage() {
             <p className="mt-1 text-sm text-muted-foreground">{t('guide.coreDesc')}</p>
           </div>
         </div>
-        <div className="grid gap-4 md:grid-cols-3">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           {workflows.map(({ icon: Icon, titleKey, descKey }) => (
             <article key={titleKey} className="rounded-lg border border-border bg-background p-4 shadow-sm shadow-primary/5">
               <Icon className="mb-3 text-primary" size={20} />
@@ -127,6 +243,8 @@ export function FeatureGuidePage() {
         </aside>
       </section>
 
+      <CapabilityBoundarySection locale={locale} />
+
       <section className="rounded-lg border border-border bg-primary/5 p-5">
         <div className="flex items-start gap-3">
           <Settings className="mt-0.5 text-primary" size={18} />
@@ -139,5 +257,147 @@ export function FeatureGuidePage() {
         </div>
       </section>
     </div>
+  )
+}
+
+function CapabilityBoundarySection({ locale }: { locale: Locale }) {
+  const copy = capabilityCopy[locale]
+  return (
+    <section id="capability-boundary" className="scroll-mt-6 overflow-hidden rounded-2xl border border-border bg-gradient-to-br from-sidebar via-background to-primary/5 p-5 shadow-sm">
+      <div className="mb-5 max-w-3xl">
+        <p className="text-xs font-semibold uppercase tracking-[0.24em] text-primary">{copy.eyebrow}</p>
+        <h2 className="mt-2 text-2xl font-semibold tracking-tight">{copy.title}</h2>
+        <p className="mt-3 text-sm leading-6 text-muted-foreground">{copy.intro}</p>
+      </div>
+      <CapabilityLaunchBanner locale={locale} />
+      <div className="grid gap-4 xl:grid-cols-[0.9fr_1.4fr]">
+        <CapabilityWebCard copy={copy} />
+        <CapabilityGapCard title={copy.gapTitle} locale={locale} />
+      </div>
+      <div className="mt-4 grid gap-4 lg:grid-cols-2">
+        <CapabilityListCard icon={AlertTriangle} title={copy.whyTitle} items={capabilityReasons[locale]} costLinkText={copy.costLinkText} tone="warning" />
+        <CapabilityAccessCard title={copy.accessTitle} locale={locale} />
+      </div>
+    </section>
+  )
+}
+
+function CapabilityLaunchBanner({ locale }: { locale: Locale }) {
+  const copy = capabilityLaunch[locale]
+  return (
+    <article className="relative mb-5 overflow-hidden rounded-2xl border border-amber-300/50 bg-[radial-gradient(circle_at_top_left,rgba(245,158,11,0.26),transparent_36%),linear-gradient(135deg,rgba(15,23,42,0.96),rgba(88,28,135,0.85)_48%,rgba(180,83,9,0.88))] p-5 text-white shadow-lg shadow-amber-900/10">
+      <div className="absolute -right-10 -top-10 h-36 w-36 rounded-full border border-white/20 bg-white/10 blur-sm" />
+      <div className="relative grid gap-5 lg:grid-cols-[1fr_280px] lg:items-center">
+        <div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="inline-flex items-center gap-1 rounded-full border border-white/20 bg-white/15 px-3 py-1 text-xs font-semibold backdrop-blur">
+              <Rocket size={13} />
+              {copy.kicker}
+            </span>
+            <span className="inline-flex items-center gap-1 rounded-full bg-amber-300 px-3 py-1 text-xs font-bold text-slate-950">
+              <CalendarDays size={13} />
+              {copy.date}
+            </span>
+          </div>
+          <h3 className="mt-4 text-2xl font-semibold tracking-tight">{copy.title}</h3>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-white/78">{copy.desc}</p>
+        </div>
+        <div className="rounded-2xl border border-white/15 bg-white/10 p-4 backdrop-blur">
+          <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
+            <Users size={16} />
+            {copy.badge}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {copy.tags.map((tag) => (
+              <span key={tag} className="rounded-full bg-white/15 px-3 py-1 text-xs text-white/90">
+                {tag}
+              </span>
+            ))}
+          </div>
+        </div>
+      </div>
+    </article>
+  )
+}
+
+function CapabilityWebCard({ copy }: { copy: (typeof capabilityCopy)[Locale] }) {
+  return (
+    <article className="rounded-xl border border-primary/20 bg-primary/10 p-4">
+      <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-primary">
+        <CheckCircle2 size={17} />
+        {copy.webTitle}
+      </div>
+      <ul className="space-y-2 text-sm leading-6 text-muted-foreground">
+        {copy.webItems.map((item) => <li key={item}>• {item}</li>)}
+      </ul>
+    </article>
+  )
+}
+
+function CapabilityGapCard({ title, locale }: { title: string; locale: Locale }) {
+  return (
+    <article className="rounded-xl border border-border bg-background/80 p-4">
+      <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
+        <CloudCog size={17} className="text-primary" />
+        {title}
+      </div>
+      <div className="grid gap-3 md:grid-cols-2">
+        {capabilityGaps[locale].map(([name, desc]) => (
+          <div key={name} className="rounded-lg border border-border bg-sidebar/70 p-3">
+            <h3 className="text-sm font-semibold">{name}</h3>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">{desc}</p>
+          </div>
+        ))}
+      </div>
+    </article>
+  )
+}
+
+function CapabilityListCard({ icon: Icon, title, items, costLinkText, tone }: { icon: LucideIcon; title: string; items: string[]; costLinkText: string; tone: 'warning' }) {
+  return (
+    <article className="rounded-xl border border-border bg-background/80 p-4">
+      <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
+        <Icon size={17} className={tone === 'warning' ? 'text-warning' : 'text-primary'} />
+        {title}
+      </div>
+      <ul className="space-y-2 text-sm leading-6 text-muted-foreground">
+        {items.map((item) => <li key={item}>• {item}</li>)}
+      </ul>
+      <a
+        className="mt-3 inline-flex items-center gap-1 rounded-full border border-warning/30 bg-warning/10 px-3 py-1.5 text-xs font-medium text-warning transition hover:bg-warning/15"
+        href="https://github.com/YoungCan-Wang/WyckoffTradingAgent/blob/main/docs/COST_MODEL.md"
+        rel="noreferrer"
+        target="_blank"
+      >
+        {costLinkText}
+        <ExternalLink size={13} />
+      </a>
+    </article>
+  )
+}
+
+function CapabilityAccessCard({ title, locale }: { title: string; locale: Locale }) {
+  const icons = [GitBranch, Terminal, Settings, Bot]
+  return (
+    <article className="rounded-xl border border-border bg-background/80 p-4">
+      <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
+        <GitBranch size={17} className="text-primary" />
+        {title}
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {capabilityAccess[locale].map(([name, desc], index) => {
+          const Icon = icons[index] ?? Bot
+          return (
+            <div key={name} className="rounded-lg bg-muted/60 p-3">
+              <div className="flex items-center gap-2 text-sm font-semibold">
+                <Icon size={15} className="text-primary" />
+                {name}
+              </div>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">{desc}</p>
+            </div>
+          )
+        })}
+      </div>
+    </article>
   )
 }

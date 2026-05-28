@@ -17,6 +17,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
+
+class AgentCancelled(Exception):
+    """Agent 运行被用户主动取消。"""
+
+
 from cli.compaction import compact_messages, shrink_stale_tool_results
 from cli.loop_guard import (
     MAX_INCOMPLETE_TOOL_RETRIES,
@@ -39,13 +44,8 @@ RuntimeEvent = dict[str, Any]
 STREAM_CHUNK_TIMEOUT = 60.0
 
 
-def _iter_with_timeout(stream, timeout: float):
-    """包装流式迭代器，chunk 间超过 timeout 秒无数据则抛出 TimeoutError。
-
-    使用独立 daemon 线程 + Queue 实现：半开连接卡死时，主线程在 queue.get
-    超时后立即抛出，不等待僵死的生产线程（daemon 线程随进程退出自动回收）。
-    超时或异常时主动 close stream 释放底层连接。
-    """
+def _iter_with_timeout(stream, timeout: float, cancel_check: Callable[[], bool] | None = None):
+    """包装流式迭代器，支持超时和取消。cancel_check 每 0.5s 轮询一次。"""
     import queue
     import threading
 
@@ -66,10 +66,20 @@ def _iter_with_timeout(stream, timeout: float):
 
     try:
         while True:
-            try:
-                item = q.get(timeout=timeout)
-            except queue.Empty:
-                raise TimeoutError(f"模型响应超时（{timeout:.0f}s 内无数据）") from None
+            deadline = time.monotonic() + timeout
+            item = None
+            got = False
+            while not got:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"模型响应超时（{timeout:.0f}s 内无数据）") from None
+                wait = min(remaining, 0.5)
+                try:
+                    item = q.get(timeout=wait)
+                    got = True
+                except queue.Empty:
+                    if cancel_check and cancel_check():
+                        raise AgentCancelled() from None
             if item is _SENTINEL:
                 return
             if isinstance(item, tuple) and len(item) == 2 and item[0] is _EXCEPTION:
@@ -129,11 +139,13 @@ class AgentRuntime:
         *,
         scratchpad: AgentScratchpad | None = None,
         max_tool_rounds: int = MAX_TOOL_ROUNDS,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self.scratchpad = scratchpad
         self.max_tool_rounds = max_tool_rounds
+        self.cancel_check = cancel_check
 
     def run_stream(
         self,
@@ -204,7 +216,7 @@ class AgentRuntime:
     ) -> Iterator[RuntimeEvent | RoundState]:
         round_state = RoundState()
         stream = self.provider.chat_stream(messages, self.tools.schemas(), system_prompt)
-        for chunk in _iter_with_timeout(stream, STREAM_CHUNK_TIMEOUT):
+        for chunk in _iter_with_timeout(stream, STREAM_CHUNK_TIMEOUT, self.cancel_check):
             event = self._consume_model_chunk(round_state, chunk, round_number)
             if event:
                 yield event

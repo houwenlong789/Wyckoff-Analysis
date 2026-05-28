@@ -22,6 +22,12 @@ interface Recommendation {
   initial_price: number | null
   current_price: number | null
   change_pct: number | null
+  mfe_pct?: number | null
+  mae_pct?: number | null
+  range_amp_pct?: number | null
+  mfe_price?: number | null
+  mae_price?: number | null
+  performance_days?: number | null
   is_ai_recommended: boolean
   rag_vetoed: boolean
   funnel_score: number | null
@@ -37,20 +43,68 @@ interface SummaryStats {
   totalRecommendations: number
 }
 
+interface TrackingReadyContentProps {
+  activeDates: number[]
+  activeOldestDate: number | null
+  filtered: Recommendation[]
+  latestDate: number | null
+  market: MarketTab
+  onlyAI: boolean
+  search: string
+  selectedWindow: RecommendationWindow
+  sortBy: SortBy
+  sortOrder: SortOrder
+  stats: SummaryStats | null
+  visibleData: Recommendation[]
+  windowRows: Recommendation[]
+  onOnlyAIChange: (value: boolean) => void
+  onSearchChange: (value: string) => void
+  onSelectedWindowChange: (value: RecommendationWindow) => void
+  onSortByChange: (value: SortBy) => void
+  onSortOrderChange: (value: SortOrder) => void
+}
+
 const RETENTION_DATES = 30
+const TRACKING_PAGE_SIZE = 1000
 const AVG_WINDOWS = [5, 10, 15, 20, 25, 30] as const
 type RecommendationWindow = (typeof AVG_WINDOWS)[number]
-type SortBy = 'date' | 'change' | 'score'
+type SortBy = 'date' | 'change' | 'score' | 'count' | 'mfe' | 'mae'
 type SortOrder = 'desc' | 'asc'
 
 async function fetchTracking(market: MarketTab): Promise<Recommendation[]> {
+  const rows: Recommendation[] = []
+  let offset = 0
+  while (true) {
+    const batch = await fetchTrackingPage(market, offset)
+    rows.push(...batch)
+    if (batch.length < TRACKING_PAGE_SIZE || hasLoadedRetentionWindow(rows)) break
+    offset += TRACKING_PAGE_SIZE
+  }
+  const dateSet = new Set(getLatestRecommendDates(rows, RETENTION_DATES))
+  return rows.filter((row) => dateSet.has(row.recommend_date))
+}
+
+async function fetchTrackingPage(market: MarketTab, offset: number): Promise<Recommendation[]> {
   const { data, error } = await supabase
     .from(MARKET_TABLE[market])
     .select('*')
     .order('recommend_date', { ascending: false })
-    .limit(2000)
+    .order('code', { ascending: true })
+    .range(offset, offset + TRACKING_PAGE_SIZE - 1)
   if (error) throw new Error(`${MARKET_TABLE[market]}: ${error.message}`)
   return data || []
+}
+
+function hasLoadedRetentionWindow(rows: Recommendation[]): boolean {
+  const dates = getLatestRecommendDates(rows, RETENTION_DATES + 1)
+  const cutoffDate = dates[RETENTION_DATES - 1]
+  const oldestFetched = rows.at(-1)?.recommend_date
+  return (
+    dates.length > RETENTION_DATES
+    && typeof oldestFetched === 'number'
+    && typeof cutoffDate === 'number'
+    && oldestFetched < cutoffDate
+  )
 }
 
 export function TrackingPage() {
@@ -104,11 +158,6 @@ export function TrackingPage() {
   const latestDate = latestDates[0] ?? null
   const oldestDate = latestDates.at(-1) ?? null
   const activeOldestDate = activeDates.at(-1) ?? null
-  const handleSort = useCallback((next: SortBy) => {
-    if (next === sortBy) { setSortOrder((o) => o === 'desc' ? 'asc' : 'desc'); return }
-    setSortBy(next); setSortOrder('desc')
-  }, [sortBy])
-
   if (needsGate && whitelist.isLoading) return <WyckoffLoading />
 
   return (
@@ -124,33 +173,64 @@ export function TrackingPage() {
       ) : loading ? (
         <WyckoffLoading />
       ) : (
-        <>
-      <DateWindowFilter
-        activeDateCount={activeDates.length}
-        activeOldestDate={activeOldestDate}
-        latestDate={latestDate}
-        rawCount={windowRows.length}
-        selectedWindow={selectedWindow}
-        onWindowChange={setSelectedWindow}
-      />
-      {stats && <SummaryCards selectedWindow={selectedWindow} stats={stats} />}
-      <WinRatePanel rows={visibleData} />
-      <TrackingFilters
-        filteredCount={filtered.length}
-        onlyAI={onlyAI}
-        search={search}
-        sortBy={sortBy}
-        sortOrder={sortOrder}
-        visibleCount={visibleData.length}
-        onOnlyAIChange={setOnlyAI}
-        onSearchChange={setSearch}
-        onSortByChange={setSortBy}
-        onSortOrderChange={setSortOrder}
-      />
-      <TrackingTable rows={filtered} sortBy={sortBy} sortOrder={sortOrder} onSortChange={handleSort} market={market} />
-        </>
+        <TrackingReadyContent
+          activeDates={activeDates}
+          activeOldestDate={activeOldestDate}
+          filtered={filtered}
+          latestDate={latestDate}
+          market={market}
+          onlyAI={onlyAI}
+          search={search}
+          selectedWindow={selectedWindow}
+          sortBy={sortBy}
+          sortOrder={sortOrder}
+          stats={stats}
+          visibleData={visibleData}
+          windowRows={windowRows}
+          onOnlyAIChange={setOnlyAI}
+          onSearchChange={setSearch}
+          onSelectedWindowChange={setSelectedWindow}
+          onSortByChange={setSortBy}
+          onSortOrderChange={setSortOrder}
+        />
       )}
     </div>
+  )
+}
+
+function TrackingReadyContent(props: TrackingReadyContentProps) {
+  const {
+    activeDates,
+    activeOldestDate,
+    filtered,
+    latestDate,
+    market,
+    onlyAI,
+    search,
+    selectedWindow,
+    sortBy,
+    sortOrder,
+    stats,
+    visibleData,
+    windowRows,
+    onOnlyAIChange,
+    onSearchChange,
+    onSelectedWindowChange,
+    onSortByChange,
+    onSortOrderChange,
+  } = props
+  const handleSort = useCallback((next: SortBy) => {
+    if (next === sortBy) { onSortOrderChange(sortOrder === 'desc' ? 'asc' : 'desc'); return }
+    onSortByChange(next); onSortOrderChange('desc')
+  }, [onSortByChange, onSortOrderChange, sortBy, sortOrder])
+  return (
+    <>
+      <DateWindowFilter activeDateCount={activeDates.length} activeOldestDate={activeOldestDate} latestDate={latestDate} rawCount={windowRows.length} selectedWindow={selectedWindow} onWindowChange={onSelectedWindowChange} />
+      {stats && <SummaryCards selectedWindow={selectedWindow} stats={stats} />}
+      <WinRatePanel rows={visibleData} />
+      <TrackingFilters filteredCount={filtered.length} market={market} onlyAI={onlyAI} search={search} sortBy={sortBy} sortOrder={sortOrder} visibleCount={visibleData.length} onOnlyAIChange={onOnlyAIChange} onSearchChange={onSearchChange} onSortByChange={onSortByChange} onSortOrderChange={onSortOrderChange} />
+      <TrackingTable rows={filtered} sortBy={sortBy} sortOrder={sortOrder} onSortChange={handleSort} market={market} />
+    </>
   )
 }
 
@@ -268,6 +348,7 @@ function SummaryCards({ selectedWindow, stats }: { selectedWindow: Recommendatio
 
 function TrackingFilters({
   filteredCount,
+  market,
   onlyAI,
   search,
   sortBy,
@@ -279,6 +360,7 @@ function TrackingFilters({
   onSortOrderChange,
 }: {
   filteredCount: number
+  market: MarketTab
   onlyAI: boolean
   search: string
   sortBy: SortBy
@@ -309,27 +391,49 @@ function TrackingFilters({
         />
         {t('tracking.onlyAI')}
       </label>
-      <select
-        value={sortBy}
-        onChange={(event) => onSortByChange(event.target.value as SortBy)}
-        className="rounded-lg border border-border px-2 py-1.5 text-sm"
-      >
-        <option value="date">{t('tracking.sortDate')}</option>
-        <option value="change">{t('tracking.sortChange')}</option>
-        <option value="score">{t('tracking.sortScore')}</option>
-      </select>
-      <select
-        value={sortOrder}
-        onChange={(event) => onSortOrderChange(event.target.value as SortOrder)}
-        className="rounded-lg border border-border px-2 py-1.5 text-sm"
-      >
-        <option value="desc">{t('tracking.sortDesc')}</option>
-        <option value="asc">{t('tracking.sortAsc')}</option>
-      </select>
+      <TrackingSortControls
+        market={market}
+        sortBy={sortBy}
+        sortOrder={sortOrder}
+        onSortByChange={onSortByChange}
+        onSortOrderChange={onSortOrderChange}
+      />
       <span className="text-xs text-muted-foreground">
         {filteredCount} / {visibleCount} {t('common.stocks')}
       </span>
     </div>
+  )
+}
+
+function TrackingSortControls({
+  market,
+  sortBy,
+  sortOrder,
+  onSortByChange,
+  onSortOrderChange,
+}: {
+  market: MarketTab
+  sortBy: SortBy
+  sortOrder: SortOrder
+  onSortByChange: (value: SortBy) => void
+  onSortOrderChange: (value: SortOrder) => void
+}) {
+  const { t } = usePreferences()
+  return (
+    <>
+      <select value={sortBy} onChange={(event) => onSortByChange(event.target.value as SortBy)} className="rounded-lg border border-border px-2 py-1.5 text-sm">
+        <option value="date">{t('tracking.sortDate')}</option>
+        <option value="change">{t('tracking.sortChange')}</option>
+        {market === 'us' && <option value="mfe">{t('tracking.sortMfe')}</option>}
+        {market === 'us' && <option value="mae">{t('tracking.sortMae')}</option>}
+        <option value="score">{t('tracking.sortScore')}</option>
+        <option value="count">{t('tracking.sortRecommendCount')}</option>
+      </select>
+      <select value={sortOrder} onChange={(event) => onSortOrderChange(event.target.value as SortOrder)} className="rounded-lg border border-border px-2 py-1.5 text-sm">
+        <option value="desc">{t('tracking.sortDesc')}</option>
+        <option value="asc">{t('tracking.sortAsc')}</option>
+      </select>
+    </>
   )
 }
 
@@ -352,40 +456,11 @@ function TrackingTable({
     <div className="overflow-hidden rounded-lg border border-border">
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
-          <thead className="sticky top-0 bg-muted/80 backdrop-blur">
-            <tr>
-              <th className="px-3 py-2 text-left font-medium">{t('common.code')}</th>
-              <th className="px-3 py-2 text-left font-medium">{t('common.name')}</th>
-              <SortableHeader
-                align="right"
-                active={sortBy === 'date'}
-                label={t('tracking.recommendDate')}
-                order={sortOrder}
-                onClick={() => onSortChange('date')}
-              />
-              <th className="px-3 py-2 text-right font-medium">{t('tracking.initialPrice')}</th>
-              <th className="px-3 py-2 text-right font-medium">{t('tracking.currentPrice')}</th>
-              <SortableHeader
-                align="right"
-                active={sortBy === 'change'}
-                label={t('tracking.changePct')}
-                order={sortOrder}
-                onClick={() => onSortChange('change')}
-              />
-              <SortableHeader
-                align="right"
-                active={sortBy === 'score'}
-                label={t('tracking.score')}
-                order={sortOrder}
-                onClick={() => onSortChange('score')}
-              />
-              <th className="px-3 py-2 text-center font-medium">AI</th>
-            </tr>
-          </thead>
+          <TrackingTableHead market={market} sortBy={sortBy} sortOrder={sortOrder} onSortChange={onSortChange} />
           <tbody style={{ contentVisibility: 'auto', containIntrinsicSize: '0 40000px' }}>
             {rows.length === 0 ? (
               <tr className="border-t border-border">
-                <td colSpan={8} className="px-3 py-8 text-center text-muted-foreground">
+                <td colSpan={market === 'us' ? 11 : 8} className="px-3 py-8 text-center text-muted-foreground">
                   {t('tracking.empty')}
                 </td>
               </tr>
@@ -396,6 +471,55 @@ function TrackingTable({
         </table>
       </div>
     </div>
+  )
+}
+
+function TrackingTableHead({
+  market,
+  sortBy,
+  sortOrder,
+  onSortChange,
+}: {
+  market: MarketTab
+  sortBy: SortBy
+  sortOrder: SortOrder
+  onSortChange: (sortBy: SortBy) => void
+}) {
+  const { t } = usePreferences()
+  return (
+    <thead className="sticky top-0 bg-muted/80 backdrop-blur">
+      <tr>
+        <th className="px-3 py-2 text-left font-medium">{t('common.code')}</th>
+        <th className="px-3 py-2 text-left font-medium">{t('common.name')}</th>
+        <SortableHeader align="right" active={sortBy === 'date'} label={t('tracking.recommendDate')} order={sortOrder} onClick={() => onSortChange('date')} />
+        <SortableHeader align="right" active={sortBy === 'count'} label={t('tracking.recommendCount')} order={sortOrder} onClick={() => onSortChange('count')} />
+        <th className="px-3 py-2 text-right font-medium">{t('tracking.initialPrice')}</th>
+        <th className="px-3 py-2 text-right font-medium">{t('tracking.currentPrice')}</th>
+        <SortableHeader align="right" active={sortBy === 'change'} label={t('tracking.changePct')} order={sortOrder} onClick={() => onSortChange('change')} />
+        <SortableHeader align="right" active={sortBy === 'score'} label={t('tracking.score')} order={sortOrder} onClick={() => onSortChange('score')} />
+        {market === 'us' && <UsPerformanceHeaders sortBy={sortBy} sortOrder={sortOrder} onSortChange={onSortChange} />}
+        <th className="px-3 py-2 text-center font-medium">AI</th>
+      </tr>
+    </thead>
+  )
+}
+
+function UsPerformanceHeaders({
+  sortBy,
+  sortOrder,
+  onSortChange,
+}: {
+  sortBy: SortBy
+  sortOrder: SortOrder
+  onSortChange: (sortBy: SortBy) => void
+}) {
+  const { t } = usePreferences()
+  return (
+    <>
+      <SortableHeader align="right" active={sortBy === 'mfe'} label={t('tracking.mfePct')} order={sortOrder} onClick={() => onSortChange('mfe')} />
+      <SortableHeader align="right" active={sortBy === 'mae'} label={t('tracking.maePct')} order={sortOrder} onClick={() => onSortChange('mae')} />
+      <th className="px-3 py-2 text-right font-medium">{t('tracking.rangeAmpPct')}</th>
+    </>
   )
 }
 
@@ -429,9 +553,11 @@ function SortableHeader({
 }
 
 function TrackingRow({ row, market = 'cn' }: { row: Recommendation; market?: MarketTab }) {
+  const { t } = usePreferences()
   const vetoed = row.rag_vetoed
   const rowCls = vetoed ? 'border-t border-border hover:bg-muted/20 opacity-60 line-through' : 'border-t border-border hover:bg-muted/20'
   const codeDisplay = market === 'cn' ? String(row.code).padStart(6, '0') : String(row.code)
+  const scoreKind = trackingScoreKind(row)
   return (
     <tr className={rowCls}>
       <td className="px-3 py-2 font-mono">
@@ -440,14 +566,49 @@ function TrackingRow({ row, market = 'cn' }: { row: Recommendation; market?: Mar
       </td>
       <td className="px-3 py-2">{row.name || '-'}</td>
       <td className="px-3 py-2 text-right text-muted-foreground">{formatDate(row.recommend_date)}</td>
+      <td className="px-3 py-2 text-right font-medium">{recommendationCount(row.recommend_count)}</td>
       <td className="px-3 py-2 text-right">{row.initial_price?.toFixed(2) || '-'}</td>
       <td className="px-3 py-2 text-right">{row.current_price?.toFixed(2) || '-'}</td>
       <td className={`px-3 py-2 text-right font-medium ${pctColor(row.change_pct)}`}>{formatPct(row.change_pct)}</td>
-      <td className="px-3 py-2 text-right">{row.funnel_score?.toFixed(1) || '-'}</td>
+      <td className="px-3 py-2 text-right">
+        <div className="flex flex-col items-end gap-0.5">
+          <span>{formatScore(row.funnel_score)}</span>
+          {scoreKind && (
+            <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] leading-none text-muted-foreground">
+              {scoreKind === 'priority' ? t('tracking.scorePriority') : t('tracking.scoreRaw')}
+            </span>
+          )}
+        </div>
+      </td>
+      {market === 'us' && <UsPerformanceCells row={row} />}
       <td className="px-3 py-2 text-center">
         {row.is_ai_recommended && <span className="inline-block h-2 w-2 rounded-full bg-indigo-500" />}
       </td>
     </tr>
+  )
+}
+
+function trackingScoreKind(row: Recommendation): 'priority' | 'raw' | null {
+  if (!isFiniteNumber(row.funnel_score)) return null
+  const reason = row.recommend_reason ?? ''
+  if (row.funnel_score >= 20) return 'priority'
+  if (row.funnel_score >= 10 && (reason.includes('点火破局') || reason.includes('吸筹通道') || reason.includes('趋势延续'))) {
+    return 'priority'
+  }
+  return 'raw'
+}
+
+function UsPerformanceCells({ row }: { row: Recommendation }) {
+  return (
+    <>
+      <td className={`px-3 py-2 text-right font-medium ${pctColor(row.mfe_pct ?? null)}`}>
+        {formatPct(row.mfe_pct ?? null)}
+      </td>
+      <td className={`px-3 py-2 text-right font-medium ${pctColor(row.mae_pct ?? null)}`}>
+        {formatPct(row.mae_pct ?? null)}
+      </td>
+      <td className="px-3 py-2 text-right text-muted-foreground">{formatPct(row.range_amp_pct ?? null)}</td>
+    </>
   )
 }
 
@@ -537,7 +698,7 @@ function getLatestRecommendDates(rows: Recommendation[], limit: number): number[
 }
 
 function dedupeRecommendations(rows: Recommendation[]): Recommendation[] {
-  const sortedRows = [...rows].sort((a, b) => b.recommend_date - a.recommend_date)
+  const sortedRows = [...rows].sort((a, b) => a.recommend_date - b.recommend_date)
   const byCode = new Map<number | string, Recommendation>()
   for (const row of sortedRows) {
     const existing = byCode.get(row.code)
@@ -589,6 +750,9 @@ function sortRecommendations(rows: Recommendation[], sortBy: SortBy, sortOrder: 
   return [...rows].sort((a, b) => {
     if (sortBy === 'date') return nullableNumberCompare(a.recommend_date, b.recommend_date, direction)
     if (sortBy === 'change') return nullableNumberCompare(a.change_pct, b.change_pct, direction)
+    if (sortBy === 'mfe') return nullableNumberCompare(a.mfe_pct, b.mfe_pct, direction)
+    if (sortBy === 'mae') return nullableNumberCompare(a.mae_pct, b.mae_pct, direction)
+    if (sortBy === 'count') return nullableNumberCompare(recommendationCount(a.recommend_count), recommendationCount(b.recommend_count), direction)
     return nullableNumberCompare(a.funnel_score, b.funnel_score, direction)
   })
 }
@@ -603,6 +767,11 @@ function nullableNumberCompare(a: number | null | undefined, b: number | null | 
 function formatPct(value: number | null): string {
   if (!isFiniteNumber(value)) return '-'
   return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`
+}
+
+function formatScore(value: number | null): string {
+  if (!isFiniteNumber(value)) return '-'
+  return value >= 10 ? value.toFixed(1) : value.toFixed(2)
 }
 
 function pctColor(value: number | null): string {

@@ -1,6 +1,43 @@
 from __future__ import annotations
 
-from cli.memory import _extract_keywords, build_memory_context, extract_stock_codes
+from cli.memory import (
+    _extract_keywords,
+    _save_summary_memories,
+    build_memory_context,
+    extract_stock_codes,
+    prepend_memory_context,
+    save_session_summary,
+)
+
+
+class _Provider:
+    def __init__(self, outputs):
+        self.outputs = list(outputs)
+
+    def chat_stream(self, *_args):
+        yield {"type": "text_delta", "text": self.outputs.pop(0)}
+
+
+class _FailingProvider:
+    def chat_stream(self, *_args):
+        raise RuntimeError("dedup unavailable")
+
+
+def _init_tmp_db(monkeypatch, tmp_path):
+    import integrations.local_db as local_db
+
+    if local_db._conn is not None:
+        local_db._conn.close()
+    local_db._conn = None
+    monkeypatch.setattr("core.constants.LOCAL_DB_PATH", tmp_path / "memory.db")
+    local_db.init_db()
+    return local_db
+
+
+def _close_tmp_db(local_db):
+    if local_db._conn is not None:
+        local_db._conn.close()
+    local_db._conn = None
 
 
 class TestExtractStockCodes:
@@ -43,3 +80,125 @@ class TestBuildMemoryContext:
         monkeypatch.setattr("cli.memory.extract_stock_codes", lambda t: [])
         result = build_memory_context("随便问个问题")
         assert result == "" or isinstance(result, str)
+
+    def test_injects_layered_context_with_source(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("persona", "用户偏好低换手、重视止损", memory_level="L3")
+            local_db.save_memory("preference", "不追涨", codes="000001")
+            local_db.save_memory(
+                "decision",
+                "用户决定等待 000001 放量确认",
+                codes="000001",
+                source_ref="chat_log:s1",
+            )
+
+            context = build_memory_context("000001 接下来怎么处理")
+
+            assert "# 用户画像" in context
+            assert "# 历史记忆" in context
+            assert "源:chat_log:s1" in context
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_applies_recall_budget_and_tags(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "偏好" * 80, codes="000001")
+            local_db.save_memory("decision", "决策" * 80, codes="000001")
+
+            context = build_memory_context("000001 怎么处理", max_chars_per_memory=40, max_total_chars=180)
+
+            assert context.startswith("<relevant-memories>")
+            assert context.endswith("</relevant-memories>")
+            assert len(context) < 320
+            assert "已截断" in context
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_prepends_memory_context_to_current_turn_only(self):
+        message = prepend_memory_context("今天怎么看？", "<relevant-memories>\nA\n</relevant-memories>")
+
+        assert message.startswith("<relevant-memories>")
+        assert "<current-user-message>\n今天怎么看？\n</current-user-message>" in message
+
+    def test_local_db_filters_memory_by_level_and_since(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            l1_id = local_db.save_memory("preference", "偏好L1", memory_level="L1")
+            local_db.save_memory("scenario", "场景L2", memory_level="L2")
+
+            l1_rows = local_db.get_recent_memories(memory_level="L1", limit=10)
+            future_rows = local_db.get_recent_memories(since="2999-01-01T00:00:00", limit=10)
+            search_rows = local_db.search_memory(keyword="偏好", memory_level="L1", limit=10)
+
+            assert [r["id"] for r in l1_rows] == [l1_id]
+            assert future_rows == []
+            assert [r["id"] for r in search_rows] == [l1_id]
+        finally:
+            _close_tmp_db(local_db)
+
+
+class TestSaveSessionSummary:
+    def test_stores_supported_atoms_and_source(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            provider = _Provider(
+                [
+                    "[股票] 000001 吸筹观察，等待放量确认\n[决策] 用户决定暂不加仓\n[偏好] 不追涨",
+                    "[画像] 用户偏好确认后再加仓\n[场景] 000001 吸筹后等待放量确认",
+                ]
+            )
+            messages = [
+                {"role": "user", "content": "看看 000001"},
+                {"role": "assistant", "tool_calls": [{"id": "tc1", "name": "analyze_stock", "args": {}}]},
+                {"role": "tool", "content": '{"code":"000001"}'},
+                {"role": "assistant", "content": "先观察。"},
+            ]
+
+            save_session_summary(messages, provider, session_id="s1")
+
+            memories = local_db.get_recent_memories(limit=10)
+            types = {m["memory_type"] for m in memories}
+            assert types == {"decision", "preference"}
+            assert any(m["source_ref"] == "chat_log:s1" for m in memories)
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_dedup_unknown_duplicate_id_still_saves(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "旧偏好", codes="000001")
+            existing = local_db.get_recent_memories(memory_type="preference", limit=10)
+            unknown_id = max(m["id"] for m in existing) + 1
+
+            saved = _save_summary_memories(
+                "[偏好] 新偏好",
+                "000001",
+                "chat_log:s2",
+                _Provider([f"DUPLICATE:{unknown_id}"]),
+            )
+
+            memories = local_db.get_recent_memories(memory_type="preference", limit=10)
+            assert saved == 1
+            assert any(m["content"] == "新偏好" for m in memories)
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_dedup_failure_still_saves(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "旧偏好", codes="000001")
+
+            saved = _save_summary_memories(
+                "[偏好] 新偏好",
+                "000001",
+                "chat_log:s2",
+                _FailingProvider(),
+            )
+
+            memories = local_db.get_recent_memories(memory_type="preference", limit=10)
+            assert saved == 1
+            assert any(m["content"] == "新偏好" for m in memories)
+        finally:
+            _close_tmp_db(local_db)

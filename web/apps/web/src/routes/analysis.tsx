@@ -10,15 +10,18 @@ import { KlineChart } from '@/components/kline-chart'
 import { usePreferences } from '@/lib/preferences'
 import { AIDisclaimer } from '@/components/ai-disclaimer'
 import { detectWyckoffAnnotations } from '@/lib/wyckoff-detect'
-import { TICKFLOW_PURCHASE, fetchKline, getUserDataKeys, checkWhitelist, isCnSymbol, isSupportedKlineCode, type KlineData } from '@/lib/kline'
+import { TICKFLOW_PURCHASE, fetchKline, fetchValueSnapshot, getUserDataKeys, checkWhitelist, isCnSymbol, isSupportedKlineCode, type KlineData, type ValueSnapshot } from '@/lib/kline'
 import { avg } from '@/lib/math'
 import { marketLabel, resolveStockQuery, searchStocks, type StockSearchResult } from '@/lib/market-search'
+import { buildValuePrompt, buildValueScore, formatValuePercent, metricToneClass, numberTone, reverseNumberTone, signalClass, sourceLabel, valueScoreClass, valueUnavailableText, type ValueView } from '@/lib/value-analysis'
+import { saveAnalysisHistory } from '@/lib/local-history'
 
 interface AnalysisResult {
   report: string
   symbol: string
   name: string
   klineData: KlineData[]
+  valueSnapshot: ValueSnapshot
 }
 
 export function AnalysisPage() {
@@ -27,17 +30,39 @@ export function AnalysisPage() {
   const search = useStockSearch()
   const prerequisites = usePrerequisites(user?.id)
   const runner = useAnalysisRunner(search, prerequisites.setHasModelConfig)
+  useAnalysisHistory(user?.id, runner.result)
   const disabled = runner.loading || !search.symbol.trim() || prerequisites.checkingConfig || !prerequisites.hasModelConfig || !prerequisites.hasDataSource
 
   return (
-    <div className="flex h-full flex-col p-6">
-      <h1 className="mb-6 text-xl font-semibold">{t('analysis.title')}</h1>
-      <MissingConfigBanner prerequisites={prerequisites} />
-      <SearchForm search={search} loading={runner.loading} disabled={disabled} onAnalyze={runner.handleAnalyze} onClearError={() => runner.setError('')} />
-      {runner.error && <div className="mb-4 rounded-lg bg-red-50 px-4 py-2.5 text-sm text-red-700 dark:bg-red-500/10 dark:text-red-200">{runner.error}</div>}
+    <div className="flex h-full min-h-0 flex-col overflow-hidden px-6 py-5">
+      <div className="shrink-0 border-b border-border/70 pb-4">
+        <h1 className="mb-4 text-xl font-semibold">{t('analysis.title')}</h1>
+        <MissingConfigBanner prerequisites={prerequisites} />
+        <SearchForm search={search} loading={runner.loading} disabled={disabled} onAnalyze={runner.handleAnalyze} onClearError={() => runner.setError('')} />
+        {runner.error && <div className="mt-3 rounded-lg bg-red-50 px-4 py-2.5 text-sm text-red-700 dark:bg-red-500/10 dark:text-red-200">{runner.error}</div>}
+      </div>
       <AnalysisContent runner={runner} />
     </div>
   )
+}
+
+function useAnalysisHistory(userId: string | undefined, result: AnalysisResult | null) {
+  const savedKey = useRef('')
+
+  useEffect(() => {
+    if (!userId || !result?.report) return
+    const key = analysisHistoryKey(result)
+    if (savedKey.current === key) return
+    savedKey.current = key
+    void saveAnalysisHistory({
+      kind: 'single-analysis',
+      userId,
+      title: `${result.symbol} ${result.name}`,
+      subtitle: `${result.klineData.length} rows · ${sourceLabel(result.valueSnapshot)}`,
+      symbols: [result.symbol],
+      payload: result,
+    }).catch(() => undefined)
+  }, [result, userId])
 }
 
 interface SearchController {
@@ -152,7 +177,7 @@ interface AnalysisRunnerState {
   error: string
   step: AnalysisStep | null
   streamingReport: string
-  earlyKline: { data: KlineData[]; symbol: string; name: string } | null
+  earlyKline: { data: KlineData[]; symbol: string; name: string; valueSnapshot: ValueSnapshot } | null
   setError: Dispatch<SetStateAction<string>>
   handleAnalyze: () => void
 }
@@ -165,7 +190,7 @@ function useAnalysisRunner(search: SearchController, setHasModelConfig: Dispatch
   const [error, setError] = useState('')
   const [step, setStep] = useState<AnalysisStep | null>(null)
   const [streamingReport, setStreamingReport] = useState('')
-  const [earlyKline, setEarlyKline] = useState<{ data: KlineData[]; symbol: string; name: string } | null>(null)
+  const [earlyKline, setEarlyKline] = useState<{ data: KlineData[]; symbol: string; name: string; valueSnapshot: ValueSnapshot } | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const streamBuf = useRef('')
   const rafRef = useRef(0)
@@ -174,26 +199,27 @@ function useAnalysisRunner(search: SearchController, setHasModelConfig: Dispatch
     setStep('resolve')
     const resolved = await resolveAnalysisCode(search.symbol, search.selectedStock)
     if (!resolved) { setError(t('analysis.invalidStockCode')); setStep(null); return }
-    abortRef.current?.abort()
-    const abort = (abortRef.current = new AbortController())
-    setError(''); setLoading(true); setResult(null); setStreamingReport(''); setEarlyKline(null)
-    search.setSymbol(resolved.code); search.setSelectedStock(resolved.stock); search.setSearchOpen(false)
+    const abort = startAnalysisRequest(abortRef, search, resolved, setError, setLoading, setResult, setStreamingReport, setEarlyKline)
     try {
       const [config, dataKeys] = await Promise.all([loadLLMConfig(user!.id), getUserDataKeys(user!.id)])
       setHasModelConfig(Boolean(config?.api_key && config?.model))
       if (!config?.api_key || !config.model) throw new Error(t('analysis.missingPrefix', { items: t('analysis.modelRequirement') }))
       setStep('kline')
-      const [stockInfoResult, klineData] = await Promise.all([fetchStockName(resolved.code), fetchKline(resolved.code, dataKeys, user!.id)])
+      const [stockInfoResult, klineData, valueSnapshot] = await Promise.all([
+        fetchStockName(resolved.code),
+        fetchKline(resolved.code, dataKeys, user!.id),
+        fetchValueSnapshot(resolved.code, dataKeys).catch((): ValueSnapshot => ({ symbol: resolved.code, source: 'none', metrics: null, reason: 'not-found' })),
+      ])
       if (klineData.length === 0) throw new Error(t('analysis.noKlineData'))
       const name = resolved.stock?.name || stockInfoResult.data?.name || resolved.code
-      setEarlyKline({ data: klineData, symbol: resolved.code, name })
+      setEarlyKline({ data: klineData, symbol: resolved.code, name, valueSnapshot })
       setStep('llm'); streamBuf.current = ''
       const onDelta = (chunk: string) => { streamBuf.current += chunk; scheduleFlush(streamBuf, rafRef, setStreamingReport) }
-      const report = await callLLM(config, resolved.code, name, buildKlinePayload(klineData), abort.signal, onDelta)
+      const report = await callLLM(config, resolved.code, name, buildKlinePayload(klineData), valueSnapshot, abort.signal, onDelta)
       cancelAnimationFrame(rafRef.current)
       if (abort.signal.aborted) return
       setStreamingReport(report)
-      setResult({ report, symbol: resolved.code, name, klineData })
+      setResult({ report, symbol: resolved.code, name, klineData, valueSnapshot })
     } catch (err) {
       if (abort.signal.aborted) return
       setError(err instanceof Error ? err.message : t('analysis.failed'))
@@ -201,6 +227,28 @@ function useAnalysisRunner(search: SearchController, setHasModelConfig: Dispatch
   }
 
   return { loading, result, error, step, streamingReport, earlyKline, setError, handleAnalyze }
+}
+
+function startAnalysisRequest(
+  abortRef: React.MutableRefObject<AbortController | null>,
+  search: SearchController,
+  resolved: NonNullable<Awaited<ReturnType<typeof resolveAnalysisCode>>>,
+  setError: Dispatch<SetStateAction<string>>,
+  setLoading: Dispatch<SetStateAction<boolean>>,
+  setResult: Dispatch<SetStateAction<AnalysisResult | null>>,
+  setStreamingReport: Dispatch<SetStateAction<string>>,
+  setEarlyKline: Dispatch<SetStateAction<AnalysisRunnerState['earlyKline']>>,
+): AbortController {
+  abortRef.current?.abort()
+  const abort = new AbortController()
+  abortRef.current = abort
+  setError(''); setLoading(true); setResult(null); setStreamingReport(''); setEarlyKline(null)
+  search.setSymbol(resolved.code); search.setSelectedStock(resolved.stock); search.setSearchOpen(false)
+  return abort
+}
+
+function analysisHistoryKey(result: AnalysisResult): string {
+  return `${result.symbol}:${result.klineData.length}:${result.report.length}`
 }
 
 function scheduleFlush(buf: React.MutableRefObject<string>, raf: React.MutableRefObject<number>, set: Dispatch<SetStateAction<string>>) {
@@ -213,7 +261,7 @@ function MissingConfigBanner({ prerequisites }: { prerequisites: Prerequisites }
   const { t } = usePreferences()
   if (prerequisites.checkingConfig || (prerequisites.hasModelConfig && prerequisites.hasDataSource)) return null
   return (
-    <div className="mb-6 rounded-xl border border-amber-200 bg-amber-50/80 p-4 dark:border-amber-500/30 dark:bg-amber-500/10">
+    <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50/80 p-4 dark:border-amber-500/30 dark:bg-amber-500/10">
       <h2 className="mb-2 text-sm font-semibold text-amber-900 dark:text-amber-100">{t('analysis.missingTitle')}</h2>
       <ul className="mb-3 list-disc space-y-1 pl-5 text-sm text-amber-800 dark:text-amber-200">
         {!prerequisites.hasModelConfig && <li>{t('analysis.missingModel')}</li>}
@@ -241,15 +289,15 @@ function SearchForm({
 }) {
   const { t } = usePreferences()
   return (
-    <div className="mb-6">
-      <div className="flex items-end gap-3">
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-end gap-3">
         <StockSearchBox search={search} onAnalyze={onAnalyze} onClearError={onClearError} />
-        <button onClick={onAnalyze} disabled={disabled} className="flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50">
+        <button onClick={onAnalyze} disabled={disabled} className="flex h-10 shrink-0 items-center gap-2 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-50">
           {loading ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
           {loading ? t('analysis.analyzing') : t('analysis.start')}
         </button>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground">
+      <p className="text-xs text-muted-foreground">
         {t('analysis.marketHint')}
         <a href={TICKFLOW_PURCHASE} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">{t('common.tickflowLink')}</a>
       </p>
@@ -264,7 +312,7 @@ function StockSearchBox({ search, onAnalyze, onClearError }: { search: SearchCon
     onClearError()
   }
   return (
-    <div className="relative flex-1 max-w-md" onBlur={(e) => closeSearchOnOuterBlur(e, search.setSearchOpen)}>
+    <div className="relative min-w-[240px] flex-1 lg:max-w-3xl" onBlur={(e) => closeSearchOnOuterBlur(e, search.setSearchOpen)}>
       <label className="mb-1.5 block text-sm font-medium">{t('common.stockCode')}</label>
       <div className="relative">
         <Search size={16} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
@@ -334,27 +382,119 @@ function AnalysisContent({ runner }: { runner: AnalysisRunnerState }) {
   const symbol = result?.symbol ?? earlyKline?.symbol
   const name = result?.name ?? earlyKline?.name
   const report = result?.report ?? streamingReport
+  const valueSnapshot = result?.valueSnapshot ?? earlyKline?.valueSnapshot
 
   return (
-    <div className="min-h-0 flex-1 overflow-auto">
+    <div className="flex min-h-0 flex-1 flex-col pt-4">
       {step && <AnalysisProgressBar step={step} />}
-      {symbol && name && <div className="mb-4 flex items-center gap-2"><span className="rounded-full bg-primary/10 px-3 py-1 text-sm font-medium text-primary">{symbol} {name}</span></div>}
-      {kline && <KlineSection klineData={kline} />}
-      {report && <ReportSection report={report} />}
+      {symbol && name && (
+        <div className="mb-3 flex shrink-0 items-center gap-2">
+          <span className="rounded-full bg-primary/10 px-3 py-1 text-sm font-medium text-primary">{symbol} {name}</span>
+        </div>
+      )}
+      <div className={report ? 'min-h-0 flex-1 overflow-auto pr-1 xl:grid xl:gap-4 xl:overflow-hidden xl:pr-0 xl:grid-cols-[minmax(420px,0.9fr)_minmax(560px,1.1fr)] 2xl:grid-cols-[minmax(500px,0.85fr)_minmax(720px,1.15fr)]' : 'min-h-0 flex-1 overflow-auto pr-1'}>
+        <div className={report ? 'space-y-4 xl:min-h-0 xl:overflow-auto xl:pr-1' : 'space-y-6'}>
+          {kline && <KlineSection klineData={kline} compact={Boolean(report)} />}
+          {valueSnapshot && <ValueSection snapshot={valueSnapshot} compact={Boolean(report)} />}
+        </div>
+        {report && <ReportSection report={report} />}
+      </div>
     </div>
   )
 }
 
-function KlineSection({ klineData }: { klineData: KlineData[] }) {
+function KlineSection({ klineData, compact = false }: { klineData: KlineData[]; compact?: boolean }) {
   const { t } = usePreferences()
   const wyckoff = useMemo(() => detectWyckoffAnnotations(klineData), [klineData])
   return (
-    <section className="mb-6">
+    <section>
       <div className="mb-3 flex flex-wrap items-end justify-between gap-2">
         <div><h2 className="text-base font-semibold">{t('analysis.chartTitle')}</h2><p className="mt-1 text-xs text-muted-foreground">{t('analysis.chartSubtitle')}</p></div>
         <span className="rounded-full border border-border px-2.5 py-1 text-xs text-muted-foreground">{klineData.length} {t('common.rows')}</span>
       </div>
-      <KlineChart data={klineData} height={350} wyckoffMarkers={wyckoff?.markers} tradingRange={wyckoff?.tradingRange ?? undefined} stage={wyckoff?.stage} showIndicators />
+      <KlineChart data={klineData} height={compact ? 320 : 430} wyckoffMarkers={wyckoff?.markers} tradingRange={wyckoff?.tradingRange ?? undefined} stage={wyckoff?.stage} showIndicators />
+    </section>
+  )
+}
+
+function ValueSection({ snapshot, compact = false }: { snapshot: ValueSnapshot; compact?: boolean }) {
+  const { t } = usePreferences()
+  const [view, setView] = useState<ValueView>('quality')
+  const metrics = snapshot.metrics
+  const signals = useMemo(() => metrics ? buildValueScore(metrics, t) : null, [metrics, t])
+
+  if (!metrics) {
+    return (
+      <section className={`rounded-lg border border-border bg-background ${compact ? 'p-4' : 'p-5'}`}>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold">{t('analysis.valueTitle')}</h2>
+            <p className="mt-1 text-xs text-muted-foreground">{t('analysis.valueSubtitle')}</p>
+          </div>
+          <span className="rounded-full border border-border px-2.5 py-1 text-xs text-muted-foreground">{t('analysis.valueNoSource')}</span>
+        </div>
+        <p className="mt-4 text-sm text-muted-foreground">{valueUnavailableText(snapshot.reason, t)}</p>
+      </section>
+    )
+  }
+
+  const shownSignals = view === 'quality' ? signals?.strengths ?? [] : signals?.risks ?? []
+  const metricItems = [
+    { label: t('analysis.valueRoe'), value: formatValuePercent(metrics.roe), tone: numberTone(metrics.roe, 10, 0) },
+    { label: t('analysis.valueProfitYoy'), value: formatValuePercent(metrics.net_income_yoy), tone: numberTone(metrics.net_income_yoy, 0, -10) },
+    { label: t('analysis.valueRevenueYoy'), value: formatValuePercent(metrics.revenue_yoy), tone: numberTone(metrics.revenue_yoy, 0, -10) },
+    { label: t('analysis.valueGrossMargin'), value: formatValuePercent(metrics.gross_margin), tone: numberTone(metrics.gross_margin, 30, 15) },
+    { label: t('analysis.valueDebtRatio'), value: formatValuePercent(metrics.debt_to_asset_ratio), tone: reverseNumberTone(metrics.debt_to_asset_ratio, 55, 70) },
+    { label: t('analysis.valueCashRevenue'), value: formatValuePercent(metrics.operating_cash_to_revenue), tone: numberTone(metrics.operating_cash_to_revenue, 5, 0) },
+  ]
+
+  return (
+    <section className={`rounded-lg border border-border bg-background ${compact ? 'p-4' : 'p-5'}`}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-base font-semibold">{t('analysis.valueTitle')}</h2>
+          <p className="mt-1 text-xs text-muted-foreground">{t('analysis.valueSubtitle')}</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${valueScoreClass(signals?.tone ?? 'neutral')}`}>{signals?.label}</span>
+          <span className="rounded-full border border-border px-2.5 py-1 text-xs text-muted-foreground">{sourceLabel(snapshot)}</span>
+        </div>
+      </div>
+
+      <div className="mt-4 grid gap-x-4 gap-y-3 border-y border-border/70 py-4 sm:grid-cols-2 lg:grid-cols-3">
+        {metricItems.map((item) => (
+          <div key={item.label} className="min-w-0">
+            <div className="truncate text-xs text-muted-foreground">{item.label}</div>
+            <div className={`mt-1 text-lg font-semibold ${metricToneClass(item.tone)}`}>{item.value}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+        <div className="inline-flex rounded-lg border border-border bg-muted/40 p-1" role="tablist" aria-label={t('analysis.valueTitle')}>
+          {(['quality', 'risk'] as const).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => setView(mode)}
+              className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${view === mode ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+              role="tab"
+              aria-selected={view === mode}
+            >
+              {mode === 'quality' ? t('analysis.valueQuality') : t('analysis.valueRisk')}
+            </button>
+          ))}
+        </div>
+        {(metrics.period_end || metrics.announce_date) && <span className="text-xs text-muted-foreground">{t('analysis.valuePeriod')}: {metrics.period_end || metrics.announce_date}</span>}
+      </div>
+
+      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+        {shownSignals.length > 0 ? shownSignals.map((signal) => (
+          <div key={signal.label} className={`rounded-md border px-3 py-2 text-sm ${signalClass(signal.tone)}`}>{signal.label}</div>
+        )) : (
+          <div className="rounded-md border border-border px-3 py-2 text-sm text-muted-foreground">{t('analysis.valueNoSignals')}</div>
+        )}
+      </div>
     </section>
   )
 }
@@ -362,11 +502,15 @@ function KlineSection({ klineData }: { klineData: KlineData[] }) {
 function ReportSection({ report }: { report: string }) {
   const { t } = usePreferences()
   return (
-    <div className="rounded-lg border border-border p-6">
-      <h2 className="mb-4 text-base font-semibold">{t('analysis.reportTitle')}</h2>
-      <AIDisclaimer />
-      <article className="mt-4 prose prose-sm max-w-none text-foreground"><MarkdownContent content={report} /></article>
-    </div>
+    <section className="flex min-h-[420px] min-w-0 flex-col rounded-lg border border-border bg-background xl:min-h-0">
+      <div className="shrink-0 border-b border-border/70 px-5 py-4">
+        <h2 className="mb-3 text-base font-semibold">{t('analysis.reportTitle')}</h2>
+        <AIDisclaimer />
+      </div>
+      <article className="prose prose-base min-h-0 max-w-none flex-1 overflow-auto px-6 py-5 text-foreground">
+        <MarkdownContent content={report} />
+      </article>
+    </section>
   )
 }
 
@@ -394,7 +538,7 @@ function AnalysisProgressBar({ step }: { step: AnalysisStep }) {
 function EmptyAnalysisState() {
   const { t } = usePreferences()
   return (
-    <div className="flex flex-1 items-center justify-center text-muted-foreground">
+    <div className="flex min-h-0 flex-1 items-center justify-center text-muted-foreground">
       <div className="text-center"><div className="mb-3 text-4xl">📊</div><p className="text-sm">{t('analysis.emptyTitle')}</p><p className="mt-1 text-xs">{t('analysis.emptySubtitle')}</p></div>
     </div>
   )
@@ -457,10 +601,10 @@ function buildKlinePayload(data: KlineData[]): string {
   ].join('\n')
 }
 
-async function callLLM(config: Parameters<typeof streamLLMResponse>[0], code: string, name: string, klinePayload: string, signal?: AbortSignal, onDelta?: (chunk: string) => void): Promise<string> {
+async function callLLM(config: Parameters<typeof streamLLMResponse>[0], code: string, name: string, klinePayload: string, valueSnapshot: ValueSnapshot, signal?: AbortSignal, onDelta?: (chunk: string) => void): Promise<string> {
   const result = await streamLLMResponse(config, [
-    { role: 'system', content: '你是威科夫分析大师，精通量价分析和威科夫方法。请对给定股票进行深度分析，包括：\n1. 当前所处威科夫阶段（积累/上涨/派发/下跌），Phase A-E 定位\n2. 量价关系分析（供需力量对比）\n3. 关键支撑与阻力位\n4. 主力意图判断\n5. 操作建议与风险提示（含止损位）\n\n请用简洁、专业的中文回答。使用 markdown 格式，结构清晰。' },
-    { role: 'user', content: `请分析股票 ${code} ${name}。基于威科夫理论给出当前阶段判断和操作建议。\n\n${klinePayload}` },
+    { role: 'system', content: '你是威科夫分析大师，主框架是量价与威科夫阶段判断。若用户提供价值面摘要，只把它作为质量、风险和仓位置信度校准：技术面负责时机，价值面负责是否值得提高/降低结论置信度。不要用基本面替代 K 线事实，也不要因为单个指标给出过度确定结论。\n\n输出结构：\n1. 技术面结论：威科夫阶段、量价供需、支撑阻力、主力意图。\n2. 价值面校准：只引用给定摘要中的关键指标，说明它如何影响风险/置信度。\n3. 综合策略：观察/试错/持有/减仓等动作条件，包含失效位和风险提示。\n\n请用简洁、专业的中文 markdown 回答。' },
+    { role: 'user', content: `请分析股票 ${code} ${name}。\n\n${buildValuePrompt(valueSnapshot)}\n\n${klinePayload}` },
   ], { temperature: 0.7, signal, onDelta })
   if (!result) throw new Error('模型未返回结果，请重试')
   return result

@@ -10,6 +10,7 @@ from scripts.review_list_replay import (
     _build_report_lines,
     _find_big_gainers,
     _format_recommendation_history,
+    _load_today_review_codes,
     _normalize_code6,
     _short_code_list,
 )
@@ -32,23 +33,59 @@ def test_short_code_list_limits_output():
 def test_find_big_gainers_derives_pct_from_close():
     df = pd.DataFrame(
         {
-            "date": ["2026-05-12", "2026-05-13"],
-            "close": [10.0, 10.9],
-            "pct_chg": [0.0, 0.0],
+            "date": ["2026-05-11", "2026-05-12", "2026-05-13"],
+            "close": [10.0, 10.5, 11.4],
+            "pct_chg": [0.0, 0.0, 0.0],
         }
     )
 
-    codes = _find_big_gainers({"000001": df}, {"000001": "平安银行"}, threshold=8.0)
+    codes = _find_big_gainers({"000001": df}, {"000001": "平安银行"})
 
     assert codes == ["000001"]
 
 
 def test_find_big_gainers_falls_back_to_pct_chg():
-    df = pd.DataFrame({"date": ["2026-05-13"], "close": [10.9], "pct_chg": [8.2]})
+    df = pd.DataFrame({"date": ["2026-05-12", "2026-05-13"], "close": [10.0, 10.9], "pct_chg": [5.9, 8.2]})
 
-    codes = _find_big_gainers({"000001": df}, {"000001": "平安银行"}, threshold=8.0)
+    codes = _find_big_gainers({"000001": df}, {"000001": "平安银行"})
 
     assert codes == ["000001"]
+
+
+def test_find_big_gainers_excludes_hot_previous_day():
+    df = pd.DataFrame(
+        {
+            "date": ["2026-05-11", "2026-05-12", "2026-05-13"],
+            "close": [10.0, 10.7, 11.6],
+            "pct_chg": [0.0, 0.0, 0.0],
+        }
+    )
+
+    codes = _find_big_gainers({"000001": df}, {"000001": "平安银行"})
+
+    assert codes == []
+
+
+def test_load_today_review_codes_falls_back_when_spot_candidates_empty(monkeypatch):
+    from integrations import data_source
+
+    monkeypatch.setattr(
+        data_source,
+        "_load_spot_snapshot_map",
+        lambda force_refresh: {"000001": {"pct_chg": 0.0}, "000002": {"pct_chg": 0.0}},
+    )
+    calls = []
+
+    def fake_fetch(codes, name_map, window):
+        calls.append(list(codes))
+        return ["000001"]
+
+    monkeypatch.setattr("scripts.review_list_replay._fetch_and_filter_review_codes", fake_fetch)
+
+    codes = _load_today_review_codes(["000001", "000002"], {"000001": "平安银行", "000002": "万科A"}, object())
+
+    assert codes == ["000001"]
+    assert calls == [["000001", "000002"]]
 
 
 def test_build_focus_lines_highlights_actionable_buckets():

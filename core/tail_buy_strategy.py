@@ -10,13 +10,19 @@ import math
 import re
 from dataclasses import dataclass, field
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-logger = logging.getLogger(__name__)
+from core.intraday_analysis import (
+    compute_effort_vs_result,
+    compute_smart_money_score,
+    compute_spring_quality,
+    compute_vol_price_corr,
+    ensure_intraday_df,
+    infer_session_vwap,
+)
 
-CN_TZ = ZoneInfo("Asia/Shanghai")
+logger = logging.getLogger(__name__)
 DECISION_BUY = "BUY"
 DECISION_WATCH = "WATCH"
 DECISION_SKIP = "SKIP"
@@ -31,6 +37,7 @@ class TailBuyCandidate:
     status: str
     signal_type: str
     signal_score: float
+    snap: dict[str, Any] = field(default_factory=dict)
     rule_score: float = 0.0
     rule_decision: str = DECISION_SKIP
     rule_reasons: list[str] = field(default_factory=list)
@@ -67,30 +74,7 @@ def _safe_float(raw: Any, default: float = 0.0) -> float:
 
 
 def _infer_session_vwap(close: pd.Series, total_volume: float, total_amount: float) -> tuple[float, float]:
-    """
-    从 amount/volume 推断当日 VWAP，同时自适应 volume 量纲（股/手等）。
-    返回 (vwap, volume_scale)，其中 volume_scale=100 代表 volume 为“手”。
-    """
-    last_close = _safe_float(close.iloc[-1], 0.0) if len(close) else 0.0
-    if total_volume <= 0 or total_amount <= 0:
-        return last_close, 1.0
-
-    ref_price = _safe_float(close.tail(min(len(close), 30)).median(), last_close)
-    candidates: list[tuple[float, float, float]] = []
-    for scale in (1.0, 10.0, 100.0, 1000.0):
-        v = total_amount / max(total_volume * scale, 1e-9)
-        if v <= 0:
-            continue
-        rel_err = abs(v - ref_price) / max(ref_price, 1e-8)
-        candidates.append((rel_err, float(v), float(scale)))
-
-    if not candidates:
-        return last_close, 1.0
-    candidates.sort(key=lambda x: x[0])
-    best_err, best_vwap, best_scale = candidates[0]
-    if best_err > 5.0:
-        return last_close, 1.0
-    return best_vwap, best_scale
+    return infer_session_vwap(close, total_volume, total_amount)
 
 
 def _normalize_status(raw: Any) -> str:
@@ -139,6 +123,7 @@ def pick_tail_candidates(
             status=status,
             signal_type=str(row.get("signal_type", "") or "").strip() or "unknown",
             signal_score=_safe_float(row.get("signal_score"), 0.0),
+            snap={k: v for k, v in row.items() if k.startswith("snap_")},
         )
         old = by_code.get(code)
         if old is None:
@@ -155,33 +140,10 @@ def pick_tail_candidates(
 
 
 def _ensure_intraday_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    out = df.copy()
-    if "datetime" not in out.columns:
-        if "timestamp" in out.columns:
-            dt = pd.to_datetime(out["timestamp"], errors="coerce", utc=True)
-            out["datetime"] = dt.dt.tz_convert(CN_TZ)
-        else:
-            return pd.DataFrame()
-    out["datetime"] = pd.to_datetime(out["datetime"], errors="coerce")
-    if out["datetime"].dt.tz is None:
-        out["datetime"] = out["datetime"].dt.tz_localize(CN_TZ, nonexistent="shift_forward", ambiguous="NaT")
-    else:
-        out["datetime"] = out["datetime"].dt.tz_convert(CN_TZ)
-    for col in ("open", "high", "low", "close", "volume", "amount"):
-        if col not in out.columns:
-            out[col] = None
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-    out = out.dropna(subset=["datetime", "close"]).sort_values("datetime").reset_index(drop=True)
-    if out.empty:
-        return out
-    if out["amount"].isna().all():
-        out["amount"] = out["close"] * out["volume"].fillna(0.0)
-    return out
+    return ensure_intraday_df(df)
 
 
-def compute_tail_features(df_1m: pd.DataFrame) -> dict[str, Any]:
+def compute_tail_features(df_1m: pd.DataFrame, daily_context: dict[str, Any] | None = None) -> dict[str, Any]:
     df = _ensure_intraday_df(df_1m)
     if df.empty:
         return {"bars": 0}
@@ -240,6 +202,11 @@ def compute_tail_features(df_1m: pd.DataFrame) -> dict[str, Any]:
         if base > 0:
             slope_10 = (_safe_float(close.iloc[-1], 0.0) / base - 1.0) * 100.0
 
+    vpc = compute_vol_price_corr(df)
+    evr = compute_effort_vs_result(df)
+    sms = compute_smart_money_score(df)
+    spring_q = compute_spring_quality(df, daily_context) if daily_context else None
+
     return {
         "bars": bars,
         "last_close": last_close,
@@ -259,6 +226,10 @@ def compute_tail_features(df_1m: pd.DataFrame) -> dict[str, Any]:
         "reclaim_vwap": reclaim_vwap,
         "breakout_tail": breakout_tail,
         "slope_10_pct": slope_10,
+        "vol_price_corr": vpc,
+        "effort_vs_result": evr,
+        "smart_money_score": sms,
+        "spring_quality": spring_q,
     }
 
 
@@ -403,6 +374,42 @@ def score_tail_features(
     elif slope_10 <= -0.5:
         score -= 4.0
 
+    vpc = _safe_float(features.get("vol_price_corr"), 0.0)
+    if vpc > 0.3:
+        score += 8.0
+        reasons.append("量价正相关（涨时放量跌时缩量）")
+    elif vpc < -0.3:
+        score -= 8.0
+        reasons.append("量价背离（涨时缩量跌时放量）")
+
+    evr = _safe_float(features.get("effort_vs_result"), 0.0)
+    if evr > 30:
+        score += 6.0
+        reasons.append("放量承接（高Effort低波动=吸筹）")
+    elif evr < -30:
+        score -= 6.0
+        reasons.append("缩量大波动（虚假波动风险）")
+
+    sms = _safe_float(features.get("smart_money_score"), 0.0)
+    if sms > 1.0:
+        score += 5.0
+        reasons.append("尾盘聪明钱流入（量价齐升）")
+    elif sms < -1.0:
+        score -= 5.0
+        reasons.append("尾盘聪明钱撤退（放量下跌）")
+
+    spring_q = features.get("spring_quality")
+    if spring_q is not None:
+        if spring_q >= 70:
+            score += 10.0
+            reasons.append(f"分钟线Spring验证通过（{spring_q:.0f}分，快速收回支撑）")
+        elif spring_q >= 50:
+            score += 5.0
+            reasons.append(f"分钟线Spring部分确认（{spring_q:.0f}分）")
+        elif spring_q <= 20:
+            score -= 5.0
+            reasons.append(f"分钟线Spring失败（{spring_q:.0f}分，跌破未收回）")
+
     score = max(0.0, min(100.0, score))
     if score >= 72:
         decision = DECISION_BUY
@@ -413,13 +420,21 @@ def score_tail_features(
     return score, decision, reasons
 
 
+def _build_daily_context(snap: dict[str, Any]) -> dict[str, Any] | None:
+    support = _safe_float(snap.get("snap_support"), 0.0)
+    if support <= 0:
+        return None
+    return {"support_level": support, "snap_ma20": _safe_float(snap.get("snap_ma20"), 0.0)}
+
+
 def evaluate_rule_decision(
     candidate: TailBuyCandidate,
     df_1m: pd.DataFrame,
     *,
     style: str = "auto",
 ) -> TailBuyCandidate:
-    features = compute_tail_features(df_1m)
+    daily_context = _build_daily_context(candidate.snap) if candidate.snap else None
+    features = compute_tail_features(df_1m, daily_context)
     score, decision, reasons = score_tail_features(
         features,
         signal_score=candidate.signal_score,
@@ -638,20 +653,15 @@ def build_tail_buy_markdown(
     candidates: list[TailBuyCandidate],
     llm_total: int,
     llm_success: int,
-    llm_route_plan: list[str] | None = None,
-    llm_route_stats: dict[str, int] | None = None,
     elapsed_seconds: float,
     extra_sections: list[str] | None = None,
     extra_sections_first: bool = False,
     max_error_items_per_block: int = 5,
     candidate_source: str | None = None,
     buy_only: bool = False,
+    data_fetched_at: str = "",
 ) -> str:
     counts = summarize_decision_counts(candidates)
-    llm_route_plan = list(llm_route_plan or [])
-    llm_route_stats = dict(llm_route_stats or {})
-    route_line = " -> ".join(llm_route_plan) if llm_route_plan else "未启用"
-    route_hits = ", ".join([f"{k}:{v}" for k, v in sorted(llm_route_stats.items())]) if llm_route_stats else "无"
     source_text = str(candidate_source or "").strip() or (
         f"signal_pending（signal_date={target_signal_date}, status in pending/confirmed）"
     )
@@ -662,9 +672,8 @@ def build_tail_buy_markdown(
         f"- 扫描数量: {len(candidates)}",
         f"- 分层结果: BUY={counts[DECISION_BUY]}"
         + ("" if buy_only else f" / WATCH={counts[DECISION_WATCH]} / SKIP={counts[DECISION_SKIP]}"),
-        f"- LLM 二判: {llm_success}/{llm_total}",
-        f"- LLM 路由: {route_line}",
-        f"- LLM 命中: {route_hits}",
+        f"- AI 二判: {llm_success}/{llm_total}",
+        f"- 分时数据获取: {data_fetched_at}" if data_fetched_at else "- 分时数据获取: -",
         f"- 总耗时: {elapsed_seconds:.1f}s",
         "",
         f"⚠️ 风险提醒: {market_reminder}",
@@ -686,8 +695,7 @@ def build_tail_buy_markdown(
             reasons = "；".join(item.rule_reasons[:2]) if item.rule_reasons else "规则信号一般"
             llm_tag = ""
             if item.llm_decision:
-                model_used = f"@{item.llm_model_used}" if item.llm_model_used else ""
-                llm_tag = f" | LLM:{item.llm_decision}{model_used}"
+                llm_tag = f" | AI:{item.llm_decision}"
             llm_reason = f" | {item.llm_reason}" if item.llm_reason else ""
             add_tag = "[加仓] " if item.signal_type == "holding" else ""
             lines.append(

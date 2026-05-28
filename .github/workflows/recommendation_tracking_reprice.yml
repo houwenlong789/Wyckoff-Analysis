@@ -1,6 +1,9 @@
 name: Wyckoff Pattern Replay Reprice
 
 on:
+  schedule:
+    # 北京时间周一到周五 23:00，GitHub Actions 使用 UTC。
+    - cron: "0 15 * * 1-5"
   workflow_dispatch:
 
 concurrency:
@@ -38,16 +41,19 @@ jobs:
 
       - name: Reprice CN
         run: |
+          set -o pipefail
           python -u scripts/recommendation_tracking_reprice_job.py --market cn --logs ${{ github.workspace }}/logs/recommendation_reprice.log \
             2>&1 | tee -a ${{ github.workspace }}/logs/recommendation_reprice.console.log
 
       - name: Reprice US
         run: |
+          set -o pipefail
           python -u scripts/recommendation_tracking_reprice_job.py --market us --logs ${{ github.workspace }}/logs/recommendation_reprice.log \
             2>&1 | tee -a ${{ github.workspace }}/logs/recommendation_reprice.console.log
 
       - name: Reprice HK
         run: |
+          set -o pipefail
           python -u scripts/recommendation_tracking_reprice_job.py --market hk --logs ${{ github.workspace }}/logs/recommendation_reprice.log \
             2>&1 | tee -a ${{ github.workspace }}/logs/recommendation_reprice.console.log
 

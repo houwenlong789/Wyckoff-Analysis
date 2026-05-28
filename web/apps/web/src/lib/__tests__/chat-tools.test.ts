@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import type { ToolDeps, KlineRow } from '../chat-tools'
 import {
+  buildValueAgentDigest,
   buildKlineDigest,
   execSearchStock,
   execViewPortfolio,
@@ -90,6 +91,29 @@ describe('buildKlineDigest', () => {
     const rows = makeKlineRows(130)
     const result = buildKlineDigest(rows)
     expect(result).toContain('MA120=')
+  })
+})
+
+describe('buildValueAgentDigest', () => {
+  it('adds score signals to the compact value prompt', () => {
+    const digest = buildValueAgentDigest({
+      symbol: '600519.SH',
+      source: 'tickflow',
+      metrics: {
+        period_end: '2026-03-31',
+        roe: 18.2,
+        net_income_yoy: 11.8,
+        revenue_yoy: 6.5,
+        gross_margin: 91.6,
+        debt_to_asset_ratio: 21.4,
+        operating_cash_to_revenue: 16.2,
+      },
+    })
+
+    expect(digest).toContain('价值面摘要（来源：TickFlow，报告期：2026-03-31）')
+    expect(digest).toContain('ROE=18.20%')
+    expect(digest).toContain('价值面评级：稳健')
+    expect(digest).toContain('质量信号：')
   })
 })
 
@@ -212,11 +236,12 @@ describe('execQueryRecommendations', () => {
   it('formats recommendation entries', async () => {
     const deps = createMockDeps({
       recommendation_tracking: [
-        { code: 600519, name: '贵州茅台', recommend_date: 20240101, initial_price: 1800, current_price: 1900, change_pct: 5.56, is_ai_recommended: true },
+        { code: 600519, name: '贵州茅台', recommend_date: 20240101, recommend_count: 3, initial_price: 1800, current_price: 1900, change_pct: 5.56, is_ai_recommended: true },
       ],
     })
     const result = await execQueryRecommendations(deps, 10)
     expect(result).toContain('600519')
+    expect(result).toContain('推荐3次')
     expect(result).toContain('+5.56%')
     expect(result).toContain('[AI]')
   })
@@ -284,6 +309,60 @@ describe('execScreenStocks', () => {
 })
 
 describe('execAnalyzeStock', () => {
+  it('includes value snapshot when analyzing A-share stocks', async () => {
+    const deps = createMockDeps({ user_settings: { tickflow_api_key: ' tf-test ', tushare_token: '' } })
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({
+          data: [
+            { date: '2024-01-01', open: 100, high: 103, low: 99, close: 102, volume: 1000 },
+            { date: '2024-01-02', open: 102, high: 105, low: 101, close: 104, volume: 1200 },
+          ],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({
+          data: {
+            '600519.SH': [{
+              period_end: '2026-03-31',
+              roe: 18.2,
+              net_income_yoy: 11.8,
+              revenue_yoy: 6.5,
+              gross_margin: 91.6,
+              net_margin: 48.3,
+              debt_to_asset_ratio: 21.4,
+              operating_cash_to_revenue: 16.2,
+            }],
+          },
+        }),
+      })
+    deps.fetch = fetchMock as unknown as ToolDeps['fetch']
+
+    const result = await execAnalyzeStock(
+      deps,
+      'user1',
+      { api_key: 'llm-key', model: 'test-model', base_url: 'https://example.com/v1' },
+      {},
+      '600519',
+      '贵州茅台',
+    )
+
+    expect(result).toBe('mocked LLM response')
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/llm-proxy/v1/financials/metrics?'),
+      expect.objectContaining({ headers: expect.objectContaining({ 'x-api-key': 'tf-test' }) }),
+    )
+    expect(deps.generateText).toHaveBeenCalledWith(expect.objectContaining({
+      system: expect.stringContaining('价值面校准'),
+      prompt: expect.stringContaining('价值面摘要（来源：TickFlow，报告期：2026-03-31）'),
+    }))
+    expect(deps.generateText).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: expect.stringContaining('K线共2根'),
+    }))
+  })
+
   it('uses TickFlow batch fallback for market symbols', async () => {
     const deps = createMockDeps({ user_settings: { tickflow_api_key: ' tf-test ', tushare_token: '' } })
     const fetchMock = vi.fn()

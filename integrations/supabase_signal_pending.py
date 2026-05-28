@@ -120,13 +120,17 @@ def run_step2_5(
     name_map: dict[str, str] | None = None,
     sector_map: dict[str, str] | None = None,
     cfg: Any = None,
+    dry_run: bool = False,
 ) -> list[dict[str, Any]]:
     """Step2.5：写入新信号 + 确认/过期旧信号，返回确认通过的 symbol_info 列表。"""
-    write_pending_signals(signal_date, triggers, df_map, regime, name_map, sector_map, cfg)
+    if not dry_run:
+        write_pending_signals(signal_date, triggers, df_map, regime, name_map, sector_map, cfg)
     pending = load_pending_signals()
     if not pending:
         return []
     updates, confirmed = run_confirmation_cycle(pending, df_map, signal_date)
-    if updates:
+    if updates and not dry_run:
         batch_update_signals(updates)
+    elif updates:
+        print(f"[signal_pending] dry-run: 跳过状态更新 {len(updates)} 条")
     return confirmed

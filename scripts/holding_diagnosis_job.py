@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from integrations.llm_client import call_llm
+from integrations.llm_client import call_llm, provider_fallbacks, provider_route_chain, resolve_provider_name
 from integrations.supabase_portfolio import load_portfolio_state
 from integrations.tickflow_client import TickFlowClient
 from scripts.tail_buy_intraday_job import (
@@ -193,22 +193,11 @@ def _build_report(
 
 
 def _build_llm_routes() -> list[dict[str, str]]:
-    routes: list[dict[str, str]] = []
-    provider = os.getenv("DEFAULT_LLM_PROVIDER", "gemini").strip().lower() or "gemini"
-    api_key = (os.getenv(f"{provider.upper()}_API_KEY") or os.getenv("GEMINI_API_KEY", "")).strip()
-    model = (os.getenv(f"{provider.upper()}_MODEL") or os.getenv("GEMINI_MODEL", "")).strip()
-    base_url = (os.getenv(f"{provider.upper()}_BASE_URL") or "").strip()
-    if api_key and model:
-        routes.append(
-            {
-                "name": f"{provider}:{model}",
-                "provider": provider,
-                "model": model,
-                "api_key": api_key,
-                "base_url": base_url,
-            }
-        )
-    return routes
+    provider = resolve_provider_name("HOLDING_DIAG_LLM_PROVIDER", "efficiency")
+    return provider_route_chain(
+        provider,
+        provider_fallbacks("HOLDING_DIAG_LLM_FALLBACK_PROVIDERS"),
+    )
 
 
 def _run_llm_and_report(

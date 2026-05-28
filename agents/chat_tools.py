@@ -1,8 +1,5 @@
 """
-ADK 工具函数 — 将已有的 Wyckoff 引擎能力暴露给对话 Agent。
-
-每个函数都是一个 ADK tool：普通 Python 函数 + 类型标注 + docstring，
-ADK 的 FunctionTool 会自动解析为工具 schema。
+Wyckoff Agent 工具函数 — 将已有引擎能力暴露给 Web、CLI 和 MCP。
 
 用户凭据（API Key / Tushare Token 等）按需从 Supabase 实时获取，
 不依赖 st.session_state 或 os.environ 的长链传递。
@@ -10,6 +7,7 @@ ADK 的 FunctionTool 会自动解析为工具 schema。
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import logging
 import math
@@ -25,13 +23,12 @@ from datetime import date, timedelta
 from typing import Any
 from urllib.parse import urlparse
 
-try:
-    from google.adk.tools import ToolContext
-except ImportError:
-    # CLI 模式下无 ADK，使用 shim
-    class ToolContext:  # type: ignore[no-redef]
-        def __init__(self, state=None):
-            self.state = state or {}
+
+class ToolContext:
+    """最小化工具上下文，兼容 Web、CLI、MCP 的共享工具函数。"""
+
+    def __init__(self, state=None):
+        self.state = state or {}
 
 
 logger = logging.getLogger(__name__)
@@ -1441,6 +1438,8 @@ def generate_strategy_decision(tool_context: ToolContext) -> dict:
             benchmark_context=None,
             api_key=api_key,
             model=model,
+            provider=provider,
+            llm_base_url=base_url,
             portfolio_id=portfolio_id,
             tg_bot_token=tg_bot_token,
             tg_chat_id=tg_chat_id,
@@ -1593,7 +1592,12 @@ def _query_signal(status: str, limit: int) -> dict:
 # Helper — 缓存 user client，避免重复消费 refresh_token
 # ---------------------------------------------------------------------------
 
-_user_client_cache: dict[str, Any] = {}  # user_id:token_prefix → Client
+_user_client_cache: dict[str, Any] = {}  # user_id:token_digest → Client
+
+
+def _user_client_cache_key(user_id: str, access_token: str) -> str:
+    digest = hashlib.sha1(str(access_token).encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"{user_id}:{digest}"
 
 
 def _close_cached_clients() -> None:
@@ -1612,6 +1616,25 @@ def _evict_stale_clients(keep_key: str) -> None:
         close_client(_user_client_cache.pop(k))
 
 
+def _persist_tool_session(tool_context: ToolContext | None) -> None:
+    if tool_context is None:
+        return
+    state = tool_context.state
+    if not state.get("access_token") or not state.get("refresh_token"):
+        return
+    try:
+        from cli.auth import _load_session, _save_session
+
+        data = _load_session() or {}
+        for key in ("user_id", "email", "access_token", "refresh_token"):
+            value = state.get(key)
+            if value:
+                data[key] = value
+        _save_session(data)
+    except Exception:
+        logger.debug("failed to persist refreshed Supabase session", exc_info=True)
+
+
 def _get_user_client(tool_context: ToolContext | None):
     """获取或复用 user client。token 变化时重建；auth 失败自动重登。"""
     if tool_context is None:
@@ -1620,7 +1643,7 @@ def _get_user_client(tool_context: ToolContext | None):
     if not at:
         return None
     user_id = _get_user_id(tool_context)
-    cache_key = f"{user_id}:{at[:16]}"
+    cache_key = _user_client_cache_key(user_id, at)
     cached = _user_client_cache.get(cache_key)
     if cached is not None:
         return cached
@@ -1641,7 +1664,9 @@ def _get_user_client(tool_context: ToolContext | None):
         tool_context.state["access_token"] = new_at
     if new_rt:
         tool_context.state["refresh_token"] = new_rt
-    final_key = f"{user_id}:{(new_at or at)[:16]}"
+    if new_at or new_rt:
+        _persist_tool_session(tool_context)
+    final_key = _user_client_cache_key(_get_user_id(tool_context), new_at or at)
     _evict_stale_clients(final_key)
     _user_client_cache[final_key] = client
     return client
@@ -1654,12 +1679,19 @@ def _relogin_and_create_client(tool_context: ToolContext | None):
     data = _auto_relogin()
     if not data:
         return None, "", ""
+    tool_context.state["user_id"] = data.get("user_id", tool_context.state.get("user_id", ""))
+    tool_context.state["email"] = data.get("email", tool_context.state.get("email", ""))
     tool_context.state["access_token"] = data["access_token"]
     tool_context.state["refresh_token"] = data["refresh_token"]
     from integrations.supabase_base import create_user_client, get_session_tokens
 
     client = create_user_client(data["access_token"], data["refresh_token"])
     new_at, new_rt = get_session_tokens(client)
+    if new_at:
+        tool_context.state["access_token"] = new_at
+    if new_rt:
+        tool_context.state["refresh_token"] = new_rt
+    _persist_tool_session(tool_context)
     return client, new_at or data["access_token"], new_rt or data["refresh_token"]
 
 
@@ -1671,10 +1703,24 @@ def _is_auth_error(e: Exception) -> bool:
     return any(k in err for k in _AUTH_ERR_KEYWORDS)
 
 
+def _auth_failure_message(result: Any) -> str:
+    if isinstance(result, tuple) and len(result) >= 2 and result[0] is False:
+        msg = str(result[1] or "")
+        return msg if _is_auth_error(Exception(msg)) else ""
+    if isinstance(result, dict) and result.get("error"):
+        msg = str(result.get("error") or "")
+        return msg if _is_auth_error(Exception(msg)) else ""
+    return ""
+
+
 def _with_auth_retry(tool_context: ToolContext | None, fn, *args, **kwargs):
     """执行 fn，遇到 auth 错误时自动重登并重试一次。"""
     try:
-        return fn(*args, **kwargs)
+        result = fn(*args, **kwargs)
+        auth_msg = _auth_failure_message(result)
+        if not auth_msg:
+            return result
+        raise RuntimeError(auth_msg)
     except Exception as e:
         if not _is_auth_error(e) or tool_context is None:
             raise
@@ -2205,7 +2251,7 @@ def web_fetch(url: str, tool_context: ToolContext = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 工具列表导出（Web/Streamlit 端，不含 exec/read/write/web_fetch）
+# 工具列表导出（Web/MCP/CLI 端，不含 exec/read/write/web_fetch）
 # ---------------------------------------------------------------------------
 
 WYCKOFF_TOOLS = [

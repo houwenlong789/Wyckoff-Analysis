@@ -10,7 +10,10 @@
     wyckoff mcp                     # 启动 MCP Server
     wyckoff memory                  # 查看 Agent 记忆
     wyckoff log                     # 查看对话日志
+    wyckoff session                 # 会话列表 / 导出 / 分叉
     wyckoff trace                   # 查看 JSONL 运行轨迹
+    wyckoff prompt                  # 查看/渲染 Prompt 模板
+    wyckoff diag                    # 导出会话诊断包
     wyckoff dashboard               # 启动本地可视化面板
     wyckoff auth <email>            # 登录
     wyckoff model list/add/rm       # 模型管理
@@ -40,27 +43,9 @@ sys.path.insert(0, _PACKAGE_ROOT)
 # 加载 .env（项目根目录）
 load_dotenv()
 
-# 抑制 Streamlit 在非 Streamlit 环境下的全部日志
-os.environ["STREAMLIT_LOG_LEVEL"] = "error"
 import logging as _logging
 
 logger = _logging.getLogger(__name__)
-
-
-def _silence_streamlit():
-    for name in list(_logging.Logger.manager.loggerDict):
-        if name.startswith("streamlit"):
-            lg = _logging.getLogger(name)
-            lg.handlers.clear()
-            lg.setLevel(_logging.CRITICAL)
-            lg.propagate = False
-
-
-try:
-    import streamlit  # noqa: F401
-except Exception:
-    logger.debug("streamlit import failed", exc_info=True)
-_silence_streamlit()
 
 # CLI 环境：只显示 CRITICAL，不泄漏 traceback 给用户
 import warnings as _warnings
@@ -209,6 +194,7 @@ def _cmd_auth(args):
 
 def _model_list():
     from cli.auth import load_default_model_id, load_fallback_model_id, load_light_model_id, load_model_configs
+    from cli.model_registry import format_model_metadata, infer_model_info
 
     configs = load_model_configs()
     default_id = load_default_model_id()
@@ -225,8 +211,10 @@ def _model_list():
             marks += " ⚡"
         if c["id"] == light_id:
             marks += " 💡"
+        metadata = format_model_metadata(infer_model_info(c))
         print(
-            f"  {c['id']}{marks}  provider={c.get('provider_name', '')}  model={c.get('model', '')}  base_url={c.get('base_url', '') or '(default)'}"
+            f"  {c['id']}{marks}  provider={c.get('provider_name', '')}  "
+            f"model={c.get('model', '')}  {metadata}  base_url={c.get('base_url', '') or '(default)'}"
         )
     legend = "  * = 默认"
     if fallback_id:
@@ -362,9 +350,55 @@ def _cmd_model(args):
         return
     if sub in ("fallback", "light"):
         return _model_role_set(args, sub)
+    if sub == "cost":
+        if not args.model_id:
+            print("用法: wyckoff model cost <id> --input-per-1m N --output-per-1m N [--context-window N]")
+            sys.exit(1)
+        configs = load_model_configs()
+        cfg = next((c for c in configs if c["id"] == args.model_id), None)
+        if not cfg:
+            print(f"✗ 模型 {args.model_id} 不存在")
+            sys.exit(1)
+        updated = dict(cfg)
+        if args.input_per_1m is not None:
+            updated["input_cost_per_1m"] = args.input_per_1m
+        if args.output_per_1m is not None:
+            updated["output_cost_per_1m"] = args.output_per_1m
+        if args.context_window is not None:
+            updated["context_window"] = args.context_window
+        save_model_entry(updated)
+        print(f"✓ 模型 {args.model_id} 的成本/上下文元数据已保存")
+        return
+    if sub == "usage":
+        from cli.model_registry import summarize_model_usage
+
+        rows = summarize_model_usage(days=args.days, configs=load_model_configs())
+        if not rows:
+            print(f"最近 {args.days} 天暂无模型用量记录")
+            return
+        print(f"最近 {args.days} 天模型用量")
+        print(f"{'provider':<12} {'model':<28} {'req':>4} {'in':>10} {'out':>10} {'cost':>12}")
+        print("-" * 82)
+        total_cost = 0.0
+        total_known = False
+        for row in rows:
+            cost_s = "-"
+            if row.estimated_cost is not None:
+                total_known = True
+                total_cost += row.estimated_cost
+                cost_s = f"${row.estimated_cost:.4f}"
+            print(
+                f"{row.provider[:12]:<12} {row.model[:28]:<28} {row.requests:>4} "
+                f"{row.tokens_in:>10,} {row.tokens_out:>10,} {cost_s:>12}"
+            )
+        if total_known:
+            print(f"\n估算合计: ${total_cost:.4f}")
+        else:
+            print("\n成本未知：用 wyckoff model cost <id> --input-per-1m N --output-per-1m N 配置")
+        return
 
     print(f"未知子命令: {sub}")
-    print("用法: wyckoff model [list|add|set|rm|default|fallback|light]")
+    print("用法: wyckoff model [list|add|set|rm|default|fallback|light|cost|usage]")
     sys.exit(1)
 
 
@@ -706,44 +740,110 @@ def _cmd_mcp(_args):
 # ---------------------------------------------------------------------------
 
 
+def _memory_id_arg(args) -> str:
+    return args.memory_id or args.keyword
+
+
+def _memory_since_arg(value: str) -> str:
+    if not value:
+        return ""
+    from datetime import datetime, timedelta
+
+    raw = value.strip()
+    unit = raw[-1:].lower()
+    if unit in {"d", "h", "m"} and raw[:-1].isdigit():
+        amount = int(raw[:-1])
+        delta = {"d": timedelta(days=amount), "h": timedelta(hours=amount), "m": timedelta(minutes=amount)}[unit]
+        return (datetime.utcnow() - delta).isoformat()
+    return raw
+
+
+def _memory_level_arg(value: str) -> str:
+    level = value.strip().upper()
+    return level if level in {"L1", "L2", "L3"} else ""
+
+
+def _print_memory_rows(memories: list[dict], *, output_format: str = "table") -> None:
+    if output_format == "json":
+        print(json.dumps(memories, ensure_ascii=False, indent=2, default=str))
+        return
+    if output_format == "jsonl":
+        for row in memories:
+            print(json.dumps(row, ensure_ascii=False, default=str))
+        return
+    _print_memory_table(memories)
+
+
+def _print_memory_table(memories: list[dict]) -> None:
+    print(f"Agent 记忆 ({len(memories)} 条)")
+    print(f"{'ID':>5} {'类型':<12} {'层级':<4} {'日期':<20} {'内容'}")
+    print("-" * 80)
+    for m in memories:
+        content = m.get("content", "")
+        if len(content) > 60:
+            content = content[:60] + "..."
+        level = m.get("memory_level", "")
+        print(f"{m['id']:>5} {m.get('memory_type', ''):<12} {level:<4} {m.get('created_at', '')[:19]:<20} {content}")
+
+
+def _delete_memory_by_id(memory_id: str) -> None:
+    from integrations.local_db import get_db
+
+    conn = get_db()
+    with conn:
+        cur = conn.execute("DELETE FROM agent_memory WHERE id=?", (memory_id,))
+    if cur.rowcount:
+        print(f"✓ 已删除记忆 #{memory_id}")
+    else:
+        print(f"✗ 记忆 #{memory_id} 不存在")
+
+
+def _cmd_memory_list(args, level: str, since: str) -> None:
+    from integrations.local_db import get_recent_memories
+
+    mtype = args.type or None
+    memories = get_recent_memories(memory_type=mtype, memory_level=level, since=since, limit=args.limit)
+    if not memories:
+        print("暂无记忆记录")
+        return
+    _print_memory_rows(memories, output_format=args.format)
+
+
+def _cmd_memory_search(args, level: str, since: str) -> None:
+    keyword = args.keyword
+    if not keyword:
+        print("用法: wyckoff memory search <关键词>")
+        sys.exit(1)
+    from integrations.local_db import search_memory
+
+    results = search_memory(keyword=keyword, memory_level=level, since=since, limit=args.limit)
+    if not results:
+        print(f"未找到包含 '{keyword}' 的记忆")
+        return
+    if args.format != "table":
+        _print_memory_rows(results, output_format=args.format)
+        return
+    for m in results:
+        content = m.get("content", "")
+        if len(content) > 80:
+            content = content[:80] + "..."
+        print(f"  [{m['id']}] {m.get('memory_type', '')} | {content}")
+
+
 def _cmd_memory(args):
-    from integrations.local_db import get_recent_memories, init_db, prune_memories
+    from integrations.local_db import init_db, prune_memories
 
     init_db()
     sub = args.memory_cmd or "list"
+    level = _memory_level_arg(args.level)
+    since = _memory_since_arg(args.since)
 
     if sub == "list":
-        mtype = args.type or None
-        memories = get_recent_memories(memory_type=mtype, limit=args.limit)
-        if not memories:
-            print("暂无记忆记录")
-            return
-        print(f"Agent 记忆 ({len(memories)} 条)")
-        print(f"{'ID':>5} {'类型':<12} {'日期':<20} {'内容'}")
-        print("-" * 80)
-        for m in memories:
-            content = m.get("content", "")
-            if len(content) > 60:
-                content = content[:60] + "..."
-            print(f"{m['id']:>5} {m.get('memory_type', ''):<12} {m.get('created_at', '')[:19]:<20} {content}")
+        _cmd_memory_list(args, level, since)
         return
 
     if sub == "search":
-        keyword = args.keyword
-        if not keyword:
-            print("用法: wyckoff memory search <关键词>")
-            sys.exit(1)
-        from integrations.local_db import search_memory
-
-        results = search_memory(keyword=keyword, limit=args.limit)
-        if not results:
-            print(f"未找到包含 '{keyword}' 的记忆")
-            return
-        for m in results:
-            content = m.get("content", "")
-            if len(content) > 80:
-                content = content[:80] + "..."
-            print(f"  [{m['id']}] {m.get('memory_type', '')} | {content}")
+        _cmd_memory_search(args, level, since)
         return
 
     if sub == "clear":
@@ -752,24 +852,64 @@ def _cmd_memory(args):
         return
 
     if sub == "delete":
-        mid = args.memory_id
+        mid = _memory_id_arg(args)
         if not mid:
             print("用法: wyckoff memory delete <id>")
             sys.exit(1)
-        from integrations.local_db import get_db
+        _delete_memory_by_id(mid)
+        return
 
-        conn = get_db()
-        with conn:
-            cur = conn.execute("DELETE FROM agent_memory WHERE id=?", (mid,))
-        if cur.rowcount:
-            print(f"✓ 已删除记忆 #{mid}")
-        else:
-            print(f"✗ 记忆 #{mid} 不存在")
+    if sub == "trace":
+        mid = _memory_id_arg(args)
+        if not mid:
+            print("用法: wyckoff memory trace <id>")
+            sys.exit(1)
+        try:
+            _print_memory_trace(int(mid))
+        except ValueError:
+            print(f"✗ 无效记忆 ID: {mid}")
+            sys.exit(1)
         return
 
     print(f"未知子命令: {sub}")
-    print("用法: wyckoff memory [list|search|clear|delete]")
+    print("用法: wyckoff memory [list|search|clear|delete|trace]")
     sys.exit(1)
+
+
+def _print_memory_trace(memory_id: int) -> None:
+    from integrations.local_db import get_memory_by_id, load_chat_logs
+
+    memory = get_memory_by_id(memory_id)
+    if not memory:
+        print(f"✗ 记忆 #{memory_id} 不存在")
+        return
+    print(f"记忆 #{memory_id}")
+    print(f"类型: {memory.get('memory_type', '')} / {memory.get('memory_level', '')}")
+    print(f"内容: {memory.get('content', '')}")
+    source_ref = str(memory.get("source_ref", "") or "")
+    print(f"来源: {source_ref or '(无)'}")
+    if not source_ref.startswith("chat_log:"):
+        return
+    rows = load_chat_logs(session_id=source_ref.removeprefix("chat_log:"), limit=8)
+    for row in rows:
+        content = str(row.get("content", "") or "").replace("\n", " ")
+        if len(content) > 100:
+            content = content[:100] + "..."
+        print(f"- {row.get('created_at', '')[:19]} {row.get('role', '')}: {content}")
+
+
+def _add_memory_parser(sub) -> None:
+    p_mem = sub.add_parser("memory", help="Agent 记忆管理", aliases=["mem"])
+    p_mem.add_argument("memory_cmd", nargs="?", default="list", help="list/search/clear/delete/trace")
+    p_mem.add_argument("keyword", nargs="?", default="", help="搜索关键词 (search 时)")
+    p_mem.add_argument("memory_id", nargs="?", default="", help="记忆 ID (delete 时)")
+    p_mem.add_argument(
+        "--type", default="", help="过滤类型 (preference/persona/scenario/stock_opinion/decision/market_view)"
+    )
+    p_mem.add_argument("--level", default="", help="过滤层级 (L1/L2/L3)")
+    p_mem.add_argument("--since", default="", help="仅显示该时间之后的记忆，支持 ISO 或 7d/24h/30m")
+    p_mem.add_argument("--format", choices=["table", "json", "jsonl"], default="table", help="输出格式")
+    p_mem.add_argument("-n", "--limit", type=int, default=20, help="返回条数")
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +944,68 @@ def _cmd_log(args):
 
 
 # ---------------------------------------------------------------------------
+# wyckoff session — 会话管理
+# ---------------------------------------------------------------------------
+
+
+def _cmd_session(args):
+    from integrations.local_db import init_db, list_chat_sessions
+
+    init_db()
+    sub = args.session_cmd or "list"
+
+    if sub == "list":
+        sessions = list_chat_sessions(limit=args.limit)
+        if not sessions:
+            print("暂无会话")
+            return
+        print(f"最近会话 ({len(sessions)} 条)")
+        print(f"{'#':>2} {'session':<12} {'started':<16} {'msg':>4} {'tokens':>11}  preview")
+        print("-" * 88)
+        for idx, item in enumerate(sessions, start=1):
+            first = str(item.get("first_user_msg", "") or "").replace("\n", " ")
+            if len(first) > 42:
+                first = first[:42] + "..."
+            tokens = int(item.get("total_tokens_in") or 0) + int(item.get("total_tokens_out") or 0)
+            print(
+                f"{idx:>2} {str(item.get('session_id', ''))[:12]:<12} "
+                f"{str(item.get('started_at', '') or '')[:16]:<16} {int(item.get('msg_count') or 0):>4} "
+                f"{tokens:>11,}  {first}"
+            )
+        return
+
+    if sub == "export":
+        from cli.session_tools import SessionToolError, export_session_transcript
+
+        try:
+            result = export_session_transcript(
+                session_id=args.session_id,
+                output=Path(args.out).expanduser() if args.out else None,
+                output_format=args.format,
+            )
+        except SessionToolError as exc:
+            print(f"✗ {exc}")
+            sys.exit(1)
+        print(f"✓ 会话已导出: {result.path}")
+        print(f"  session={result.session_id} messages={result.message_count}")
+        return
+
+    if sub == "fork":
+        from cli.session_tools import SessionToolError, fork_session
+
+        try:
+            result = fork_session(session_id=args.session_id, new_session_id=args.new_id)
+        except SessionToolError as exc:
+            print(f"✗ {exc}")
+            sys.exit(1)
+        print(f"✓ 会话已分叉: {result.source_session_id} -> {result.new_session_id}")
+        print(f"  messages={result.message_count}")
+        return
+
+    print("用法: wyckoff session [list|export|fork]")
+
+
+# ---------------------------------------------------------------------------
 # wyckoff trace — 查看 append-only 运行轨迹
 # ---------------------------------------------------------------------------
 
@@ -816,6 +1018,25 @@ def _cmd_trace(args):
     trace_dir = wyckoff_home() / "scratchpad"
     if args.path:
         print(trace_dir)
+        return
+
+    if args.events:
+        from cli.event_stream import scratchpad_events_jsonl
+
+        target = Path(args.events).expanduser()
+        if not target.is_absolute():
+            target = trace_dir / target
+        if not target.exists():
+            print(f"轨迹文件不存在: {target}")
+            sys.exit(1)
+        events_text = scratchpad_events_jsonl([target])
+        if args.out:
+            out = Path(args.out).expanduser()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(events_text, encoding="utf-8")
+            print(f"✓ 事件流已导出: {out}")
+        else:
+            print(events_text, end="")
         return
 
     if args.show:
@@ -852,6 +1073,82 @@ def _cmd_trace(args):
             query = query[:80] + "..."
         stamp = path.name.split("_", 1)[0]
         print(f"  [{stamp}] {path.name}  {query}")
+
+
+# ---------------------------------------------------------------------------
+# wyckoff prompt — 查看/渲染投研 Prompt 模板
+# ---------------------------------------------------------------------------
+
+
+def _cmd_prompt(args):
+    from cli.prompt_templates import load_prompt_templates, render_prompt_template
+
+    templates = load_prompt_templates()
+    sub = args.prompt_cmd or "list"
+
+    if sub == "list":
+        print("可用 Prompt 模板")
+        print()
+        for tpl in templates.values():
+            hint = f" {tpl.argument_hint}" if tpl.argument_hint else ""
+            print(f"  {tpl.name:<14} {tpl.description}{hint}")
+        print("\n用法: wyckoff prompt render <name> [补充说明]")
+        return
+
+    if sub == "show":
+        if not args.name:
+            print("用法: wyckoff prompt show <name>")
+            return
+        tpl = templates.get(args.name)
+        if not tpl:
+            print(f"未知 Prompt 模板: {args.name}")
+            return
+        print(f"{tpl.name} — {tpl.description}")
+        if tpl.argument_hint:
+            print(f"参数: {tpl.argument_hint}")
+        print()
+        print(tpl.prompt)
+        return
+
+    if sub == "render":
+        if not args.name:
+            print("用法: wyckoff prompt render <name> [补充说明]")
+            return
+        tpl = templates.get(args.name)
+        if not tpl:
+            print(f"未知 Prompt 模板: {args.name}")
+            return
+        user_input = " ".join(args.extra or [])
+        print(render_prompt_template(tpl, user_input))
+        return
+
+    print("用法: wyckoff prompt [list|show|render]")
+
+
+# ---------------------------------------------------------------------------
+# wyckoff diag — 导出可检查的会话诊断包
+# ---------------------------------------------------------------------------
+
+
+def _cmd_diag(args):
+    from cli.diagnostic_export import DiagnosticExportError, export_diagnostic_package
+
+    output = Path(args.out).expanduser() if args.out else None
+    try:
+        result = export_diagnostic_package(
+            session_id=args.session,
+            output=output,
+            output_format=args.format,
+        )
+    except DiagnosticExportError as exc:
+        print(f"✗ {exc}")
+        sys.exit(1)
+
+    print(f"✓ 诊断包已导出: {result.path}")
+    print(
+        f"  session={result.session_id} messages={result.message_count} "
+        f"scratchpads={result.scratchpad_count} tool_results={result.tool_result_count}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1079,8 +1376,14 @@ def _dispatch_command(args) -> None:
         _cmd_memory(args)
     elif args.cmd == "log":
         _cmd_log(args)
+    elif args.cmd in ("session", "sess"):
+        _cmd_session(args)
     elif args.cmd == "trace":
         _cmd_trace(args)
+    elif args.cmd == "prompt":
+        _cmd_prompt(args)
+    elif args.cmd in ("diag", "diagnostic"):
+        _cmd_diag(args)
     elif args.cmd == "sync":
         _cmd_sync(args)
     elif args.cmd == "cleanup":
@@ -1115,6 +1418,10 @@ def main():
     p_model.add_argument("api_key", nargs="?", default="", help="API Key (set 时)")
     p_model.add_argument("--model", dest="model_name", default="", help="模型名")
     p_model.add_argument("--base-url", dest="base_url", default="", help="Base URL")
+    p_model.add_argument("--input-per-1m", type=float, default=None, help="输入 token 每百万成本（USD，cost 时）")
+    p_model.add_argument("--output-per-1m", type=float, default=None, help="输出 token 每百万成本（USD，cost 时）")
+    p_model.add_argument("--context-window", type=int, default=None, help="上下文窗口 token 数（cost 时）")
+    p_model.add_argument("--days", type=int, default=7, help="usage 统计天数")
 
     # wyckoff config
     p_config = sub.add_parser("config", help="数据源配置")
@@ -1161,18 +1468,21 @@ def main():
     # wyckoff mcp
     sub.add_parser("mcp", help="启动 MCP Server")
 
-    # wyckoff memory
-    p_mem = sub.add_parser("memory", help="Agent 记忆管理", aliases=["mem"])
-    p_mem.add_argument("memory_cmd", nargs="?", default="list", help="list/search/clear/delete")
-    p_mem.add_argument("keyword", nargs="?", default="", help="搜索关键词 (search 时)")
-    p_mem.add_argument("memory_id", nargs="?", default="", help="记忆 ID (delete 时)")
-    p_mem.add_argument("--type", default="", help="过滤类型 (session/preference)")
-    p_mem.add_argument("-n", "--limit", type=int, default=20, help="返回条数")
+    _add_memory_parser(sub)
 
     # wyckoff log
     p_log = sub.add_parser("log", help="查看对话日志")
     p_log.add_argument("--session", default="", help="指定会话 ID")
     p_log.add_argument("-n", "--limit", type=int, default=30, help="返回条数")
+
+    # wyckoff session
+    p_session = sub.add_parser("session", help="会话列表 / 导出 / 分叉", aliases=["sess"])
+    p_session.add_argument("session_cmd", nargs="?", default="list", help="list/export/fork")
+    p_session.add_argument("session_id", nargs="?", default="", help="会话 ID；留空时使用最近会话")
+    p_session.add_argument("-n", "--limit", type=int, default=20, help="list 返回条数")
+    p_session.add_argument("--out", default="", help="export 输出路径；默认 ~/.wyckoff/sessions/exports/")
+    p_session.add_argument("--format", choices=["md", "json"], default="md", help="export 输出格式")
+    p_session.add_argument("--new-id", default="", help="fork 新会话 ID；默认自动生成")
 
     # wyckoff trace
     p_trace = sub.add_parser("trace", help="查看 JSONL 运行轨迹")
@@ -1180,6 +1490,20 @@ def main():
     p_trace.add_argument("--show", default="", help="显示指定轨迹文件（文件名或绝对路径）")
     p_trace.add_argument("--chars", type=int, default=12000, help="--show 输出字符数上限")
     p_trace.add_argument("--path", action="store_true", help="只打印轨迹目录")
+    p_trace.add_argument("--events", default="", help="将指定 scratchpad JSONL 转成标准事件流")
+    p_trace.add_argument("--out", default="", help="--events 输出路径；留空则打印到 stdout")
+
+    # wyckoff prompt
+    p_prompt = sub.add_parser("prompt", help="查看/渲染 Prompt 模板")
+    p_prompt.add_argument("prompt_cmd", nargs="?", default="list", help="list/show/render")
+    p_prompt.add_argument("name", nargs="?", default="", help="模板名")
+    p_prompt.add_argument("extra", nargs=argparse.REMAINDER, help="render 时传入的补充说明")
+
+    # wyckoff diag
+    p_diag = sub.add_parser("diag", help="导出会话诊断包", aliases=["diagnostic"])
+    p_diag.add_argument("--session", default="", help="指定会话 ID；默认最近一个会话")
+    p_diag.add_argument("--out", default="", help="输出路径；默认 ~/.wyckoff/diagnostics/")
+    p_diag.add_argument("--format", choices=["zip", "json"], default="zip", help="输出格式")
 
     # wyckoff sync
     p_sync = sub.add_parser("sync", help="同步 Supabase → 本地 SQLite")

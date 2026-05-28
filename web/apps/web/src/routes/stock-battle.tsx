@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type Dispatch, type FormEvent, type MutableRefObject, type ReactNode, type SetStateAction } from 'react'
 import { CheckSquare, Loader2, Swords, XSquare } from 'lucide-react'
 import { useAuthStore } from '@/stores/auth'
 import { usePreferences } from '@/lib/preferences'
@@ -9,9 +9,11 @@ import { KlineChart } from '@/components/kline-chart'
 import { MultiStockChart, type ComparisonSeries } from '@/components/multi-stock-chart'
 import { UpgradeNotice } from '@/components/upgrade-notice'
 import { AIDisclaimer } from '@/components/ai-disclaimer'
-import { TICKFLOW_PURCHASE, fetchKlineViaTickFlow, getUserDataKeys, isSupportedKlineCode, type KlineData } from '@/lib/kline'
+import { TICKFLOW_PURCHASE, fetchKlineViaTickFlow, fetchValueSnapshot, getUserDataKeys, isSupportedKlineCode, type KlineData, type ValueSnapshot } from '@/lib/kline'
 import { avg } from '@/lib/math'
+import { saveAnalysisHistory } from '@/lib/local-history'
 import { resolveStockQuery } from '@/lib/market-search'
+import { buildValueDigest, buildValueScore, formatValuePercent, metricToneClass, numberTone, reverseNumberTone, signalClass, sourceLabel, valueScoreClass, valueUnavailableText, type ValueScore, type ValueTone, type ValueView } from '@/lib/value-analysis'
 
 interface BattleTarget {
   code: string
@@ -21,6 +23,7 @@ interface BattleTarget {
 interface BattleStock extends BattleTarget {
   data: KlineData[]
   stats: StrengthStats
+  valueSnapshot: ValueSnapshot
 }
 
 interface StrengthStats {
@@ -35,12 +38,24 @@ interface StrengthStats {
 
 type ChartMode = 'overlay' | 'separate'
 
+interface BattleHistoryPayload {
+  input: string
+  stocks: BattleStock[]
+  selectedCodes: string[]
+  mode: ChartMode
+  overlayLimit: number
+  report: string
+  benchmark: KlineData[]
+}
+
 const DEFAULT_INPUT = '中国平安\n贵州茅台\nAAPL\nNVDA\n腾讯'
 
 export function StockBattlePage() {
+  const user = useAuthStore((s) => s.user)
   const [input, setInput] = useState(DEFAULT_INPUT)
   const battle = useBattleRunner()
   const selectedSeries = useSelectedSeries(battle.stocks, battle.selectedCodes)
+  useBattleHistory(user?.id, input, battle.stocks, battle.selectedCodes, battle.mode, battle.overlayLimit, battle.report, battle.benchmark)
 
   return (
     <div className="mx-auto flex max-w-7xl flex-col gap-5 p-6">
@@ -51,6 +66,7 @@ export function StockBattlePage() {
         <>
           <BattleControls battle={battle} />
           <BattleCharts mode={battle.mode} limit={battle.overlayLimit} stocks={selectedSeries} benchmark={battle.benchmark} />
+          <ValueBattlePanel stocks={battle.stocks} />
           <StrengthTable stocks={battle.stocks} />
           <ReportPanel report={battle.report} loading={battle.loading} />
         </>
@@ -70,34 +86,101 @@ function useBattleRunner() {
   const [overlayLimit, setOverlayLimit] = useState(6)
   const [report, setReport] = useState('')
   const abortRef = useRef<AbortController | null>(null)
+  const streamBuf = useRef(''), rafRef = useRef(0)
   const [benchmark, setBenchmark] = useState<KlineData[]>([])
+
   async function run(input: string) {
     if (!user) return
-    abortRef.current?.abort()
+    abortRef.current?.abort(); cancelAnimationFrame(rafRef.current)
     const abort = new AbortController()
     abortRef.current = abort
-    setLoading(true); setError(''); setStocks([]); setBenchmark([])
+    streamBuf.current = ''
+    setLoading(true); setError(''); setStocks([]); setBenchmark([]); setSelectedCodes([]); setReport('')
     try {
       const [config, keys, targets] = await Promise.all([loadLLMConfig(user.id), getUserDataKeys(user.id), resolveTargets(input)])
       if (!config) throw new Error(t('battle.missingModel'))
       if (!keys.tickflow) throw new Error(upgradeMessage())
       const [fetched, bench] = await Promise.all([
-        fetchBattleStocks(targets, keys.tickflow),
+        fetchBattleStocks(targets, keys),
         fetchKlineViaTickFlow('399300', keys.tickflow).catch(() => [] as KlineData[]),
       ])
       if (abort.signal.aborted) return
       setStocks(fetched)
       setBenchmark(bench)
       setSelectedCodes(fetched.slice(0, Math.min(6, fetched.length)).map((item) => item.code))
-      setReport(await callBattleLLM(config, fetched, abort.signal))
+      const onDelta = (chunk: string) => { streamBuf.current += chunk; scheduleBattleReportFlush(streamBuf, rafRef, setReport) }
+      const finalReport = await callBattleLLM(config, fetched, abort.signal, onDelta)
+      cancelAnimationFrame(rafRef.current)
+      if (abort.signal.aborted) return
+      setReport(finalReport)
     } catch (err) {
       if (abort.signal.aborted) return
       setError(normalizeBattleError(err))
     } finally {
+      cancelAnimationFrame(rafRef.current)
       setLoading(false)
     }
   }
+
   return { loading, error, stocks, selectedCodes, mode, overlayLimit, report, benchmark, run, setSelectedCodes, setMode, setOverlayLimit }
+}
+
+function scheduleBattleReportFlush(buf: MutableRefObject<string>, raf: MutableRefObject<number>, set: Dispatch<SetStateAction<string>>) {
+  if (raf.current) return
+  raf.current = requestAnimationFrame(() => { raf.current = 0; set(buf.current) })
+}
+
+function useBattleHistory(
+  userId: string | undefined,
+  input: string,
+  stocks: BattleStock[],
+  selectedCodes: string[],
+  mode: ChartMode,
+  overlayLimit: number,
+  report: string,
+  benchmark: KlineData[],
+) {
+  const savedKey = useRef('')
+
+  useEffect(() => {
+    if (!userId || !report || stocks.length === 0) return
+    const payload = buildBattleHistoryPayload(input, stocks, selectedCodes, mode, overlayLimit, report, benchmark)
+    const key = battleHistoryKey(payload)
+    if (savedKey.current === key) return
+    savedKey.current = key
+    void saveAnalysisHistory({
+      kind: 'stock-battle',
+      userId,
+      title: payload.stocks.map((stock) => stock.name || stock.code).slice(0, 3).join(' / '),
+      subtitle: `${payload.stocks.length} stocks`,
+      symbols: payload.stocks.map((stock) => stock.code),
+      payload,
+    }).catch(() => undefined)
+  }, [benchmark, input, mode, overlayLimit, report, selectedCodes, stocks, userId])
+}
+
+function buildBattleHistoryPayload(
+  input: string,
+  stocks: BattleStock[],
+  selectedCodes: string[],
+  mode: ChartMode,
+  overlayLimit: number,
+  report: string,
+  benchmark: KlineData[],
+): BattleHistoryPayload {
+  return {
+    input,
+    stocks,
+    selectedCodes,
+    mode,
+    overlayLimit,
+    report,
+    benchmark,
+  }
+}
+
+function battleHistoryKey(payload: BattleHistoryPayload): string {
+  return `${payload.stocks.map((stock) => stock.code).join(',')}:${payload.report.length}`
 }
 
 function BattleHeader() {
@@ -197,12 +280,110 @@ function BattleCharts({ mode, limit, stocks, benchmark }: { mode: ChartMode; lim
 }
 
 function SingleStockPanel({ stock }: { stock: BattleStock }) {
+  const { t } = usePreferences()
+  const value = buildValueScore(stock.valueSnapshot.metrics, t)
   return (
     <div className="rounded-lg border border-border p-4">
-      <h2 className="mb-3 text-sm font-semibold">{stock.code} {stock.name}</h2>
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <h2 className="min-w-0 truncate text-sm font-semibold">{stock.code} {stock.name}</h2>
+        <ValueBadge value={value} />
+      </div>
       <KlineChart data={stock.data} height={300} />
     </div>
   )
+}
+
+function ValueBattlePanel({ stocks }: { stocks: BattleStock[] }) {
+  const { t } = usePreferences()
+  const [view, setView] = useState<ValueView>('quality')
+  const rows = useMemo(
+    () => [...stocks].sort((a, b) => buildValueScore(b.valueSnapshot.metrics).score - buildValueScore(a.valueSnapshot.metrics).score),
+    [stocks],
+  )
+  return (
+    <section className="rounded-lg border border-border p-4">
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-base font-semibold">{t('battle.valueTitle')}</h2>
+          <p className="mt-1 text-xs text-muted-foreground">{t('battle.valueSubtitle')}</p>
+        </div>
+        <div className="inline-flex rounded-lg border border-border bg-muted/40 p-1" role="tablist" aria-label={t('battle.valueTitle')}>
+          {(['quality', 'risk'] as const).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => setView(mode)}
+              className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${view === mode ? 'bg-background text-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+              role="tab"
+              aria-selected={view === mode}
+            >
+              {mode === 'quality' ? t('analysis.valueQuality') : t('analysis.valueRisk')}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-3">
+        {rows.map((stock) => <ValueBattleCard key={stock.code} stock={stock} view={view} />)}
+      </div>
+    </section>
+  )
+}
+
+function ValueBattleCard({ stock, view }: { stock: BattleStock; view: ValueView }) {
+  const { t } = usePreferences()
+  const metrics = stock.valueSnapshot.metrics
+  const value = buildValueScore(metrics, t)
+  if (!metrics) {
+    return (
+      <div className="rounded-lg border border-border p-4">
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <h3 className="truncate text-sm font-semibold">{stock.code} {stock.name}</h3>
+            <p className="mt-1 text-xs text-muted-foreground">{valueUnavailableText(stock.valueSnapshot.reason, t)}</p>
+          </div>
+          <ValueBadge value={value} />
+        </div>
+      </div>
+    )
+  }
+  const signals = view === 'quality' ? value.strengths : value.risks
+  return (
+    <div className="rounded-lg border border-border p-4">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="truncate text-sm font-semibold">{stock.code} {stock.name}</h3>
+          <p className="mt-1 text-xs text-muted-foreground">{sourceLabel(stock.valueSnapshot)}{metrics.period_end ? ` · ${metrics.period_end}` : ''}</p>
+        </div>
+        <ValueBadge value={value} />
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
+        <MetricCell label={t('analysis.valueRoe')} value={formatValuePercent(metrics.roe)} tone={numberTone(metrics.roe, 10, 0)} />
+        <MetricCell label={t('analysis.valueProfitYoy')} value={formatValuePercent(metrics.net_income_yoy)} tone={numberTone(metrics.net_income_yoy, 0, -10)} />
+        <MetricCell label={t('analysis.valueGrossMargin')} value={formatValuePercent(metrics.gross_margin)} tone={numberTone(metrics.gross_margin, 30, 15)} />
+        <MetricCell label={t('analysis.valueDebtRatio')} value={formatValuePercent(metrics.debt_to_asset_ratio)} tone={reverseNumberTone(metrics.debt_to_asset_ratio, 55, 70)} />
+      </div>
+      <div className="mt-3 space-y-2">
+        {signals.length > 0 ? signals.slice(0, 3).map((signal) => (
+          <div key={signal.label} className={`rounded-md border px-3 py-2 text-xs ${signalClass(signal.tone)}`}>{signal.label}</div>
+        )) : (
+          <div className="rounded-md border border-border px-3 py-2 text-xs text-muted-foreground">{t('analysis.valueNoSignals')}</div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function MetricCell({ label, value, tone }: { label: string; value: string; tone: ValueTone }) {
+  return (
+    <div className="min-w-0">
+      <div className="truncate text-xs text-muted-foreground">{label}</div>
+      <div className={`mt-0.5 font-semibold ${metricToneClass(tone)}`}>{value}</div>
+    </div>
+  )
+}
+
+function ValueBadge({ value }: { value: ValueScore }) {
+  return <span className={`shrink-0 rounded-full px-2.5 py-1 text-xs font-medium ${valueScoreClass(value.tone)}`}>{value.label}</span>
 }
 
 function StrengthTable({ stocks }: { stocks: BattleStock[] }) {
@@ -211,7 +392,7 @@ function StrengthTable({ stocks }: { stocks: BattleStock[] }) {
   return (
     <section className="overflow-hidden rounded-lg border border-border">
       <table className="w-full text-sm">
-        <thead className="bg-muted/40"><tr>{['#', t('common.code'), t('battle.score'), '20D', '60D', '120D', t('battle.drawdown')].map((h) => <th key={h} scope="col" className="px-3 py-2 text-left font-medium">{h}</th>)}</tr></thead>
+        <thead className="bg-muted/40"><tr>{['#', t('common.code'), t('battle.score'), t('battle.valueColumn'), '20D', '60D', '120D', t('battle.drawdown')].map((h) => <th key={h} scope="col" className="px-3 py-2 text-left font-medium">{h}</th>)}</tr></thead>
         <tbody>{rows.map((stock, index) => <StrengthRow key={stock.code} stock={stock} rank={index + 1} />)}</tbody>
       </table>
     </section>
@@ -219,11 +400,13 @@ function StrengthTable({ stocks }: { stocks: BattleStock[] }) {
 }
 
 function StrengthRow({ stock, rank }: { stock: BattleStock; rank: number }) {
+  const { t } = usePreferences()
   return (
     <tr className="border-t border-border">
       <td className="px-3 py-2">{rank}</td>
       <td className="px-3 py-2 font-mono">{stock.code} <span className="font-sans text-muted-foreground">{stock.name}</span></td>
       <td className="px-3 py-2 font-medium">{stock.stats.score.toFixed(1)}</td>
+      <td className="px-3 py-2"><ValueBadge value={buildValueScore(stock.valueSnapshot.metrics, t)} /></td>
       <td className="px-3 py-2">{fmtPct(stock.stats.ret20)}</td>
       <td className="px-3 py-2">{fmtPct(stock.stats.ret60)}</td>
       <td className="px-3 py-2">{fmtPct(stock.stats.ret120)}</td>
@@ -285,13 +468,13 @@ async function resolveToken(token: string): Promise<BattleTarget | null> {
   return { code, name: resolved?.name || code }
 }
 
-async function fetchBattleStocks(targets: BattleTarget[], apiKey: string): Promise<BattleStock[]> {
+async function fetchBattleStocks(targets: BattleTarget[], keys: { tickflow: string | null; tushare: string | null }): Promise<BattleStock[]> {
   const errors: string[] = []
   const stocks: BattleStock[] = []
   await Promise.all(
     targets.map(async (target) => {
       try {
-        const result = await fetchOneBattleStock(target, apiKey)
+        const result = await fetchOneBattleStock(target, keys)
         if (result) stocks.push(result)
         else errors.push(`${target.code}: 无数据`)
       } catch (err) {
@@ -304,10 +487,14 @@ async function fetchBattleStocks(targets: BattleTarget[], apiKey: string): Promi
   return stocks
 }
 
-async function fetchOneBattleStock(target: BattleTarget, apiKey: string): Promise<BattleStock | null> {
-  const data = await fetchKlineViaTickFlow(target.code, apiKey)
+async function fetchOneBattleStock(target: BattleTarget, keys: { tickflow: string | null; tushare: string | null }): Promise<BattleStock | null> {
+  if (!keys.tickflow) return null
+  const [data, valueSnapshot] = await Promise.all([
+    fetchKlineViaTickFlow(target.code, keys.tickflow),
+    fetchValueSnapshot(target.code, keys).catch((): ValueSnapshot => ({ symbol: target.code, source: 'none', metrics: null, reason: 'not-found' })),
+  ])
   if (data.length === 0) return null
-  return { ...target, data, stats: computeStrengthStats(data) }
+  return { ...target, data, stats: computeStrengthStats(data), valueSnapshot }
 }
 
 function computeStrengthStats(data: KlineData[]): StrengthStats {
@@ -327,22 +514,22 @@ function periodReturn(data: KlineData[], days: number): number {
   return base > 0 ? (latest / base - 1) * 100 : 0
 }
 
-async function callBattleLLM(config: Parameters<typeof streamLLMResponse>[0], stocks: BattleStock[], signal?: AbortSignal): Promise<string> {
-  const result = await streamLLMResponse(config, buildBattleMessages(stocks), { temperature: 0.45, maxTokens: 3500, signal })
+async function callBattleLLM(config: Parameters<typeof streamLLMResponse>[0], stocks: BattleStock[], signal?: AbortSignal, onDelta?: (chunk: string) => void): Promise<string> {
+  const result = await streamLLMResponse(config, buildBattleMessages(stocks), { temperature: 0.45, maxTokens: 3500, signal, onDelta })
   if (!result) throw new Error('模型未返回结果，请重试')
   return result
 }
 
 function buildBattleMessages(stocks: BattleStock[]) {
   return [
-    { role: 'system' as const, content: '你是威科夫强弱对抗分析师。只基于给定行情数据比较股票相对强弱，输出强弱排序、胜出原因、落后风险、适合观察的触发价位。' },
+    { role: 'system' as const, content: '你是威科夫强弱对抗分析师。主框架是量价相对强弱、趋势延续性和回撤位置；若给出价值面摘要，只把它作为质量、风险和置信度校准，不用基本面替代 K 线事实。输出强弱排序、胜出原因、落后风险、价值面校准、适合观察的触发价位。' },
     { role: 'user' as const, content: `请比较这些股票的强弱，并给出结论。\n\n${stocks.map(buildStockDigest).join('\n\n---\n\n')}` },
   ]
 }
 
 function buildStockDigest(stock: BattleStock): string {
   const rows = stock.data.slice(-60).map((row) => [row.date, row.open, row.high, row.low, row.close, Math.round(row.volume)].join(','))
-  return [`## ${stock.code} ${stock.name}`, `score=${stock.stats.score.toFixed(2)} ret20=${stock.stats.ret20.toFixed(2)} ret60=${stock.stats.ret60.toFixed(2)} ret120=${stock.stats.ret120.toFixed(2)} drawdown60=${stock.stats.drawdown60.toFixed(2)} volumeRatio=${stock.stats.volumeRatio.toFixed(2)}`, '```csv', 'date,open,high,low,close,volume', ...rows, '```'].join('\n')
+  return [`## ${stock.code} ${stock.name}`, `score=${stock.stats.score.toFixed(2)} ret20=${stock.stats.ret20.toFixed(2)} ret60=${stock.stats.ret60.toFixed(2)} ret120=${stock.stats.ret120.toFixed(2)} drawdown60=${stock.stats.drawdown60.toFixed(2)} volumeRatio=${stock.stats.volumeRatio.toFixed(2)}`, buildValueDigest(stock.valueSnapshot), '```csv', 'date,open,high,low,close,volume', ...rows, '```'].join('\n')
 }
 
 function normalizeBattleError(err: unknown): string {

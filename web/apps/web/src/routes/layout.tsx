@@ -1,19 +1,23 @@
-import { Outlet, NavLink, useNavigate } from 'react-router'
-import { MessageSquare, Briefcase, TrendingUp, Settings, LogOut, BarChart3, Moon, FileDown, BookOpen, Home, Github, Sun, Languages, Swords, type LucideIcon } from 'lucide-react'
+import { Outlet, Link, useLocation, useNavigate } from 'react-router'
+import { useEffect } from 'react'
+import { MessageSquare, Briefcase, TrendingUp, Settings, LogOut, BarChart3, Moon, FileDown, BookOpen, Home, Github, Sun, Languages, Swords, Map, History, type LucideIcon } from 'lucide-react'
 import { supabase } from '@/lib/supabase'
 import { useAuthStore } from '@/stores/auth'
 import { MarketBar } from '@/components/market-bar'
 import { usePreferences, type TranslationKey } from '@/lib/preferences'
+import { trackRouteActivity } from '@/lib/activity'
 
 const navItems = [
   { to: '/chat', icon: MessageSquare, labelKey: 'nav.chat' },
   { to: '/analysis', icon: BarChart3, labelKey: 'nav.analysis' },
   { to: '/battle', icon: Swords, labelKey: 'nav.battle' },
   { to: '/portfolio', icon: Briefcase, labelKey: 'nav.portfolio' },
+  { to: '/history', icon: History, labelKey: 'nav.history' },
   { to: '/tracking', icon: TrendingUp, labelKey: 'nav.tracking' },
   { to: '/tail-buy', icon: Moon, labelKey: 'nav.tailBuy' },
   { to: '/export', icon: FileDown, labelKey: 'nav.export' },
   { to: '/guide', icon: BookOpen, labelKey: 'nav.guide' },
+  { to: '/guide#capability-boundary', icon: Map, labelKey: 'nav.capabilities' },
   { to: '/settings', icon: Settings, labelKey: 'nav.settings' },
 ] satisfies { to: string; icon: LucideIcon; labelKey: TranslationKey }[]
 
@@ -109,14 +113,11 @@ function SidebarFooter({ email, onLogout }: { email: string; onLogout: () => voi
 }
 
 export function AppLayout() {
-  const navigate = useNavigate()
+  const location = useLocation()
   const user = useAuthStore((s) => s.user)
   const { t } = usePreferences()
-
-  async function handleLogout() {
-    await supabase.auth.signOut()
-    navigate('/login', { replace: true })
-  }
+  const handleLogout = useLogoutHandler()
+  useRouteActivity(user?.id, location)
 
   return (
     <div className="flex h-screen">
@@ -130,20 +131,18 @@ export function AppLayout() {
 
         <nav className="flex-1 space-y-0.5 px-3">
           {navItems.map(({ to, icon: Icon, labelKey }) => (
-            <NavLink
+            <Link
               key={to}
               to={to}
-              className={({ isActive }) =>
-                `flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition-all ${
-                  isActive
-                    ? 'bg-primary/10 font-medium text-primary shadow-sm'
-                    : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-                }`
-              }
+              className={`flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition-all ${
+                _navActive(location.pathname, location.hash, to)
+                  ? 'bg-primary/10 font-medium text-primary shadow-sm'
+                  : 'text-muted-foreground hover:bg-muted hover:text-foreground'
+              }`}
             >
               <Icon size={18} />
               {t(labelKey)}
-            </NavLink>
+            </Link>
           ))}
         </nav>
 
@@ -158,4 +157,27 @@ export function AppLayout() {
       </div>
     </div>
   )
+}
+
+function _navActive(pathname: string, hash: string, to: string) {
+  const [targetPath, targetHash = ''] = to.split('#')
+  if (targetHash) {
+    return pathname === targetPath && hash === `#${targetHash}`
+  }
+  return pathname === targetPath && !hash
+}
+
+function useLogoutHandler() {
+  const navigate = useNavigate()
+  return async () => {
+    await supabase.auth.signOut()
+    navigate('/login', { replace: true })
+  }
+}
+
+function useRouteActivity(userId: string | undefined, location: ReturnType<typeof useLocation>) {
+  const route = `${location.pathname}${location.search}${location.hash}`
+  useEffect(() => {
+    if (userId) trackRouteActivity(userId, route)
+  }, [route, userId])
 }

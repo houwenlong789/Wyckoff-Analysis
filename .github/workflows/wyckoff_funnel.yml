@@ -2,9 +2,14 @@ name: Wyckoff Funnel
 
 on:
   schedule:
-    # 北京 18:25 (UTC+8)，为了避开 GitHub Actions 整点/半点的高峰期丢包问题，提前5分钟
-    - cron: '25 10 * * 0-4'
+    # 北京时间周一到周五 18:25（UTC 10:25），A 股收盘后跑日频漏斗 + 主线雷达。
+    - cron: '25 10 * * 1-5'
   workflow_dispatch:
+    inputs:
+      end_calendar_day:
+        description: "可选：回放目标自然日，例如 2026-05-26"
+        required: false
+        type: string
 
 concurrency:
   group: daily-job-${{ github.ref }}
@@ -24,7 +29,11 @@ jobs:
       FUNNEL_MAX_WORKERS: "4"
       FUNNEL_BATCH_SIZE: "200"
       FUNNEL_BATCH_SLEEP: "0.55"
+      END_CALENDAR_DAY: ${{ github.event.inputs.end_calendar_day || '' }}
       DEFAULT_LLM_PROVIDER: ${{ secrets.DEFAULT_LLM_PROVIDER }}
+      STEP3_LLM_PROVIDER: ${{ vars.STEP3_LLM_PROVIDER || secrets.STEP3_LLM_PROVIDER || 'gemini' }}
+      STEP3_LLM_FALLBACK_PROVIDERS: ${{ vars.STEP3_LLM_FALLBACK_PROVIDERS || secrets.STEP3_LLM_FALLBACK_PROVIDERS || 'efficiency' }}
+      STEP4_LLM_PROVIDER: ${{ vars.STEP4_LLM_PROVIDER || secrets.STEP4_LLM_PROVIDER || 'efficiency' }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
       1ROUTE_API_KEY: ${{ secrets.ONEROUTE_API_KEY }}
@@ -61,6 +70,8 @@ jobs:
       SUPABASE_USER_ID: ${{ secrets.SUPABASE_USER_ID }}
       TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
       SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+      RAG_SEMANTIC_VETO_ENABLED: ${{ vars.RAG_SEMANTIC_VETO_ENABLED || '1' }}
+      RAG_SEMANTIC_PROVIDER: ${{ vars.RAG_SEMANTIC_PROVIDER || secrets.RAG_SEMANTIC_PROVIDER || 'efficiency' }}
       # 实盘风控参数：锁死 -9% 止损 + 单票仓位上限
       STEP4_BUY_HARD_STOP_ENABLED: "1"
       STEP4_BUY_HARD_STOP_PCT: "9.0"
@@ -68,15 +79,18 @@ jobs:
       STEP4_PROBE_BUDGET_LIMIT: "0.10"
       STEP4_ATTACK_BUDGET_LIMIT: "0.20"
       STEP4_BUY_BLOCK_REGIMES: "CRASH,BLACK_SWAN,RISK_OFF"
-      # AI 候选配额：偏 Accum（回测夏普 1.77 vs Trend 0.14）
-      FUNNEL_AI_SELECTION_MODE: "modern"
+      # AI 候选选择：正式 L4 全量进入 Step3，Trend/Accum 仅用于分轨研报。
+      FUNNEL_AI_SELECTION_MODE: "all_formal_l4"
       FUNNEL_AI_TOTAL_CAP: "8"
+      # off=静态配额；shadow=旁路记录动态策略差异；on=正式启用动态配额。
+      FUNNEL_DYNAMIC_POLICY: ${{ vars.FUNNEL_DYNAMIC_POLICY || secrets.FUNNEL_DYNAMIC_POLICY || 'off' }}
       FUNNEL_AI_RISK_ON_TREND: "3"
       FUNNEL_AI_RISK_ON_ACCUM: "5"
       FUNNEL_AI_RISK_OFF_TREND: "0"
       FUNNEL_AI_RISK_OFF_ACCUM: "0"
       FUNNEL_AI_NEUTRAL_TREND: "2"
       FUNNEL_AI_NEUTRAL_ACCUM: "3"
+      DAILY_JOB_ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
       TZ: Asia/Shanghai
 
     steps:
@@ -93,8 +107,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
 
-      - name: Prepare logs dir
-        run: mkdir -p logs
+      - name: Prepare artifact dirs
+        run: mkdir -p logs artifacts
 
       - name: Run daily job
         run: |
@@ -106,9 +120,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: daily-job-logs-${{ github.run_number }}
-          path: logs/*.log
-          retention-days: 7
+          name: daily-job-artifacts-${{ github.run_number }}
+          path: |
+            logs/*.log
+            artifacts/**
+          retention-days: 30
           if-no-files-found: warn
 
       - name: Notify on failure

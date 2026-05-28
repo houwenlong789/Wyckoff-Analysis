@@ -23,7 +23,6 @@ pip-wheel-metadata/
 dist/
 build/
 *.egg-info/
-uv.lock
 
 data/
 !data/funnel_snapshots/.gitkeep

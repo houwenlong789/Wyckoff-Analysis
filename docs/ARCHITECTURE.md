@@ -7,15 +7,15 @@
 ## 系统全景
 
 ```
-     ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-     │ React Web   │  │ Streamlit    │  │  CLI (TUI)   │  │  MCP Server  │  │  GitHub      │
-     │ (CF Pages)  │  │ maintenance  │  │  Terminal    │  │  (stdio)     │  │  Actions     │
-     └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-            │                 │                 │                 │                 │
-            ▼                 ▼                 ▼                 ▼                 ▼
+     ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+     │ React Web    │  │  CLI (TUI)   │  │  MCP Server  │  │  GitHub      │
+     │ (CF Pages)   │  │  Terminal    │  │  (stdio)     │  │  Actions     │
+     └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘
+            │                 │                 │                 │
+            ▼                 ▼                 ▼                 ▼
      ┌─────────────────────────────────────────────────────────────────────────────────┐
-    │                              Agent Brain                                        │
-    │ React: Vercel AI SDK · Streamlit: Google ADK(maintenance) · CLI: AgentRuntime · MCP │
+     │                              Agent Brain                                        │
+     │              React: Vercel AI SDK · CLI: AgentRuntime · MCP                     │
      │                                                                                 │
      │  10 专业工具 + 5 通用能力 — LLM 自主编排                                          │
      │  自动 Plan Mode — 复杂任务拆步骤执行                                              │
@@ -106,29 +106,29 @@ DeepSeek 推理模型要求多轮对话中 assistant 消息必须携带 `reasoni
 
 ## Agent 架构
 
-### 四通道复用
+### 三通道复用
 
-React Web、Streamlit 维护入口、CLI、MCP 共享同一套工具函数（`agents/chat_tools.py`）+ 同一份 System Prompt（`core/prompts.py`），通过不同运行时驱动：
+React Web、CLI、MCP 共享同一套工具函数（`agents/chat_tools.py`）+ 同一份 System Prompt（`core/prompts.py`），通过不同运行时驱动：
 
-| | React Web (CF Pages) | Streamlit 维护入口 | CLI（TUI） | MCP Server |
-|---|---|---|---|---|
-| 运行时 | Vercel AI SDK `streamText` | Google ADK `LlmAgent`（保留作兼容/对比） | `AgentRuntime`（`cli/runtime.py`） | FastMCP（stdio） |
-| UI | React SPA | Streamlit 页面 | Textual 全屏 TUI | 无（被 Claude Code 等调用） |
-| 入口 | `web/apps/web/` | `streamlit_app.py` | `wyckoff`（无子命令） | `wyckoff-mcp` |
-| 工具数 | 10（独立实现） | 10（共享） | 18（+5 本地 +3 委派） | 10（三层权限） |
-| 部署 | CF Pages + Functions | Streamlit Cloud（维护） | 本地 pip 安装 | 本地进程 |
-| 对话能力 | ✓ maxSteps 多轮 | ✓ ADK Runner 多轮 | ✓ Agent Loop 多轮 | ✗ 单次工具调用 |
-| 后台任务 | ✗ | ✗ | ✓ 长任务非阻塞 | ✗ |
-| 消息排队 | ✗ | ✗ | ✓ Agent 忙时自动排队 | N/A |
-| Thinking | ✗ | ✗ | ✓ 推理模型 reasoning 展示 | N/A |
-| Agent 记忆 | ✗ | ✗ | ✓ 跨会话记忆（SQLite） | ✗ |
-| 上下文压缩 | ✗ | ✗ | ✓ 动态阈值（25% context window）自动压缩 | N/A |
-| 可视化面板 | ✗ | ✗ | ✓ `wyckoff dashboard` | ✗ |
-| Plan Mode | ✗ | ✓ prompt 驱动 | ✓ prompt 驱动 | N/A |
+| | React Web (CF Pages) | CLI（TUI） | MCP Server |
+|---|---|---|---|
+| 运行时 | Vercel AI SDK `streamText` | `AgentRuntime`（`cli/runtime.py`） | FastMCP（stdio） |
+| UI | React SPA | Textual 全屏 TUI | 无（被 Claude Code 等调用） |
+| 入口 | `web/apps/web/` | `wyckoff`（无子命令） | `wyckoff-mcp` |
+| 工具数 | 10（独立实现） | 18（+5 本地 +3 委派） | 10（三层权限） |
+| 部署 | CF Pages + Functions | 本地 pip 安装 | 本地进程 |
+| 对话能力 | ✓ maxSteps 多轮 | ✓ Agent Loop 多轮 | ✗ 单次工具调用 |
+| 后台任务 | ✗ | ✓ 长任务非阻塞 | ✗ |
+| 消息排队 | ✗ | ✓ Agent 忙时自动排队 | N/A |
+| Thinking | ✗ | ✓ 推理模型 reasoning 展示 | N/A |
+| Agent 记忆 | ✗ | ✓ 跨会话记忆（SQLite） | ✗ |
+| 上下文压缩 | ✓ 最近对话压缩 | ✓ 动态阈值（25% context window）自动压缩 | N/A |
+| 可视化面板 | ✗ | ✓ `wyckoff dashboard` | ✗ |
+| Plan Mode | ✗ | ✓ prompt 驱动 | N/A |
 
-Streamlit 框架在 MVP 阶段支撑了产品验证，但随着项目功能持续增长，Streamlit 在组件定制、状态管理、部署灵活性等方面的局限性日益凸显，已进入维护模式。数据导出和少量历史诊断能力可保留在 Streamlit 内，新功能默认进入 React Web 的 Agent 体验或 CLI。
+Streamlit 框架在 MVP 阶段支撑了产品验证，但主分支已全面下线 Streamlit：运行代码、依赖和 CI 路径均不再维护。历史代码保留在 `release/streamlit` 分支，MVP 产品架构和效果图归档在 [`STREAMLIT_MVP_ARCHITECTURE.md`](STREAMLIT_MVP_ARCHITECTURE.md)。
 
-当前主力 agent loop 收敛在 `cli/runtime.py::AgentRuntime`：它负责 provider 调用、工具执行、并发分批、上下文压缩、retry、doom-loop、scratchpad 和大结果落盘。TUI/CLI 只消费 runtime event；Google ADK 路径仅服务 Streamlit 维护入口和后续多 agent SDK 体感对比，不再作为新能力的默认承载层。
+当前主力 agent loop 收敛在 `cli/runtime.py::AgentRuntime`：它负责 provider 调用、工具执行、并发分批、上下文压缩、retry、doom-loop、scratchpad 和大结果落盘。TUI/CLI 只消费 runtime event；React Web 则以 CF Pages + Vercel AI SDK 承载在线读盘室。
 
 **CLI 专属工具**（Web / MCP 不可用）：`exec_command`、`read_file`、`write_file`、`web_fetch`、`check_background_tasks`、`delegate_to_research`、`delegate_to_analysis`、`delegate_to_trading`
 
@@ -201,7 +201,7 @@ CLI 专属工具仅在 TUI 环境中可用，Web 和 MCP 不注册这些工具�
 - Web（CF Pages）：拆为 `plan_portfolio_update` → 用户在聊天中确认 → `execute_portfolio_update`，通过 LLM 行为约束实现
 
 **Tool Schema 策略差异**：
-- CLI / Streamlit 维护入口：OpenAI SDK 默认不开 `strict`，工具参数可用 Python `Optional[T]`（字段不在 required 中）
+- CLI：OpenAI SDK 默认不开 `strict`，工具参数可用 Python `Optional[T]`（字段不在 required 中）
 - Web（CF Pages）：`@ai-sdk/openai` 的 `compatibility: 'compatible'` 模式自动开启 `strict: true`，要求所有字段必须在 `required` 中。可选参数使用 Zod `.nullable()` 而非 `.optional()`，生成 `"type": ["string", "null"]` 使字段留在 required 中、模型不需要时传 null
 
 ### 工具路由原则
@@ -331,7 +331,7 @@ claude mcp add wyckoff -- wyckoff-mcp
 
 ## Agent 记忆系统
 
-`cli/memory.py` — 跨会话记忆，存储在 SQLite `agent_memory` 表。
+`cli/memory.py` — 跨会话分层记忆，存储在 SQLite `agent_memory` 表。设计吸收 TencentDB-Agent-Memory 的两条核心原则：高层保留结构，低层保留证据；压缩可以折叠，但必须能下钻。
 
 ### 写入时机
 
@@ -344,41 +344,65 @@ claude mcp add wyckoff -- wyckoff-mcp
 - 消息数 ≥ 4
 - 至少有 1 次工具调用
 
-LLM 从最近 40 条消息中提取关键结论（≤300 字），带 `[偏好]` 前缀的行以 `memory_type='preference'` 存储（永不清理），其余以 `session` 类型存储。
+LLM 从最近 40 条消息中提取 L1 原子记忆（≤300 字），每行必须是 `[股票]` / `[决策]` / `[市场]` / `[偏好]` 前缀。系统按前缀拆成独立记录：
+
+- `[股票]` → `stock_opinion`
+- `[决策]` → `decision`
+- `[市场]` → `market_view`
+- `[偏好]` → `preference`
+
+当本轮产生足够 L1 原子记忆后，系统会再提炼 L2 `scenario` 和 L3 `persona`，用于下一轮更高密度召回。
+
+### 分层与追溯
+
+| 层级 | 载体 | 作用 | 下钻方式 |
+|------|------|------|---------|
+| L0 | `chat_log` / scratchpad / tool result 文件 | 原始对话与工具证据 | `source_ref=chat_log:<session_id>` 或 `result_ref` |
+| L1 | `agent_memory` 原子记忆 | 股票结论、决策、市场观点、偏好 | `wyckoff memory trace <id>` |
+| L2 | `scenario` | 可复用交易/复盘场景 | 关联 L1 原子记忆和股票代码 |
+| L3 | `persona` | 用户画像、稳定风险边界 | 需要细节时回查 L1/L0 |
+
+`agent_memory` 新增 `memory_level`、`source_ref`、`confidence`、`metadata` 字段。TUI 在保存记忆时写入 `source_ref=chat_log:<session_id>`，CLI 可用 `wyckoff memory trace <id>` 查看来源会话片段。
 
 ### 自动清理
 
-TUI 启动时自动执行 `prune_memories()`，清理 90 天前的 `session` 和 `fact` 类型记忆。
+TUI 启动时自动执行 `prune_memories()`，清理 90 天前的普通记忆；`preference` 和 `persona` 保留。
 
 ### 检索注入
 
-每次用户提问前，Hybrid Search 综合检索 + 偏好置顶：
+每次用户提问前，Hybrid Search 综合检索 + 画像/偏好置顶：
 
 1. **FTS5 全文检索**（权重 1.0）：SQLite FTS5 索引，BM25 排序，精准匹配用户问题中的关键词
 2. **股票代码匹配**（权重 0.85）：正则提取 6 位代码，LIKE 匹配
 3. **中文关键词 LIKE**（权重 0.6）：2-gram 分词 + 停用词过滤，补充召回
-4. **时间衰减加权**：30 天半衰期，近期记忆得分更高，`preference` 类型永不衰减
-5. 始终拉取全部 `preference` 类型记忆，置顶显示
+4. **时间衰减加权**：30 天半衰期，近期记忆得分更高，`preference` / `persona` 不衰减
+5. 始终拉取 L3 `persona` 和近期 `preference`，置顶显示
 
 拼成两段注入 system prompt 尾部：
 
 ```
-# 用户偏好
-- 不要推荐 ST 股
+# 用户画像
 - 风险偏好中等，止损 -6%
+- 不要推荐 ST 股
 
-# 历史记忆
-- [04-20] 000001 处于吸筹 Phase C，支撑位 12.50
-- [04-21] 用户关注半导体板块轮动
+# 相关场景
+- #18 [2026-05-15] 000001 吸筹后等待放量确认
+
+# 历史原子记忆
+- #12 [2026-05-15] 000001 处于吸筹 Phase C，支撑位 12.50 | 源:chat_log:abc123
 ```
 
 ### 记忆类型
 
 | 类型 | 说明 | 自动清理 |
 |------|------|---------|
-| `session` | LLM 提取的会话摘要 | 90 天 |
+| `stock_opinion` | 股票级结论 | 90 天 |
+| `decision` | 用户操作意图/决策 | 90 天 |
+| `market_view` | 市场或板块判断 | 90 天 |
+| `scenario` | L2 可复用场景 | 90 天 |
 | `fact` | 用户主动记录的事实 | 90 天 |
 | `preference` | 用户偏好 | 永不清理 |
+| `persona` | L3 用户画像 | 永不清理 |
 
 ## 上下文压缩
 
@@ -401,12 +425,13 @@ TUI 启动时自动执行 `prune_memories()`，清理 90 天前的 `session` 和
 1. **Memory Flush**：压缩前先用 LLM 从待压缩消息中提取用户偏好/重要事实，存入 `preference` 记忆（永不丢失）
 2. 保留最近 4 条消息（`TAIL_KEEP = 4`）原文
 3. 前面的消息用 LLM 总结为 ≤500 字中文摘要
-3. 工具结果做智能摘要而非粗暴截断：
+4. 工具结果做智能摘要而非粗暴截断：
    - `analyze_stock` 诊断模式 → 保留 `code`、`phase`、`health`、`trigger_signals` 等关键字段
    - `analyze_stock` 行情模式 → 保留最近 5 条数据
    - `portfolio` 诊断模式 → 保留 `diagnostics`、`successful_count` 等
    - `portfolio` 查看模式 → 保留 `positions`、`free_cash` 等
    - 通用工具 → 保留 `error`、`message`、`status` 等顶层键
+5. 超大工具结果由 `cli/tool_results.py` 写入 `~/.wyckoff/tool-results/*.json`，上下文只保留 `node_id`、`result_ref`、Mermaid 节点和预览；`index.jsonl` 记录节点到原文文件的映射，便于按 `node_id` 下钻。
 
 ```
 [对话摘要]
@@ -554,6 +579,30 @@ pending ──(价格确认)──→ confirmed（可操作）
 
 TTL：SOS 2 天、Spring 3 天、LPS 3 天、EVR 2 天、Compression 3 天。
 
+## 信号反馈与动态策略闭环
+
+完整说明见 [`SIGNAL_FEEDBACK_LOOP.md`](SIGNAL_FEEDBACK_LOOP.md)。核心关系是：漏斗写观察样本，feedback 盘后验收，下一轮漏斗读取新的健康度和 registry。
+
+```mermaid
+flowchart LR
+  A["漏斗本轮运行<br/>Layer1-4 + AI + OMS"] --> B["signal_observations"]
+  B --> C["signal_feedback_job.py<br/>计算 outcomes"]
+  C --> D["signal_health_daily<br/>signal_registry"]
+  D --> E{"FUNNEL_DYNAMIC_POLICY"}
+  E -- "off" --> F["下一轮仍用静态配额"]
+  E -- "shadow" --> G["静态配额出结果<br/>动态配额写 shadow 差异"]
+  E -- "on" --> H["动态配额正式介入"]
+  F --> A
+  G --> A
+  H --> A
+```
+
+| 模式 | 行为 |
+|------|------|
+| `off` | 默认静态 Trend / Accum 配额，不读取反馈权重。 |
+| `shadow` | 主流程保持静态配额，同时把动态策略候选差异写入 `signal_policy_shadow_runs`。 |
+| `on` | 正式使用 `signal_health_daily` 权重和 `signal_registry` 启停状态。 |
+
 ## 尾盘策略
 
 `core/tail_buy_strategy.py` + `scripts/tail_buy_intraday_job.py`
@@ -586,16 +635,19 @@ signal_pending (pending/confirmed)
 
 ## Pipeline（定时任务）
 
-### GitHub Actions 工作流（12 个）
+### GitHub Actions 主要工作流
 
 | 工作流 | 时间（北京） | 说明 |
 |-------|-------------|------|
 | **CI** (`ci.yml`) | push/PR | pytest + compile + dry-run |
-| **A 股漏斗筛选 + AI 研报 + 决策** (`wyckoff_funnel.yml`) | 周日-周四 18:25 | `daily_job.py` Step2→3→4 |
+| **A 股漏斗筛选 + AI 研报 + 决策** (`wyckoff_funnel.yml`) | 周一-周五 18:25 | `daily_job.py` Step2→3→4，日频写入 `theme_radar_snapshot` |
+| **主线雷达周报** (`theme_radar.yml`) | 周五 21:10 | `theme_radar_job.py --with-news`，周频新闻增强复盘 |
+| **信号反馈闭环** (`signal_feedback.yml`) | 周一-周五 23:30 | `signal_feedback_job.py` 刷新 outcomes / health / registry |
 | **港股漏斗筛选** (`wyckoff_funnel_hk.yml`) | 周一-周五 16:35 | `market_funnel_job.py --market hk` |
 | **美股漏斗筛选** (`wyckoff_funnel_us.yml`) | 周二-周六 05:35 | `market_funnel_job.py --market us` |
 | **尾盘策略** (`tail_buy_1420.yml`) | 周一-周五 13:50 | `tail_buy_intraday_job.py` |
 | **盘前风控** (`premarket_risk.yml`) | 周一-周五 08:20 | A50 + VIX 预警 |
+| **板块连续性报告** (`sector_continuity.yml`) | 周一-周五盘后 | 计算概念 / 行业热度并持久化 |
 | **涨停复盘** (`review_list_replay.yml`) | 周一-周五 19:25 | 当日涨幅 ≥ 8% 回溯 |
 | **形态复盘重定价** (`recommendation_tracking_reprice.yml`) | 周日-周四 23:00 | 同步收盘价、计算收益 |
 | **数据库维护** (`db_maintenance.yml`) | 每天 23:05 | 清理过期行情、订单、信号、市场信号等滑动窗口数据 |
@@ -629,6 +681,12 @@ tickflow                                        （1 分钟盘中数据，尾盘
 | `signal_pending` | 信号确认池 |
 | `market_signal_daily` | 大盘信号 |
 | `daily_nav` | 每日净值 |
+| `concept_heat_history` | 板块连续性与概念热度历史 |
+| `signal_observations` | L4 信号观察样本 |
+| `signal_outcomes` | 信号后续收益 / 回撤结果 |
+| `signal_health_daily` | 按信号聚合的健康度快照 |
+| `signal_registry` | 信号生命周期与启停状态 |
+| `signal_policy_shadow_runs` | 动态策略 shadow run 差异记录 |
 
 数据隔离：Web JWT → RLS，CLI access_token → RLS，脚本 service_role_key → 绕过 RLS。
 
@@ -676,8 +734,7 @@ wyckoff-mcp                      # 启动 MCP Server（供 Claude Code 等调用
 
 ```
 mcp_server.py    MCP Server 入口（FastMCP，10 个工具）
-agents/          Agent 工具函数（ADK + AgentRuntime + MCP 共用）
-app/             Streamlit 维护入口
+agents/          Agent 工具函数（Web + AgentRuntime + MCP 共用）
 cli/             CLI 入口、TUI、AgentRuntime、Provider、Dashboard、Memory
   providers/     LLM Provider 实现（Gemini / Claude / OpenAI / Fallback）
 core/            漏斗引擎、诊断、策略、信号确认、尾盘策略、常量

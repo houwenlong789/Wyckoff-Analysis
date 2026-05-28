@@ -65,6 +65,7 @@ jobs:
           WEB_REQUEST_ID: ${{ inputs.request_id }}
           WEB_PAYLOAD_JSON: ${{ inputs.payload_json }}
         run: |
+          set -o pipefail
           python -u scripts/web_background_job.py \
             --job-kind "$WEB_JOB_KIND" \
             --request-id "$WEB_REQUEST_ID" \

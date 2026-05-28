@@ -49,11 +49,9 @@ RAG_SEMANTIC_VETO_ENABLED = os.getenv("RAG_SEMANTIC_VETO_ENABLED", "1").strip().
     "on",
 }
 RAG_SEMANTIC_TIMEOUT = int(os.getenv("RAG_SEMANTIC_TIMEOUT", "25"))
-from integrations._llm_types import DEFAULT_GEMINI_MODEL as _DEFAULT_GEMINI_MODEL
-
-RAG_SEMANTIC_MODEL = (
-    os.getenv("RAG_SEMANTIC_MODEL", "").strip() or os.getenv("GEMINI_MODEL", "").strip() or _DEFAULT_GEMINI_MODEL
-)
+RAG_SEMANTIC_API_KEY = os.getenv("RAG_SEMANTIC_API_KEY", "").strip()
+RAG_SEMANTIC_MODEL = os.getenv("RAG_SEMANTIC_MODEL", "").strip()
+RAG_SEMANTIC_BASE_URL = os.getenv("RAG_SEMANTIC_BASE_URL", "").strip()
 _STAR_ST_PATTERN = re.compile(r"(?<![a-z0-9])(?:\*|＊)st\s*[\u4e00-\u9fff]", re.IGNORECASE)
 _ST_PATTERN = re.compile(r"(?<![a-z0-9\*＊])st\s*[\u4e00-\u9fff]", re.IGNORECASE)
 
@@ -119,6 +117,70 @@ def _extract_hits(text: str, keywords: list[str]) -> list[str]:
     return hits
 
 
+def _is_about_this_stock(sentence: str, code: str, name: str) -> bool:
+    """判断一段文本是否在讨论该股本身（而非泛泛提及其他股票）。"""
+    s = sentence.lower()
+    code_digits = code.lstrip("0").zfill(4) if code else ""
+    if code in s or code_digits in s:
+        return True
+    clean_name = re.sub(r"^[*＊]?st", "", name, flags=re.IGNORECASE).strip()
+    if clean_name and clean_name.lower() in s:
+        return True
+    if name and name.lower() in s:
+        return True
+    return False
+
+
+def _extract_hits_strict(
+    news_items: list[str],
+    keywords: list[str],
+    code: str,
+    name: str,
+) -> tuple[list[str], list[str]]:
+    """从单股新闻源提取命中关键词。
+
+    akshare stock_news_em(symbol) 本身已经是单股源，所以非 ST 关键词直接匹配即可。
+    ST 关键词需要精确判断 *ST/ST 后紧跟的是否是本股名称（排除聚合文章里的其他 ST 股）。
+
+    Returns (hits, evidence_titles_for_hits).
+    """
+    hits: list[str] = []
+    hit_evidence: list[str] = []
+    for article in news_items:
+        article_lower = article.lower()
+        article_title = article.split("\n", 1)[0].strip()
+        for kw in keywords:
+            k = str(kw or "").strip().lower()
+            if not k or k in {"st", "*st"} or k in hits:
+                continue
+            if k not in article_lower:
+                continue
+            hits.append(k)
+            if article_title and article_title not in hit_evidence:
+                hit_evidence.append(article_title)
+
+        if "*st" not in hits and _STAR_ST_PATTERN.search(article_lower):
+            if _st_mentions_this_stock(article_lower, code, name):
+                hits.append("*st")
+                if article_title and article_title not in hit_evidence:
+                    hit_evidence.append(article_title)
+        if "st" not in hits and _ST_PATTERN.search(article_lower):
+            if _st_mentions_this_stock(article_lower, code, name):
+                hits.append("st")
+                if article_title and article_title not in hit_evidence:
+                    hit_evidence.append(article_title)
+    return hits, hit_evidence
+
+
+def _st_mentions_this_stock(text: str, code: str, name: str) -> bool:
+    """ST 专用：只有 *ST/ST + 本股名称前缀 才算命中，不做宽泛 fallback。"""
+    clean_name = re.sub(r"^[*＊]?st", "", name, flags=re.IGNORECASE).strip()
+    if not clean_name:
+        return False
+    prefix = clean_name[:2].lower()
+    return bool(re.search(rf"(?:\*|＊)?st\s*{re.escape(prefix)}", text, re.IGNORECASE))
+
+
 def _fetch_news_akshare(code: str) -> list[dict[str, str]]:
     """通过 akshare 拉取东方财富个股新闻，返回近 N 天内的条目。"""
     import akshare as ak
@@ -176,21 +238,7 @@ def _parse_semantic_judgement(raw: str) -> tuple[bool | None, str]:
     return (None, "")
 
 
-def _semantic_negative_via_gemini(
-    code: str,
-    name: str,
-    hits: list[str],
-    snippets: list[str],
-) -> tuple[bool | None, str | None]:
-    """关键词命中后的二次语义判定。"""
-    if not RAG_SEMANTIC_VETO_ENABLED:
-        return (None, None)
-    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
-    if not api_key:
-        return (None, "semantic_disabled:missing_gemini_api_key")
-
-    from integrations.llm_client import call_llm
-
+def _semantic_news_content(hits: list[str], snippets: list[str]) -> str:
     normalized_hits = [str(h or "").strip().lower() for h in hits if str(h or "").strip()]
     cleaned_snippets = [s for s in snippets if str(s or "").strip()]
     relevant_snippets: list[str] = []
@@ -201,13 +249,10 @@ def _semantic_negative_via_gemini(
                 relevant_snippets.append(s)
     if not relevant_snippets:
         relevant_snippets = cleaned_snippets[:2]
+    return "\n\n".join(relevant_snippets[:3]).strip()[:3000]
 
-    content = "\n\n".join(relevant_snippets[:3]).strip()
-    if not content:
-        return (None, "semantic_disabled:empty_snippets")
-    if len(content) > 3000:
-        content = content[:3000]
 
+def _semantic_prompt(code: str, name: str, hits: list[str], content: str) -> tuple[str, str]:
     system_prompt = (
         "你是A股舆情风控判定器。任务是判断新闻是否构成【极端负面实锤风险】。\n"
         "极端负面=监管立案属实、财务造假属实、退市风险、重大诉讼败诉、债务违约等会显著打击股价的事件。\n"
@@ -221,11 +266,32 @@ def _semantic_negative_via_gemini(
         f"{content}\n\n"
         '输出格式: {{"is_extreme_negative": true|false, "reason": "<20字内原因>"}}'
     )
+    return system_prompt, user_message
+
+
+def _semantic_negative_via_llm(
+    code: str,
+    name: str,
+    hits: list[str],
+    snippets: list[str],
+) -> tuple[bool | None, str | None]:
+    """关键词命中后的二次语义判定。直接走 RAG_SEMANTIC_* 三变量，不绑定任何 provider。"""
+    if not RAG_SEMANTIC_VETO_ENABLED:
+        return (None, None)
+    if not RAG_SEMANTIC_API_KEY or not RAG_SEMANTIC_MODEL or not RAG_SEMANTIC_BASE_URL:
+        return (None, "semantic_disabled:missing_RAG_SEMANTIC_*_config")
+
+    from integrations.llm_client import _call_openai_compatible
+
+    content = _semantic_news_content(hits, snippets)
+    if not content:
+        return (None, "semantic_disabled:empty_snippets")
+    system_prompt, user_message = _semantic_prompt(code, name, hits, content)
     try:
-        raw = call_llm(
-            provider="gemini",
+        raw = _call_openai_compatible(
+            base_url=RAG_SEMANTIC_BASE_URL,
+            api_key=RAG_SEMANTIC_API_KEY,
             model=RAG_SEMANTIC_MODEL,
-            api_key=api_key,
             system_prompt=system_prompt,
             user_message=user_message,
             timeout=max(RAG_SEMANTIC_TIMEOUT, 8),
@@ -269,15 +335,16 @@ def _scan_one(code: str, name: str, keywords: list[str]) -> VetoResult:
         content = str(item.get("content", "")).strip()
         merged = f"{title}\n{content}".strip()
         if merged:
-            text_parts.append(merged.lower())
+            text_parts.append(merged)
             semantic_snippets.append(merged)
         if title:
             evidence.append(title)
-    combined = "\n".join(text_parts)
     relevant_count = len(results)
     elapsed_ms = int((time.perf_counter() - started) * 1000)
 
-    hits = _extract_hits(combined, keywords)
+    hits, hit_evidence = _extract_hits_strict(text_parts, keywords, code, name)
+    if hit_evidence:
+        evidence = hit_evidence + [e for e in evidence if e not in hit_evidence]
     if not hits:
         return VetoResult(
             code=code,
@@ -296,7 +363,7 @@ def _scan_one(code: str, name: str, keywords: list[str]) -> VetoResult:
     semantic_negative: bool | None = None
     semantic_reason: str | None = None
     semantic_err: str | None = None
-    verdict, reason_or_err = _semantic_negative_via_gemini(
+    verdict, reason_or_err = _semantic_negative_via_llm(
         code=code,
         name=name,
         hits=hits,
@@ -308,7 +375,7 @@ def _scan_one(code: str, name: str, keywords: list[str]) -> VetoResult:
         semantic_reason = reason_or_err
         veto = bool(verdict)
     else:
-        veto = True
+        veto = False
         semantic_err = reason_or_err
 
     return VetoResult(

@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
 
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 11
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -123,11 +123,29 @@ CREATE TABLE IF NOT EXISTS tail_buy_history (
     signal_type TEXT DEFAULT '',
     status TEXT DEFAULT '',
     final_decision TEXT NOT NULL,
+    rule_decision TEXT DEFAULT '',
     rule_score REAL DEFAULT 0,
     priority_score REAL DEFAULT 0,
     rule_reasons TEXT DEFAULT '',
     llm_decision TEXT DEFAULT '',
     llm_reason TEXT DEFAULT '',
+    llm_confidence REAL,
+    llm_model_used TEXT DEFAULT '',
+    initial_price REAL DEFAULT 0,
+    current_price REAL DEFAULT 0,
+    change_pct REAL DEFAULT 0,
+    price_updated_at TEXT DEFAULT '',
+    last_close REAL DEFAULT 0,
+    vwap REAL DEFAULT 0,
+    dist_vwap_pct REAL DEFAULT 0,
+    close_pos REAL DEFAULT 0,
+    day_ret_pct REAL DEFAULT 0,
+    last30_ret_pct REAL DEFAULT 0,
+    last15_ret_pct REAL DEFAULT 0,
+    tail30_volume_share REAL DEFAULT 0,
+    drop_from_high_pct REAL DEFAULT 0,
+    fetch_error TEXT DEFAULT '',
+    features_json TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now')),
     UNIQUE(code, run_date)
 );
@@ -144,6 +162,12 @@ CREATE TABLE IF NOT EXISTS background_task_result (
     UNIQUE(task_id)
 );
 
+CREATE TABLE IF NOT EXISTS theme_radar_snapshot (
+    trade_date TEXT PRIMARY KEY,
+    snapshot_json TEXT NOT NULL,
+    synced_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_rec_date ON recommendation_tracking(recommend_date);
 CREATE INDEX IF NOT EXISTS idx_sig_status ON signal_pending(status);
 CREATE INDEX IF NOT EXISTS idx_mem_type ON agent_memory(memory_type);
@@ -156,6 +180,7 @@ CREATE INDEX IF NOT EXISTS idx_tail_run_date ON tail_buy_history(run_date);
 CREATE INDEX IF NOT EXISTS idx_tail_decision ON tail_buy_history(final_decision);
 CREATE INDEX IF NOT EXISTS idx_bg_task_session ON background_task_result(session_id);
 CREATE INDEX IF NOT EXISTS idx_bg_task_created ON background_task_result(created_at);
+CREATE INDEX IF NOT EXISTS idx_theme_radar_synced ON theme_radar_snapshot(synced_at);
 
 -- FTS5 全文检索索引（记忆系统 hybrid search）
 CREATE VIRTUAL TABLE IF NOT EXISTS agent_memory_fts USING fts5(
@@ -200,6 +225,7 @@ def init_db() -> None:
     conn = get_db()
     conn.executescript(_DDL)
     _ensure_agent_memory_columns(conn)
+    _ensure_tail_buy_history_columns(conn)
     cur = conn.execute("SELECT MAX(version) FROM schema_version")
     row = cur.fetchone()
     current = row[0] if row and row[0] else 0
@@ -219,6 +245,8 @@ def init_db() -> None:
             logger.warning("migration: add metadata column failed", exc_info=True)
     if current < 8:
         _ensure_agent_memory_columns(conn)
+    if current < 9:
+        _ensure_tail_buy_history_columns(conn)
     if current < _SCHEMA_VERSION:
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version) VALUES(?)",
@@ -240,6 +268,33 @@ def _ensure_agent_memory_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE agent_memory ADD COLUMN {name} {ddl}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_level ON agent_memory(memory_level)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_source ON agent_memory(source_ref)")
+
+
+def _ensure_tail_buy_history_columns(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(tail_buy_history)").fetchall()}
+    columns = {
+        "rule_decision": "TEXT DEFAULT ''",
+        "llm_confidence": "REAL",
+        "llm_model_used": "TEXT DEFAULT ''",
+        "initial_price": "REAL DEFAULT 0",
+        "current_price": "REAL DEFAULT 0",
+        "change_pct": "REAL DEFAULT 0",
+        "price_updated_at": "TEXT DEFAULT ''",
+        "last_close": "REAL DEFAULT 0",
+        "vwap": "REAL DEFAULT 0",
+        "dist_vwap_pct": "REAL DEFAULT 0",
+        "close_pos": "REAL DEFAULT 0",
+        "day_ret_pct": "REAL DEFAULT 0",
+        "last30_ret_pct": "REAL DEFAULT 0",
+        "last15_ret_pct": "REAL DEFAULT 0",
+        "tail30_volume_share": "REAL DEFAULT 0",
+        "drop_from_high_pct": "REAL DEFAULT 0",
+        "fetch_error": "TEXT DEFAULT ''",
+        "features_json": "TEXT DEFAULT ''",
+    }
+    for name, ddl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE tail_buy_history ADD COLUMN {name} {ddl}")
 
 
 def _backfill_background_tasks_from_chat_log(conn: sqlite3.Connection) -> None:
@@ -403,16 +458,22 @@ def delete_recommendations(codes: list[str]) -> int:
 
 def load_signals(*, status: str | None = None, limit: int = 200) -> list[dict]:
     conn = get_db()
-    if status:
-        cur = conn.execute(
-            "SELECT * FROM signal_pending WHERE status=? ORDER BY signal_date DESC LIMIT ?",
-            (status, limit),
-        )
-    else:
-        cur = conn.execute(
-            "SELECT * FROM signal_pending ORDER BY signal_date DESC LIMIT ?",
-            (limit,),
-        )
+    try:
+        if status:
+            cur = conn.execute(
+                "SELECT * FROM signal_pending WHERE status=? ORDER BY signal_date DESC LIMIT ?",
+                (status, limit),
+            )
+        else:
+            cur = conn.execute(
+                "SELECT * FROM signal_pending ORDER BY signal_date DESC LIMIT ?",
+                (limit,),
+            )
+    except sqlite3.OperationalError as exc:
+        if "no such table: signal_pending" in str(exc).lower():
+            logger.info("local signal_pending table is unavailable; returning empty signal cache")
+            return []
+        raise
     return [dict(r) for r in cur.fetchall()]
 
 
@@ -421,10 +482,16 @@ def load_signals_by_codes(codes: list[str]) -> dict[str, dict]:
         return {}
     conn = get_db()
     ph = ",".join("?" for _ in codes)
-    cur = conn.execute(
-        f"SELECT * FROM signal_pending WHERE code IN ({ph}) ORDER BY signal_date DESC",
-        codes,
-    )
+    try:
+        cur = conn.execute(
+            f"SELECT * FROM signal_pending WHERE code IN ({ph}) ORDER BY signal_date DESC",
+            codes,
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table: signal_pending" in str(exc).lower():
+            logger.info("local signal_pending table is unavailable; returning empty signal cache")
+            return {}
+        raise
     result: dict[str, dict] = {}
     for r in cur.fetchall():
         row = dict(r)
@@ -470,6 +537,41 @@ def load_latest_market_signal() -> dict | None:
         return None
     try:
         return json.loads(row["data_json"])
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Theme radar snapshot
+# ---------------------------------------------------------------------------
+
+
+def save_theme_radar_snapshot(snapshot: dict[str, Any]) -> None:
+    trade_date = str(snapshot.get("trade_date", "") or "").strip()
+    if not trade_date:
+        raise ValueError("theme radar snapshot requires trade_date")
+    conn = get_db()
+    with conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO theme_radar_snapshot
+               (trade_date, snapshot_json, synced_at) VALUES (?, ?, datetime('now'))""",
+            (trade_date, json.dumps(snapshot, ensure_ascii=False, default=str)),
+        )
+
+
+def load_latest_theme_radar_snapshot() -> dict | None:
+    conn = get_db()
+    try:
+        cur = conn.execute("SELECT snapshot_json FROM theme_radar_snapshot ORDER BY trade_date DESC LIMIT 1")
+    except sqlite3.OperationalError as exc:
+        if "no such table: theme_radar_snapshot" in str(exc).lower():
+            return None
+        raise
+    row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row["snapshot_json"])
     except (json.JSONDecodeError, TypeError):
         return None
 
@@ -681,6 +783,8 @@ def search_memory(
     *,
     codes: list[str] | None = None,
     keyword: str | None = None,
+    memory_level: str | None = None,
+    since: str | None = None,
     limit: int = 10,
 ) -> list[dict]:
     conn = get_db()
@@ -695,6 +799,12 @@ def search_memory(
     if keyword:
         clauses.append("content LIKE ?")
         params.append(f"%{keyword}%")
+    if memory_level:
+        clauses.append("memory_level=?")
+        params.append(memory_level)
+    if since:
+        clauses.append("created_at >= ?")
+        params.append(since)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     cur = conn.execute(
         f"SELECT * FROM agent_memory {where} ORDER BY created_at DESC LIMIT ?",
@@ -703,18 +813,30 @@ def search_memory(
     return [dict(r) for r in cur.fetchall()]
 
 
-def get_recent_memories(*, memory_type: str | None = None, limit: int = 20) -> list[dict]:
+def get_recent_memories(
+    *,
+    memory_type: str | None = None,
+    memory_level: str | None = None,
+    since: str | None = None,
+    limit: int = 20,
+) -> list[dict]:
     conn = get_db()
+    clauses: list[str] = []
+    params: list[Any] = []
     if memory_type:
-        cur = conn.execute(
-            "SELECT * FROM agent_memory WHERE memory_type=? ORDER BY created_at DESC LIMIT ?",
-            (memory_type, limit),
-        )
-    else:
-        cur = conn.execute(
-            "SELECT * FROM agent_memory ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        )
+        clauses.append("memory_type=?")
+        params.append(memory_type)
+    if memory_level:
+        clauses.append("memory_level=?")
+        params.append(memory_level)
+    if since:
+        clauses.append("created_at >= ?")
+        params.append(since)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    cur = conn.execute(
+        f"SELECT * FROM agent_memory {where} ORDER BY created_at DESC LIMIT ?",
+        params + [limit],
+    )
     return [dict(r) for r in cur.fetchall()]
 
 
@@ -995,28 +1117,51 @@ def save_tail_buy_results(rows: list[dict]) -> int:
         conn.executemany(
             """INSERT OR REPLACE INTO tail_buy_history
                (code, name, run_date, signal_date, signal_type, status,
-                final_decision, rule_score, priority_score, rule_reasons,
-                llm_decision, llm_reason, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
-            [
-                (
-                    str(r.get("code", "")).strip(),
-                    str(r.get("name", "")).strip(),
-                    str(r.get("run_date", "")).strip(),
-                    str(r.get("signal_date", "")).strip(),
-                    str(r.get("signal_type", "")).strip(),
-                    str(r.get("status", "")).strip(),
-                    str(r.get("final_decision", "")).strip(),
-                    float(r.get("rule_score", 0) or 0),
-                    float(r.get("priority_score", 0) or 0),
-                    str(r.get("rule_reasons", "")).strip(),
-                    str(r.get("llm_decision", "")).strip(),
-                    str(r.get("llm_reason", "")).strip(),
-                )
-                for r in rows
-            ],
+                final_decision, rule_decision, rule_score, priority_score, rule_reasons,
+                llm_decision, llm_reason, llm_confidence, llm_model_used,
+                initial_price, current_price, change_pct, price_updated_at,
+                last_close, vwap, dist_vwap_pct, close_pos, day_ret_pct,
+                last30_ret_pct, last15_ret_pct, tail30_volume_share, drop_from_high_pct,
+                fetch_error, features_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+            [_tail_buy_insert_values(r) for r in rows],
         )
     return len(rows)
+
+
+def _tail_buy_insert_values(r: dict) -> tuple[Any, ...]:
+    return (
+        str(r.get("code", "")).strip(),
+        str(r.get("name", "")).strip(),
+        str(r.get("run_date", "")).strip(),
+        str(r.get("signal_date", "")).strip(),
+        str(r.get("signal_type", "")).strip(),
+        str(r.get("status", "")).strip(),
+        str(r.get("final_decision", "")).strip(),
+        str(r.get("rule_decision", "")).strip(),
+        float(r.get("rule_score", 0) or 0),
+        float(r.get("priority_score", 0) or 0),
+        str(r.get("rule_reasons", "")).strip(),
+        str(r.get("llm_decision", "")).strip(),
+        str(r.get("llm_reason", "")).strip(),
+        r.get("llm_confidence"),
+        str(r.get("llm_model_used", "")).strip(),
+        float(r.get("initial_price", 0) or 0),
+        float(r.get("current_price", 0) or 0),
+        float(r.get("change_pct", 0) or 0),
+        str(r.get("price_updated_at", "")).strip(),
+        float(r.get("last_close", 0) or 0),
+        float(r.get("vwap", 0) or 0),
+        float(r.get("dist_vwap_pct", 0) or 0),
+        float(r.get("close_pos", 0) or 0),
+        float(r.get("day_ret_pct", 0) or 0),
+        float(r.get("last30_ret_pct", 0) or 0),
+        float(r.get("last15_ret_pct", 0) or 0),
+        float(r.get("tail30_volume_share", 0) or 0),
+        float(r.get("drop_from_high_pct", 0) or 0),
+        str(r.get("fetch_error", "")).strip(),
+        str(r.get("features_json", "")).strip(),
+    )
 
 
 def load_tail_buy_history(
