@@ -275,6 +275,16 @@ def _call_openai_compatible(
     text = (msg.get("content") or "").strip()
     if not text:
         raise RuntimeError("OpenAI 兼容接口返回内容为空")
+    # 编码修正：部分代理（如 127.0.0.1:20128）在长响应时会把
+    # UTF-8 字节以 Latin-1 再次编码，导致双重重编码乱码。
+    # 尝试 text.encode('latin-1').decode('utf-8') 恢复原始中文。
+    if len(text) > 10 and any(ord(c) > 127 for c in text):
+        try:
+            fixed = text.encode("latin-1").decode("utf-8")
+            if any("\u4e00" <= c <= "\u9fff" for c in fixed):
+                text = fixed
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
     return text
 
 
