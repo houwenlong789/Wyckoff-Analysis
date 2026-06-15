@@ -223,10 +223,6 @@ def _call_openai_compatible(
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        # 强制要求 JSON 响应：部分 OpenAI 兼容代理（如 wl.thlws.com）会
-        # 把非流式请求错误地以 text/event-stream 返回并在末尾追加
-        # `data: [DONE]`，导致 resp.json() 抛 JSONDecodeError。
-        "Accept": "application/json",
     }
     max_tokens = int(max_output_tokens) if max_output_tokens is not None else 8192
     payload = {
@@ -237,21 +233,41 @@ def _call_openai_compatible(
         ],
         "max_tokens": max(256, max_tokens),
         "temperature": 0.4,
-        "stream": False,
     }
     resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
     if resp.status_code != 200:
         raise RuntimeError(f"OpenAI 兼容接口 HTTP {resp.status_code}: {resp.text[:500]}")
-    try:
-        data = resp.json()
-    except ValueError as e:
-        # 兜底：万一代理仍误返 SSE 格式，剥掉末尾的 data: [DONE] 再解析
-        body = resp.text
-        if body.rstrip().endswith("data: [DONE]"):
-            body = body.rstrip()[: -len("data: [DONE]")].rstrip()
-            data = json.loads(body)
+    body = (resp.text or "").strip()
+    is_sse = body.startswith("data:") or "text/event-stream" in (resp.headers.get("content-type", "") or "").lower()
+    if is_sse:
+        data = {}
+        # 部分代理会把多段拼接成一行，先按 \n 拆，必要时再按 "data:" 拆
+        if "\n" in body:
+            for line in body.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped == "data: [DONE]":
+                    continue
+                if stripped.startswith("data:"):
+                    payload_str = stripped[5:].strip()
+                    if payload_str and payload_str != "[DONE]":
+                        data = json.loads(payload_str)
+                        break
         else:
-            raise RuntimeError(f"OpenAI 兼容接口响应非 JSON: {e}; body[:300]={resp.text[:300]!r}") from e
+            # 单行拼接：按 "data:" 分段，丢弃末尾的 [DONE]
+            chunks = body.split("data:")
+            for chunk in chunks:
+                chunk = chunk.strip()
+                if not chunk or chunk == "[DONE]":
+                    continue
+                if chunk.endswith("data: [DONE]"):
+                    chunk = chunk[: -len("data: [DONE]")].strip()
+                try:
+                    data = json.loads(chunk)
+                    break
+                except json.JSONDecodeError:
+                    continue
+    else:
+        data = json.loads(body)
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError("OpenAI 兼容接口返回无 choices")
