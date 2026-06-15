@@ -46,6 +46,28 @@ def test_render_theme_radar_html_outputs_grouped_cards() -> None:
     assert "光模块龙头" in html
 
 
+def test_notify_report_sends_feishu(monkeypatch) -> None:
+    from scripts import theme_radar_job as mod
+
+    captured: dict[str, str] = {}
+    monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://example.invalid/webhook")
+    monkeypatch.setattr(
+        mod,
+        "send_feishu_notification",
+        lambda webhook, title, content: (
+            captured.update({"webhook": webhook, "title": title, "content": content}) or True
+        ),
+    )
+
+    mod._notify_report({"trade_date": "2026-06-12"}, "# report")
+
+    assert captured == {
+        "webhook": "https://example.invalid/webhook",
+        "title": "主线雷达周报 2026-06-12",
+        "content": "# report",
+    }
+
+
 def _snapshot() -> dict:
     return {
         "trade_date": "2026-05-27",

@@ -6,6 +6,7 @@ from cli.memory import (
     build_memory_context,
     extract_stock_codes,
     prepend_memory_context,
+    refresh_memory_layers,
     save_session_summary,
 )
 
@@ -116,6 +117,18 @@ class TestBuildMemoryContext:
         finally:
             _close_tmp_db(local_db)
 
+    def test_dedupes_pinned_preferences_from_hybrid_results(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "不追涨", codes="000001")
+
+            context = build_memory_context("000001 不追涨")
+
+            assert context.count("不追涨") == 1
+            assert "# 用户画像" in context
+        finally:
+            _close_tmp_db(local_db)
+
     def test_prepends_memory_context_to_current_turn_only(self):
         message = prepend_memory_context("今天怎么看？", "<relevant-memories>\nA\n</relevant-memories>")
 
@@ -160,12 +173,70 @@ class TestSaveSessionSummary:
 
             memories = local_db.get_recent_memories(limit=10)
             types = {m["memory_type"] for m in memories}
-            assert types == {"decision", "preference"}
+            assert types == {"decision", "preference", "session"}
             assert any(m["source_ref"] == "chat_log:s1" for m in memories)
         finally:
             _close_tmp_db(local_db)
 
-    def test_dedup_unknown_duplicate_id_still_saves(self, monkeypatch, tmp_path):
+    def test_repeated_session_summary_hash_skips_llm(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            provider = _Provider(["[偏好] 不追涨"])
+            messages = [
+                {"role": "user", "content": "看看 000001"},
+                {"role": "assistant", "tool_calls": [{"id": "tc1", "name": "analyze_stock", "args": {}}]},
+                {"role": "tool", "content": '{"code":"000001"}'},
+                {"role": "assistant", "content": "先观察。"},
+            ]
+
+            save_session_summary(messages, provider, session_id="s1")
+            save_session_summary(messages, provider, session_id="s1")
+
+            memories = local_db.get_recent_memories(memory_type="preference", limit=10)
+            assert [m["content"] for m in memories] == ["不追涨"]
+            assert provider.outputs == []
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_no_memory_summary_is_marked_processed(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            provider = _Provider(["无"])
+            messages = [
+                {"role": "user", "content": "看看 000001"},
+                {"role": "assistant", "tool_calls": [{"id": "tc1", "name": "analyze_stock", "args": {}}]},
+                {"role": "tool", "content": '{"code":"000001"}'},
+                {"role": "assistant", "content": "没有新增偏好。"},
+            ]
+
+            save_session_summary(messages, provider, session_id="s1")
+            save_session_summary(messages, provider, session_id="s1")
+
+            assert local_db.get_recent_memories(memory_type="preference", limit=10) == []
+            assert len(local_db.get_recent_memories(memory_type="session", limit=10)) == 1
+            assert provider.outputs == []
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_deterministic_dedup_skips_exact_memory_without_llm(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "不追涨", codes="000001")
+
+            saved = _save_summary_memories(
+                "[偏好] 不 追 涨",
+                "000001",
+                "chat_log:s2",
+                _FailingProvider(),
+            )
+
+            memories = local_db.get_recent_memories(memory_type="preference", limit=10)
+            assert saved == 0
+            assert [m["content"] for m in memories] == ["不追涨"]
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_dedup_unknown_duplicate_id_skips_save(self, monkeypatch, tmp_path):
         local_db = _init_tmp_db(monkeypatch, tmp_path)
         try:
             local_db.save_memory("preference", "旧偏好", codes="000001")
@@ -180,12 +251,40 @@ class TestSaveSessionSummary:
             )
 
             memories = local_db.get_recent_memories(memory_type="preference", limit=10)
-            assert saved == 1
-            assert any(m["content"] == "新偏好" for m in memories)
+            assert saved == 0
+            assert [m["content"] for m in memories] == ["旧偏好"]
         finally:
             _close_tmp_db(local_db)
 
-    def test_dedup_failure_still_saves(self, monkeypatch, tmp_path):
+    def test_refresh_layers_is_incremental(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "偏好一")
+            local_db.save_memory("decision", "决策一")
+            local_db.save_memory("preference", "偏好二")
+
+            provider = _Provider(["[画像] 用户偏好确认后再交易\n[场景] 有放量确认才加仓"])
+            assert refresh_memory_layers(provider) == 2
+            assert provider.outputs == []
+
+            same_source_provider = _Provider(["[画像] 不应再次调用"])
+            assert refresh_memory_layers(same_source_provider) == 0
+            assert same_source_provider.outputs == ["[画像] 不应再次调用"]
+
+            local_db.save_memory("decision", "决策二")
+            local_db.save_memory("preference", "偏好三")
+            two_new_provider = _Provider(["[画像] 不足三条新 L1 不调用"])
+            assert refresh_memory_layers(two_new_provider) == 0
+            assert two_new_provider.outputs == ["[画像] 不足三条新 L1 不调用"]
+
+            local_db.save_memory("decision", "决策三")
+            next_provider = _Provider(["[画像] 用户偏好等待确认\n[场景] 趋势确认后再执行"])
+            assert refresh_memory_layers(next_provider) == 2
+            assert next_provider.outputs == []
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_dedup_failure_skips_save(self, monkeypatch, tmp_path):
         local_db = _init_tmp_db(monkeypatch, tmp_path)
         try:
             local_db.save_memory("preference", "旧偏好", codes="000001")
@@ -198,7 +297,25 @@ class TestSaveSessionSummary:
             )
 
             memories = local_db.get_recent_memories(memory_type="preference", limit=10)
-            assert saved == 1
-            assert any(m["content"] == "新偏好" for m in memories)
+            assert saved == 0
+            assert [m["content"] for m in memories] == ["旧偏好"]
+        finally:
+            _close_tmp_db(local_db)
+
+    def test_invalid_dedup_response_skips_save(self, monkeypatch, tmp_path):
+        local_db = _init_tmp_db(monkeypatch, tmp_path)
+        try:
+            local_db.save_memory("preference", "旧偏好", codes="000001")
+
+            saved = _save_summary_memories(
+                "[偏好] 新偏好",
+                "000001",
+                "chat_log:s2",
+                _Provider(["MAYBE"]),
+            )
+
+            memories = local_db.get_recent_memories(memory_type="preference", limit=10)
+            assert saved == 0
+            assert [m["content"] for m in memories] == ["旧偏好"]
         finally:
             _close_tmp_db(local_db)

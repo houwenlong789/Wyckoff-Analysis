@@ -1,7 +1,7 @@
 import { memo, useState } from 'react'
 import { Link } from 'react-router'
 import { ChevronRight } from 'lucide-react'
-import type { ScreenResult, ScreenStockItem } from '@/lib/chat-tools'
+import type { ScreenResult, ScreenStockItem } from '@wyckoff/shared'
 
 function StockRow({ s }: { s: ScreenStockItem }) {
   const chgColor = s.change_pct != null && s.change_pct >= 0 ? 'text-red-500' : 'text-green-600'

@@ -65,7 +65,7 @@ const capabilityCopy = {
     title: 'Web 是日常工作台，后台负责重任务',
     intro: '当前 Web 端已经覆盖读盘、单股、多股、持仓、跟踪和导出这些高频动作；全市场漏斗、回测、回刷和运维任务继续放在 GitHub Actions、CLI 或数据库后台，避免把长任务和敏感权限塞进浏览器。',
     webTitle: 'Web 端已经接入',
-    webItems: ['单股 320 日日线结构图、价值快照、AI 报告与本地历史', '多股对抗的相对强弱、叠加/分图、价值面校准与本地历史', '持仓诊断支持数据库持仓和手动持仓，结果保存在当前浏览器', '形态跟踪、尾盘记录、批量行情导出、模型和数据源配置'],
+    webItems: ['单股 320 日日线结构图、价值快照、AI 报告与本地历史', '多股对抗的相对强弱、叠加/分图、价值面校准与本地历史', '持仓诊断支持数据库持仓和手动持仓，结果保存在当前浏览器', '白名单形态跟踪、白名单尾盘记录、批量行情导出、模型和数据源配置'],
     gapTitle: '系统有，但不放在 Web 里主跑',
     whyTitle: '为什么不全塞进 Web',
     costLinkText: '成本详见：COST_MODEL.md',
@@ -76,7 +76,7 @@ const capabilityCopy = {
     title: 'The web UI is the daily desk; background jobs carry the heavy work',
     intro: 'The web UI now covers the high-frequency loops: reading, single-stock analysis, stock battle, portfolio diagnosis, tracking, and export. Full-market funnels, backtests, repricing, and maintenance stay in GitHub Actions, CLI, or database-side jobs instead of pushing long jobs and sensitive permissions into the browser.',
     webTitle: 'Covered by the web UI',
-    webItems: ['Single-stock 320-day chart, value snapshot, AI report, and local history', 'Stock battle with relative strength, overlay/separate charts, value calibration, and local history', 'Portfolio diagnosis for database or manual positions, with browser-local result history', 'Pattern tracking, tail-buy logs, batch market-data export, model and data-source settings'],
+    webItems: ['Single-stock 320-day chart, value snapshot, AI report, and local history', 'Stock battle with relative strength, overlay/separate charts, value calibration, and local history', 'Portfolio diagnosis for database or manual positions, with browser-local result history', 'Allowlisted pattern tracking, allowlisted tail-buy logs, batch market-data export, model and data-source settings'],
     gapTitle: 'Available in the system, but not browser-first',
     whyTitle: 'Why not put everything in the browser',
     costLinkText: 'Cost details: COST_MODEL.md',
@@ -96,7 +96,7 @@ const capabilityCopy = {
 
 const capabilityGaps = {
   'zh-CN': [
-    ['全市场漏斗任务', 'A股、港股、美股每日全市场扫描、L1-L4 分层、信号写库与飞书推送仍主要跑在 GitHub Actions。'],
+    ['全市场漏斗任务', 'A股保留完整 AI/通知链路；港股、美股每日扫描只写跟踪表并产出 Actions artifact。'],
     ['LLM 输入预览与飞书产物', '每日审核输入、完整报告、文件/文档分发更适合由 Actions 产出，Web 只承接查询和轻量分析。'],
     ['回测与参数网格', '牛熊周期、TopN、止损/止盈/持仓天数等批量计算适合后台长任务，Web 目前只展示部分结果。'],
     ['信号生命周期与补价回刷', 'pending/confirmed/expired、推荐表现回刷、30 个交易日保留、MFE/MAE 统计都在后台维护。'],
@@ -105,7 +105,7 @@ const capabilityGaps = {
     ['维护与数据库任务', '缓存清理、RLS/服务端密钥操作、日志 artifact、全量清库/回刷属于运维能力，Web 只保留安全入口。'],
   ],
   'en-US': [
-    ['Full-market funnel jobs', 'A-share, HK, and US market scans, L1-L4 layering, signal writes, and Feishu pushes mainly run in GitHub Actions.'],
+    ['Full-market funnel jobs', 'A-share scans run the full AI/notification pipeline; HK and US scans write tracking tables and artifacts only.'],
     ['LLM input previews and Feishu artifacts', 'Daily review inputs, full reports, and file/doc distribution fit Actions better; the web UI handles querying and lightweight analysis.'],
     ['Backtests and parameter grids', 'Bull/bear windows, TopN, stop-loss, take-profit, and holding-day grids are long-running backend workloads.'],
     ['Signal lifecycle and repricing', 'pending/confirmed/expired updates, recommendation repricing, 30-trading-day retention, and MFE/MAE stats run in background jobs.'],
@@ -122,26 +122,29 @@ const capabilityReasons = {
 
 const capabilityLaunch = {
   'zh-CN': {
-    kicker: '开放预告',
+    kicker: '正式开放',
     date: '2026-06-03',
-    title: '将开放知识星球、闲鱼等加入方式',
-    desc: '如果你对这个项目感兴趣，可以和我一起使用漏斗、回测、单票复盘、尾盘策略、持仓诊断等完整能力，而不只停留在 Web 端的轻量入口。',
-    badge: '完整能力',
-    tags: ['完整漏斗能力', '回测与复盘', '多市场数据', '一起迭代'],
+    title: '「威科夫策略交流学习」知识星球',
+    desc: '知识星球现已正式开放！年费仅需 518 元/年（折合每天仅约 1.4 元），518 也取「我要发」的好彩头。项目本身将始终保持开源，并热忱欢迎大家 fork 自行部署、提交 Issue 与 PR。如果您希望免除数据源接口订阅与复杂的云端环境维护工作（个人部署硬件与 API 纯开销高达 20,000+ 元/年），加入星球即可共享云端多端同步、全市场漏斗推送及专属交流社区。',
+    note: '费用主要用于共同平摊数据源、数据库、云服务器、AI API 和自动化任务等系统运维硬成本；不是投资顾问费，也不构成任何收益承诺。',
+    badge: '星球会员特权',
+    tags: ['云端数据同步', '每日漏斗推送', '自动 AI 研报', '专属交流社群'],
   },
   'en-US': {
-    kicker: 'Access preview',
+    kicker: 'Now Open',
     date: '2026-06-03',
-    title: 'Knowledge Planet, Xianyu, and similar access channels will open',
-    desc: 'If this project resonates with you, you can join me to use the full funnel, backtest, replay, tail-buy, and portfolio diagnosis workflows beyond the lightweight web cockpit.',
-    badge: 'Full Access',
-    tags: ['Full funnel', 'Backtest & replay', 'Multi-market data', 'Build together'],
+    title: 'Wyckoff Strategy Learning Planet',
+    desc: 'Knowledge Planet is officially launched! Membership is just 518 CNY/year (about 1.4 CNY/day); 518 is also an auspicious Chinese wordplay for “I want to prosper”. The project itself will always remain open source, and we welcome forks, issues, and PRs. If you wish to bypass local DevOps and API subscriptions (which cost over 20,000+ CNY/year individually), joining the shared cloud gives you cloud sync, daily scans, and the private community.',
+    note: 'The fee mainly helps share hard operating costs such as data feeds, databases, cloud servers, AI APIs, and scheduled automation; it is not an investment advisory fee and does not imply any return guarantee.',
+    badge: 'Member Benefits',
+    tags: ['Cloud Sync', 'Daily Funnel Push', 'AI Report Alerts', 'Quant Community'],
   },
 } satisfies Record<Locale, {
   kicker: string
   date: string
   title: string
   desc: string
+  note: string
   badge: string
   tags: string[]
 }>
@@ -287,7 +290,7 @@ function CapabilityLaunchBanner({ locale }: { locale: Locale }) {
   return (
     <article className="relative mb-5 overflow-hidden rounded-2xl border border-amber-300/50 bg-[radial-gradient(circle_at_top_left,rgba(245,158,11,0.26),transparent_36%),linear-gradient(135deg,rgba(15,23,42,0.96),rgba(88,28,135,0.85)_48%,rgba(180,83,9,0.88))] p-5 text-white shadow-lg shadow-amber-900/10">
       <div className="absolute -right-10 -top-10 h-36 w-36 rounded-full border border-white/20 bg-white/10 blur-sm" />
-      <div className="relative grid gap-5 lg:grid-cols-[1fr_280px] lg:items-center">
+      <div className="relative grid gap-5 lg:grid-cols-[1fr_300px] lg:items-center">
         <div>
           <div className="flex flex-wrap items-center gap-2">
             <span className="inline-flex items-center gap-1 rounded-full border border-white/20 bg-white/15 px-3 py-1 text-xs font-semibold backdrop-blur">
@@ -300,19 +303,29 @@ function CapabilityLaunchBanner({ locale }: { locale: Locale }) {
             </span>
           </div>
           <h3 className="mt-4 text-2xl font-semibold tracking-tight">{copy.title}</h3>
-          <p className="mt-2 max-w-3xl text-sm leading-6 text-white/78">{copy.desc}</p>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-white/90">{copy.desc}</p>
+          <p className="mt-3 flex max-w-3xl items-start gap-2 rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-xs leading-5 text-white/85">
+            <AlertTriangle className="mt-0.5 shrink-0" size={14} />
+            <span>{copy.note}</span>
+          </p>
         </div>
-        <div className="rounded-2xl border border-white/15 bg-white/10 p-4 backdrop-blur">
-          <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
-            <Users size={16} />
-            {copy.badge}
+        <div className="rounded-2xl border border-white/15 bg-white/10 p-4 backdrop-blur flex flex-col items-center gap-4 sm:flex-row lg:flex-col lg:items-center">
+          <div className="w-full">
+            <div className="mb-2 flex items-center gap-2 text-sm font-semibold">
+              <Users size={16} />
+              {copy.badge}
+            </div>
+            <div className="flex flex-wrap gap-1.5 mb-1">
+              {copy.tags.map((tag) => (
+                <span key={tag} className="rounded-full bg-white/15 px-2.5 py-0.5 text-xs text-white/90">
+                  {tag}
+                </span>
+              ))}
+            </div>
           </div>
-          <div className="flex flex-wrap gap-2">
-            {copy.tags.map((tag) => (
-              <span key={tag} className="rounded-full bg-white/15 px-3 py-1 text-xs text-white/90">
-                {tag}
-              </span>
-            ))}
+          <div className="flex flex-col items-center rounded-xl bg-white p-2 shadow-md shrink-0 w-48 transition-transform hover:scale-[1.03] duration-200">
+            <img src="/zsxq_qr.jpg" alt="Knowledge Planet QR" className="w-full h-auto object-contain rounded-lg" />
+            <span className="mt-2 text-xs font-bold text-slate-800">微信扫码 加入星球</span>
           </div>
         </div>
       </div>

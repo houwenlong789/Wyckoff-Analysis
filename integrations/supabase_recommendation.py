@@ -21,9 +21,52 @@ from core.constants import (
     TABLE_RECOMMENDATION_TRACKING_US,
 )
 from integrations.supabase_base import create_admin_client as _get_supabase_admin_client
+from integrations.supabase_base import create_read_client as _get_supabase_read_client
 from integrations.supabase_base import is_admin_configured as is_supabase_configured
+from integrations.supabase_base import require_server_write_context
 
 logger = logging.getLogger(__name__)
+RECOMMENDATION_ATTRIBUTION_COLUMNS = (
+    "primary_signal",
+    "signal_types",
+    "signal_track",
+    "market_regime",
+    "selection_source",
+    "selection_rank",
+    "selection_is_fill",
+    "priority_score",
+    "trigger_score",
+    "stage",
+    "industry",
+    "sector_state_code",
+    "sector_state",
+    "sector_note",
+    "sector_guidance",
+    "exit_signal",
+    "exit_price",
+    "exit_reason",
+    "strategic_theme",
+    "strategic_theme_score",
+    "strategic_stock_score",
+    "strategic_theme_state",
+    "strategic_theme_bonus",
+    "springboard_a",
+    "springboard_b",
+    "springboard_c",
+    "springboard_combo",
+    "springboard_grade",
+    "springboard_met_count",
+    "springboard_support",
+    "springboard_touch_count",
+    "springboard_evidence",
+    "springboard_scored",
+)
+RECOMMENDATION_OPTIONAL_COLUMNS = (
+    "is_ai_recommended",
+    "funnel_score",
+    "recommend_count",
+    *RECOMMENDATION_ATTRIBUTION_COLUMNS,
+)
 RECOMMENDATION_BACKUP_COLUMNS = (
     "code",
     "name",
@@ -35,6 +78,7 @@ RECOMMENDATION_BACKUP_COLUMNS = (
     "recommend_count",
     "funnel_score",
     "is_ai_recommended",
+    *RECOMMENDATION_ATTRIBUTION_COLUMNS,
     "updated_at",
 )
 
@@ -320,6 +364,134 @@ def _extract_recommendation_score(row: dict[str, Any]) -> float | None:
     return None
 
 
+def _optional_text(raw: Any) -> str | None:
+    text = str(raw or "").strip()
+    return text or None
+
+
+def _optional_float(raw: Any) -> float | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        value = float(raw)
+    except Exception:
+        return None
+    return value if pd.notna(value) else None
+
+
+def _optional_int(raw: Any) -> int | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _optional_bool(raw: Any) -> bool | None:
+    if isinstance(raw, bool):
+        return raw
+    if raw is None or raw == "":
+        return None
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "y"}:
+        return True
+    if text in {"0", "false", "no", "n"}:
+        return False
+    return None
+
+
+def _optional_text_list(raw: Any) -> list[str]:
+    if raw is None or raw == "":
+        return []
+    values = raw if isinstance(raw, list | tuple | set) else str(raw).split(",")
+    return [text for item in values if (text := str(item or "").strip())]
+
+
+def _optional_json(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return value if isinstance(value, dict) else {}
+    return {}
+
+
+def _springboard_combo(row: dict[str, Any]) -> str:
+    combo = _optional_text(row.get("springboard_combo")) or _optional_text(row.get("springboard_grade"))
+    if combo:
+        return combo
+    parts = [
+        name
+        for name, key in (("A", "springboard_a"), ("B", "springboard_b"), ("C", "springboard_c"))
+        if _optional_bool(row.get(key))
+    ]
+    return "+".join(parts) if parts else "none"
+
+
+def _extract_recommendation_attribution(row: dict[str, Any]) -> dict[str, Any]:
+    signal_types = _optional_text_list(row.get("signal_types"))
+    primary_signal = _optional_text(row.get("primary_signal")) or (signal_types[0] if signal_types else None)
+    return {
+        "primary_signal": primary_signal,
+        "signal_types": signal_types,
+        "signal_track": _optional_text(row.get("signal_track")) or _optional_text(row.get("track")),
+        "market_regime": _optional_text(row.get("market_regime")),
+        "selection_source": _optional_text(row.get("selection_source")),
+        "selection_rank": _optional_int(row.get("selection_rank") or row.get("priority_rank")),
+        "selection_is_fill": _optional_bool(row.get("selection_is_fill")) or False,
+        "priority_score": _optional_float(row.get("priority_score")),
+        "trigger_score": _optional_float(row.get("trigger_score") if "trigger_score" in row else row.get("score")),
+        "stage": _optional_text(row.get("stage")),
+        "industry": _optional_text(row.get("industry")),
+        "sector_state_code": _optional_text(row.get("sector_state_code")),
+        "sector_state": _optional_text(row.get("sector_state")),
+        "sector_note": _optional_text(row.get("sector_note")),
+        "sector_guidance": _optional_text(row.get("sector_guidance")),
+        "exit_signal": _optional_text(row.get("exit_signal")),
+        "exit_price": _optional_float(row.get("exit_price")),
+        "exit_reason": _optional_text(row.get("exit_reason")),
+        "strategic_theme": _optional_text(row.get("strategic_theme")),
+        "strategic_theme_score": _optional_float(row.get("strategic_theme_score")),
+        "strategic_stock_score": _optional_float(row.get("strategic_stock_score")),
+        "strategic_theme_state": _optional_text(row.get("strategic_theme_state")),
+        "strategic_theme_bonus": _optional_float(row.get("strategic_theme_bonus")),
+        "springboard_a": _optional_bool(row.get("springboard_a")) or False,
+        "springboard_b": _optional_bool(row.get("springboard_b")) or False,
+        "springboard_c": _optional_bool(row.get("springboard_c")) or False,
+        "springboard_combo": _springboard_combo(row),
+        "springboard_grade": _optional_text(row.get("springboard_grade")) or _springboard_combo(row),
+        "springboard_met_count": _optional_int(row.get("springboard_met_count")) or 0,
+        "springboard_support": _optional_float(row.get("springboard_support")),
+        "springboard_touch_count": _optional_int(row.get("springboard_touch_count")) or 0,
+        "springboard_evidence": _optional_json(row.get("springboard_evidence")),
+        "springboard_scored": _optional_bool(row.get("springboard_scored")) or False,
+    }
+
+
+def _is_missing_payload_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, list | tuple | set):
+        return len(value) == 0
+    if isinstance(value, dict):
+        return len(value) == 0
+    return False
+
+
+def _copy_recommendation_attribution(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for col in RECOMMENDATION_ATTRIBUTION_COLUMNS:
+        if not _is_missing_payload_value(source.get(col)) or _is_missing_payload_value(target.get(col)):
+            target[col] = source.get(col)
+
+
 def _merge_recommendation_payload_row(existing: dict[str, Any], row: dict[str, Any]) -> None:
     if not existing.get("name") and row.get("name"):
         existing["name"] = row["name"]
@@ -328,6 +500,11 @@ def _merge_recommendation_payload_row(existing: dict[str, Any], row: dict[str, A
     if new_score is not None and (old_score is None or float(new_score) > float(old_score)):
         existing["funnel_score"] = new_score
         existing["recommend_reason"] = row.get("recommend_reason", "")
+        _copy_recommendation_attribution(existing, row)
+    else:
+        for col in RECOMMENDATION_ATTRIBUTION_COLUMNS:
+            if _is_missing_payload_value(existing.get(col)) and not _is_missing_payload_value(row.get(col)):
+                existing[col] = row[col]
     old_price = _safe_float(existing.get("initial_price"), 0.0)
     new_price = _safe_float(row.get("initial_price"), 0.0)
     if old_price <= 0 < new_price:
@@ -362,6 +539,7 @@ def _build_recommendation_payload(
             "funnel_score": _extract_recommendation_score(item),
             "is_ai_recommended": False,
             "updated_at": datetime.now(UTC).isoformat(),
+            **_extract_recommendation_attribution(item),
         }
         existing = payload_by_code.get(code_int)
         if existing:
@@ -379,13 +557,12 @@ def _upsert_recommendation_payload(client, payload: list[dict[str, Any]]) -> Non
             client.table(TABLE_RECOMMENDATION_TRACKING).upsert(chunk, on_conflict="code,recommend_date").execute()
     except Exception as e:
         msg = str(e).lower()
-        optional_cols = ("is_ai_recommended", "funnel_score", "recommend_count")
-        if not any(col in msg for col in optional_cols):
+        if not any(col in msg for col in RECOMMENDATION_OPTIONAL_COLUMNS):
             raise
         fallback_payload: list[dict[str, Any]] = []
         for row in payload:
             r = dict(row)
-            for col in optional_cols:
+            for col in RECOMMENDATION_OPTIONAL_COLUMNS:
                 r.pop(col, None)
             fallback_payload.append(r)
         for chunk in _chunked(fallback_payload, 500):
@@ -408,6 +585,7 @@ def prepare_recommendation_payload(recommend_date: int, symbols_info: list[dict[
 def upsert_recommendation_payload(payload: list[dict[str, Any]]) -> bool:
     if not is_supabase_configured() or not payload:
         return False
+    require_server_write_context("upsert recommendation_tracking")
     try:
         client = _get_supabase_admin_client()
         _upsert_recommendation_payload(client, payload)
@@ -440,6 +618,10 @@ def upsert_recommendations(recommend_date: int, symbols_info: list[dict[str, Any
 def _clean_backup_value(value: Any) -> Any:
     if value is None:
         return None
+    if isinstance(value, list | tuple | set):
+        return [cleaned for item in value if (cleaned := _clean_backup_value(item)) is not None]
+    if isinstance(value, dict):
+        return {str(key): cleaned for key, item in value.items() if (cleaned := _clean_backup_value(item)) is not None}
     try:
         if pd.isna(value):
             return None
@@ -465,6 +647,12 @@ def _sql_literal(value: Any) -> str:
     value = _clean_backup_value(value)
     if value is None:
         return "null"
+    if isinstance(value, list):
+        if not value:
+            return "'{}'::text[]"
+        return "array[" + ", ".join(_sql_literal(str(item)) for item in value) + "]::text[]"
+    if isinstance(value, dict):
+        return "'" + json.dumps(value, ensure_ascii=False).replace("'", "''") + "'::jsonb"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int | float):
@@ -528,6 +716,7 @@ def mark_ai_recommendations(recommend_date: int, ai_codes: list[str]) -> bool:
     """
     if not is_supabase_configured():
         return False
+    require_server_write_context("mark AI recommendations")
     try:
         client = _get_supabase_admin_client()
         now_iso = datetime.now(UTC).isoformat()
@@ -604,6 +793,7 @@ def sync_all_tracking_prices(
     if not is_supabase_configured():
         print("[supabase_recommendation] sync_all_tracking_prices: Supabase 未配置，跳过")
         return 0
+    require_server_write_context("sync recommendation_tracking prices")
 
     try:
         client = _get_supabase_admin_client()
@@ -735,6 +925,7 @@ def correct_tracking_initial_prices() -> int:
     if not is_supabase_configured():
         print("[supabase_recommendation] correct_tracking_initial_prices: Supabase 未配置，跳过")
         return 0
+    require_server_write_context("correct recommendation_tracking prices")
     try:
         client = _get_supabase_admin_client()
         records = _fetch_all_tracking_records(client, "*")
@@ -778,7 +969,7 @@ def load_recommendation_tracking(limit: int = 1000, client=None) -> list[dict[st
     """加载形态复盘数据"""
     try:
         if client is None:
-            client = _get_supabase_admin_client()
+            client = _get_supabase_read_client()
         resp = (
             client.table(TABLE_RECOMMENDATION_TRACKING)
             .select("*")
@@ -827,6 +1018,7 @@ def refresh_tracking_prices_with_tushare_unadjusted() -> dict[str, Any]:
 
     if not is_supabase_configured():
         raise ValueError("SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY 未配置")
+    require_server_write_context("refresh CN tracking prices with Tushare")
 
     pro = get_pro()
     if pro is None:
@@ -995,6 +1187,7 @@ def upsert_global_recommendations(
     table = _resolve_global_table(market)
     if not is_supabase_configured() or not candidates:
         return False
+    require_server_write_context(f"upsert global recommendations {market}")
     try:
         client = _get_supabase_admin_client()
         payload = []
@@ -1059,6 +1252,7 @@ def refresh_global_tracking_prices(market: str) -> dict[str, Any]:
     table = _resolve_global_table(market)
     if not is_supabase_configured():
         raise ValueError("SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY 未配置")
+    require_server_write_context(f"refresh global tracking prices {market}")
     api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
     if not api_key:
         raise ValueError("TICKFLOW_API_KEY 未配置")
@@ -1193,6 +1387,7 @@ def _build_us_performance_update(
 def refresh_us_tracking_performance(max_dates: int = 60, kline_count: int = 160) -> dict[str, Any]:
     if not is_supabase_configured():
         raise ValueError("SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY 未配置")
+    require_server_write_context("refresh US tracking performance")
     api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
     if not api_key:
         raise ValueError("TICKFLOW_API_KEY 未配置")
@@ -1291,6 +1486,7 @@ def refresh_tracking_prices_with_tickflow_realtime() -> dict[str, Any]:
     """
     if not is_supabase_configured():
         raise ValueError("SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY 未配置")
+    require_server_write_context("refresh CN tracking prices")
 
     api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
     if not api_key:

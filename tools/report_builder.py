@@ -448,7 +448,27 @@ def _track_execution_requirements() -> str:
         "5) 【起跳板预判】A=缩量高收测试，B=放量高收突破，C=支撑多次测试；若事实切片冲突，以事实切片为准。\n"
         "6) 若同时出现【退出预警】和向上异动，默认按诱多/修复失败审查，除非重新站回关键位且放量高收。\n"
         "7) 近15日切片后的 VSA 标签仅是辅助索引，最终仍必须引用原始涨跌、振幅、收位与量比。\n\n"
+        "8) 【交易闸门】优先于量价评分：只有二次确认=confirmed 的标的才允许进入“处于起跳板”。\n"
+        "9) 未二次确认标的即使满足 A/B/C，也只能写入储备营地，并注明升级所需的下一根K线确认。\n\n"
     )
+
+
+def _build_confirmation_gate_line(
+    candidate_source: str | None,
+    signal_status: str | None,
+    confirm_date: str | None,
+    confirm_reason: str | None,
+) -> str:
+    source = str(candidate_source or "").strip() or "未标注"
+    status = str(signal_status or "").strip().lower()
+    confirmed = status == "confirmed" or "二次确认" in source
+    status_text = "confirmed" if confirmed else "unconfirmed"
+    parts = [f"来源:{source}", f"二次确认:{status_text}"]
+    if confirm_date:
+        parts.append(f"确认日:{str(confirm_date).strip()}")
+    if confirm_reason:
+        parts.append(f"确认理由:{str(confirm_reason).strip()}")
+    return f"  [交易闸门] {' | '.join(parts)}\n"
 
 
 def generate_stock_payload(
@@ -474,6 +494,10 @@ def generate_stock_payload(
     exit_reason: str | None = None,
     financial_metrics: dict | None = None,
     springboard_grade: str | None = None,
+    candidate_source: str | None = None,
+    signal_status: str | None = None,
+    confirm_date: str | None = None,
+    confirm_reason: str | None = None,
 ) -> str:
     """
     将 320 个交易日 OHLCV 浓缩为发给 AI 的高密度文本。
@@ -549,6 +573,7 @@ def generate_stock_payload(
     )
     header += _build_trading_range_line(df, close_val)
     header += _build_candidate_type_line(raw_tag, facts, springboard_grade, exit_signal, sector_state_code)
+    header += _build_confirmation_gate_line(candidate_source, signal_status, confirm_date, confirm_reason)
     if stage:
         header += f"  [阶段假设] {stage}\n"
     if industry:
@@ -647,6 +672,8 @@ def build_track_user_message(
         + "以下是本轮候选名单。\n"
         + "请做三阵营分流：1) 逻辑破产 2) 储备营地 3) 处于起跳板。\n"
         + "其中前两类属于非操作区，第三类才是可执行区。\n"
+        + "交易闸门硬规则：只有 [交易闸门] 二次确认=confirmed 的标的才允许进入第三类；"
+        + "未确认标的只能进入储备营地或逻辑破产。\n"
         + "输出必须包含这三个部分，且只能使用输入列表中的股票代码，不得遗漏或新增。\n\n"
         + _track_execution_requirements()
         + "\n".join(payloads)

@@ -15,10 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONUNBUFFERED: "1"
+      WYCKOFF_WRITE_CONTEXT: "server_job"
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+      SIGNAL_REGISTRY_HORIZON: "5"
       TZ: Asia/Shanghai
 
     steps:
@@ -37,3 +39,6 @@ jobs:
 
       - name: Refresh signal feedback
         run: python -u scripts/signal_feedback_job.py
+
+      - name: Build strategy attribution report
+        run: python -u scripts/strategy_attribution_report.py --market cn --days 30 --horizons 1,3,5,10,20

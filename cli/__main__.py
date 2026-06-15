@@ -60,7 +60,7 @@ _logging.basicConfig(level=_logging.CRITICAL)
 # ---------------------------------------------------------------------------
 
 
-from cli._provider_factory import _create_provider  # noqa: F401
+from cli._provider_factory import _create_provider, provider_config_kwargs  # noqa: F401
 
 
 def _get_version() -> str:
@@ -193,13 +193,12 @@ def _cmd_auth(args):
 
 
 def _model_list():
-    from cli.auth import load_default_model_id, load_fallback_model_id, load_light_model_id, load_model_configs
+    from cli.auth import load_default_model_id, load_fallback_model_id, load_model_configs
     from cli.model_registry import format_model_metadata, infer_model_info
 
     configs = load_model_configs()
     default_id = load_default_model_id()
     fallback_id = load_fallback_model_id()
-    light_id = load_light_model_id()
     if not configs:
         print("尚无模型配置，使用 wyckoff model add 添加")
         return
@@ -209,8 +208,6 @@ def _model_list():
             marks += " *"
         if c["id"] == fallback_id:
             marks += " ⚡"
-        if c["id"] == light_id:
-            marks += " 💡"
         metadata = format_model_metadata(infer_model_info(c))
         print(
             f"  {c['id']}{marks}  provider={c.get('provider_name', '')}  "
@@ -219,8 +216,6 @@ def _model_list():
     legend = "  * = 默认"
     if fallback_id:
         legend += "  ⚡ = fallback"
-    if light_id:
-        legend += "  💡 = light 路由"
     print(f"\n{legend}")
 
 
@@ -252,58 +247,29 @@ def _model_add():
     print(f"✓ 模型 {model_id} 已保存")
 
 
-def _model_role_set(args, role: str):
-    """通用 fallback/light 角色设置。"""
-    from cli.auth import load_model_configs
+def _model_fallback_set(args):
+    """设置 fallback 模型。"""
+    from cli.auth import (
+        load_fallback_model_id,
+        load_model_configs,
+        set_fallback_model,
+    )
 
-    if role == "fallback":
-        from cli.auth import load_fallback_model_id as _load
-        from cli.auth import set_fallback_model as _set
-
-        label, empty_msg = "fallback", "未设置（降级到所有模型）"
-    else:
-        from cli.auth import load_light_model_id as _load
-        from cli.auth import set_light_model as _set
-
-        label, empty_msg = "light 路由", "未设置（不启用自动路由）"
-
+    label, empty_msg = "fallback", "未设置（降级到所有模型）"
     model_id = args.model_id
     if not model_id:
-        print(f"当前 {label}: {_load() or empty_msg}")
+        print(f"当前 {label}: {load_fallback_model_id() or empty_msg}")
         return
     if model_id == "none":
-        _set("")
+        set_fallback_model("")
         print(f"✓ 已清除 {label} 设置")
         return
     configs = load_model_configs()
     if not any(c["id"] == model_id for c in configs):
         print(f"✗ 模型 {model_id} 不存在")
         sys.exit(1)
-    _set(model_id)
-    suffix = "（简单问题自动使用此模型）" if role == "light" else ""
-    print(f"✓ {label.capitalize()} 模型已设为 {model_id}{suffix}")
-
-
-def _wrap_routing_provider(state: dict) -> None:
-    """如果配置了 light 模型，用 RoutingProvider 包装当前 provider。"""
-    try:
-        from cli.auth import load_light_model_id, load_model_configs
-
-        light_id = load_light_model_id()
-        if not light_id or not state.get("provider"):
-            return
-        light_cfg = next((c for c in load_model_configs() if c["id"] == light_id), None)
-        if not light_cfg:
-            return
-        light_prov, err = _create_provider(
-            light_cfg["provider_name"], light_cfg["api_key"], light_cfg.get("model", ""), light_cfg.get("base_url", "")
-        )
-        if not err:
-            from cli.model_router import RoutingProvider
-
-            state["provider"] = RoutingProvider(state["provider"], light_prov)
-    except Exception:
-        logger.debug("routing provider setup failed", exc_info=True)
+    set_fallback_model(model_id)
+    print(f"✓ {label.capitalize()} 模型已设为 {model_id}")
 
 
 def _cmd_model(args):
@@ -348,8 +314,8 @@ def _cmd_model(args):
         set_default_model(args.model_id)
         print(f"✓ 默认模型已切换为 {args.model_id}")
         return
-    if sub in ("fallback", "light"):
-        return _model_role_set(args, sub)
+    if sub == "fallback":
+        return _model_fallback_set(args)
     if sub == "cost":
         if not args.model_id:
             print("用法: wyckoff model cost <id> --input-per-1m N --output-per-1m N [--context-window N]")
@@ -398,7 +364,7 @@ def _cmd_model(args):
         return
 
     print(f"未知子命令: {sub}")
-    print("用法: wyckoff model [list|add|set|rm|default|fallback|light|cost|usage]")
+    print("用法: wyckoff model [list|add|set|rm|default|fallback|cost|usage]")
     sys.exit(1)
 
 
@@ -623,7 +589,9 @@ def _cmd_screen(args):
             for code, score in items[:10]:
                 print(f"    {code}  score={score:.2f}")
     if metrics:
-        print(f"\n  指标: {json.dumps(metrics, ensure_ascii=False)}")
+        from tools.funnel_public import public_funnel_metrics
+
+        print(f"\n  指标: {json.dumps(public_funnel_metrics(metrics), ensure_ascii=False, default=str)}")
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +621,8 @@ def _cmd_backtest(args):
             sample_size=0,
             trading_days=60,
             max_workers=4,
+            cash_portfolio=True,
+            portfolio_styles="confirmation_only",
         )
     except Exception as e:
         print(f"✗ 回测失败: {e}")
@@ -941,6 +911,79 @@ def _cmd_log(args):
         tag = {"user": "❯", "assistant": "◆", "tool": "⚙"}.get(role, "·")
         sid = entry.get("session_id", "")[:8]
         print(f"  {tag} [{ts}] ({sid}) {content}")
+
+
+# ---------------------------------------------------------------------------
+# wyckoff workflow — 动态 workflow 状态
+# ---------------------------------------------------------------------------
+
+
+def _cmd_workflow(args):
+    sub = args.workflow_cmd or "list"
+    if sub == "list":
+        _cmd_workflow_list(args.limit)
+        return
+    run_id = args.run_id
+    if not run_id:
+        print("用法: wyckoff workflow show <run_id>")
+        sys.exit(1)
+    if sub == "events":
+        _cmd_workflow_events(run_id, args.limit)
+        return
+    if sub == "resume":
+        _cmd_workflow_resume(run_id)
+        return
+    _cmd_workflow_show(run_id)
+
+
+def _cmd_workflow_list(limit: int) -> None:
+    from cli.workflows.store import list_workflow_runs
+
+    runs = list_workflow_runs(limit=limit)
+    if not runs:
+        print("暂无 workflow 记录")
+        return
+    print(f"最近 workflow ({len(runs)} 条)")
+    for run in runs:
+        print(
+            f"  {run['run_id']}  {run['status']}  {run['label']}  "
+            f"{run.get('updated_at', '')[:19]}  {str(run.get('user_text', ''))[:50]}"
+        )
+
+
+def _cmd_workflow_show(run_id: str) -> None:
+    from cli.workflows.store import get_workflow_run
+
+    run = get_workflow_run(run_id)
+    if not run:
+        print(f"未找到 workflow: {run_id}")
+        return
+    print(f"{run['run_id']}  {run['status']}  {run['label']}")
+    print(f"用户输入: {run.get('user_text', '')}")
+    for idx, step in enumerate(run.get("plan", {}).get("steps", []), start=1):
+        print(f"  {idx}. [{step.get('status', '')}] {step.get('title', '')}  {step.get('summary', '')}")
+
+
+def _cmd_workflow_events(run_id: str, limit: int) -> None:
+    from cli.workflows.store import load_workflow_events
+
+    rows = load_workflow_events(run_id, limit=limit)
+    if not rows:
+        print(f"暂无 workflow 事件: {run_id}")
+        return
+    for row in rows:
+        print(f"  {row.get('created_at', '')[:19]}  {row.get('event_type', '')}  {row.get('payload', {})}")
+
+
+def _cmd_workflow_resume(run_id: str) -> None:
+    from cli.workflows.resume import build_resume_prompt
+    from cli.workflows.store import get_workflow_run
+
+    run = get_workflow_run(run_id)
+    if not run:
+        print(f"未找到 workflow: {run_id}")
+        return
+    print(build_resume_prompt(run))
 
 
 # ---------------------------------------------------------------------------
@@ -1273,12 +1316,7 @@ def _cmd_tui(_args=None):
                     os.environ.setdefault(ek, cfg["api_key"])
             default_cfg = next((c for c in configs if c["id"] == default_id), configs[0])
             if len(configs) == 1:
-                provider, err = _create_provider(
-                    default_cfg["provider_name"],
-                    default_cfg["api_key"],
-                    default_cfg.get("model", ""),
-                    default_cfg.get("base_url", ""),
-                )
+                provider, err = _create_provider(**provider_config_kwargs(default_cfg))
                 if not err:
                     state.update(default_cfg)
                     state["provider"] = provider
@@ -1290,8 +1328,6 @@ def _cmd_tui(_args=None):
                 state["provider"] = FallbackProvider(configs, default_id, fallback_id=load_fallback_model_id())
     except Exception:
         logger.warning("model provider init failed", exc_info=True)
-
-    _wrap_routing_provider(state)
 
     if state["provider"]:
         tools.set_provider(state["provider"])
@@ -1376,6 +1412,8 @@ def _dispatch_command(args) -> None:
         _cmd_memory(args)
     elif args.cmd == "log":
         _cmd_log(args)
+    elif args.cmd in ("workflow", "wf"):
+        _cmd_workflow(args)
     elif args.cmd in ("session", "sess"):
         _cmd_session(args)
     elif args.cmd == "trace":
@@ -1412,7 +1450,7 @@ def main():
 
     # wyckoff model
     p_model = sub.add_parser("model", help="模型管理")
-    p_model.add_argument("model_cmd", nargs="?", default="list", help="list/add/set/rm/default")
+    p_model.add_argument("model_cmd", nargs="?", default="list", help="list/add/set/rm/default/fallback/cost/usage")
     p_model.add_argument("model_id", nargs="?", default="", help="模型 ID")
     p_model.add_argument("provider", nargs="?", default="", help="供应商 (set 时)")
     p_model.add_argument("api_key", nargs="?", default="", help="API Key (set 时)")
@@ -1457,9 +1495,9 @@ def main():
 
     # wyckoff backtest
     p_bt = sub.add_parser("backtest", help="策略历史回测", aliases=["bt"])
-    p_bt.add_argument("--hold-days", type=int, default=15, help="持有天数 (默认 15)")
+    p_bt.add_argument("--hold-days", type=int, default=10, help="持有天数 (默认 10)")
     p_bt.add_argument("--months", type=int, default=18, help="回测月数 (默认 18)")
-    p_bt.add_argument("--top-n", type=int, default=5, help="每批取前N只 (默认 5)")
+    p_bt.add_argument("--top-n", type=int, default=4, help="每批取前N只 (默认 4)")
 
     # wyckoff report
     p_report = sub.add_parser("report", help="AI 深度研报")
@@ -1474,6 +1512,12 @@ def main():
     p_log = sub.add_parser("log", help="查看对话日志")
     p_log.add_argument("--session", default="", help="指定会话 ID")
     p_log.add_argument("-n", "--limit", type=int, default=30, help="返回条数")
+
+    # wyckoff workflow
+    p_wf = sub.add_parser("workflow", help="查看动态 workflow", aliases=["wf"])
+    p_wf.add_argument("workflow_cmd", nargs="?", default="list", help="list/show/events/resume")
+    p_wf.add_argument("run_id", nargs="?", default="", help="workflow run id")
+    p_wf.add_argument("-n", "--limit", type=int, default=20, help="返回条数")
 
     # wyckoff session
     p_session = sub.add_parser("session", help="会话列表 / 导出 / 分叉", aliases=["sess"])

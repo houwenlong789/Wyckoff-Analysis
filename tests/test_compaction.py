@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 
 from cli.compaction import (
-    COMPACT_RATIO,
+    MAX_COMPACT_RESERVE_TOKENS,
+    MIN_COMPACT_RESERVE_TOKENS,
     TAIL_KEEP,
     _expand_tail_for_tool_refs,
     _summarize_tool_result,
@@ -11,32 +12,46 @@ from cli.compaction import (
     compact_messages,
     estimate_tokens,
     find_tail_start_by_token_budget,
+    get_compact_reserve_tokens,
     get_compact_threshold,
-    get_context_window,
     get_recent_keep_tokens,
+    resolve_context_window,
     serialize_messages_for_compaction,
 )
+from cli.model_metadata import infer_context_window
 
 
-class TestGetContextWindow:
+class TestInferContextWindow:
     def test_deepseek(self):
-        assert get_context_window("deepseek-v4-flash") == 64_000
+        assert infer_context_window("deepseek-v4-flash") == 64_000
 
     def test_claude(self):
-        assert get_context_window("claude-sonnet-4-20260514") == 200_000
+        assert infer_context_window("claude-sonnet-4-20260514") == 200_000
 
     def test_gemini_2(self):
-        assert get_context_window("gemini-2.5-flash") == 1_000_000
+        assert infer_context_window("gemini-2.5-flash") == 1_000_000
 
-    def test_unknown_fallback(self):
-        assert get_context_window("some-unknown-model") == 64_000
+    def test_minimax_m3(self):
+        assert infer_context_window("MiniMax-M3") == 1_000_000
+
+    def test_unknown_model_uses_inference_default(self):
+        assert infer_context_window("some-unknown-model") == 64_000
 
     def test_threshold_ratio(self):
-        assert get_compact_threshold("claude-sonnet-4") == int(200_000 * COMPACT_RATIO)
+        assert get_compact_threshold("claude-sonnet-4") == 200_000 - MAX_COMPACT_RESERVE_TOKENS
+
+    def test_threshold_uses_configured_context_window(self):
+        assert resolve_context_window("deepseek-chat", 100_000) == 100_000
+        assert get_compact_threshold("deepseek-chat", 100_000) == 75_000
+
+    def test_reserve_has_small_window_cap(self):
+        assert get_compact_reserve_tokens(16_000) == 8_000
+        assert get_compact_reserve_tokens(64_000) == MIN_COMPACT_RESERVE_TOKENS
+        assert get_compact_reserve_tokens(1_000_000) == MAX_COMPACT_RESERVE_TOKENS
 
     def test_recent_keep_budget_scales_with_model(self):
-        assert get_recent_keep_tokens("gpt-3.5-turbo") == 2_000
-        assert get_recent_keep_tokens("deepseek-chat") == 8_000
+        assert get_recent_keep_tokens("gpt-3.5-turbo") == 4_000
+        assert get_recent_keep_tokens("deepseek-chat") == 20_000
         assert get_recent_keep_tokens("claude-sonnet-4") == 20_000
 
 
@@ -166,7 +181,7 @@ class TestCompactMessages:
 
     def test_compaction_triggers_on_large_context(self):
         msgs = self._make_messages(30)
-        result, compacted = compact_messages(msgs, self.FakeProvider(), "deepseek")
+        result, compacted = compact_messages(msgs, self.FakeProvider(), "deepseek", context_window=16_000)
         assert compacted
         assert len(result) < len(msgs)
         assert result[0]["content"].startswith("[对话摘要]")
@@ -189,6 +204,22 @@ class TestCompactMessages:
         assert not compacted
         assert result is msgs
 
+    def test_failed_compaction_does_not_rewrite_original_tool_results(self):
+        class FailProvider:
+            def chat_stream(self, messages, tools, system_prompt):
+                raise RuntimeError("LLM unavailable")
+
+        large_tool_content = json.dumps({"payload": "x" * 5000})
+        msgs = [{"role": "user", "content": "历史问题 " + "很长" * 1000}]
+        msgs.append({"role": "tool", "name": "portfolio", "content": large_tool_content, "tool_call_id": "tc_old"})
+        msgs.extend(self._make_messages(10))
+
+        result, compacted = compact_messages(msgs, FailProvider(), "deepseek", context_window=8_000)
+
+        assert not compacted
+        assert result is msgs
+        assert msgs[1]["content"] == large_tool_content
+
     def test_tool_call_refs_preserved(self):
         """tail 中 tool 消息引用的 call_id 对应 assistant 也被保留。"""
         msgs = self._make_messages(20)
@@ -205,7 +236,7 @@ class TestCompactMessages:
         msgs.append({"role": "user", "content": "谢谢"})
         # TAIL_KEEP=4 → 原始 tail 从 -4 开始，tool msg (倒数第3) 在 tail 内
         # 但对应 assistant tool_call (倒数第4) 不在原始 tail → 需要扩展
-        result, compacted = compact_messages(msgs, self.FakeProvider(), "deepseek")
+        result, compacted = compact_messages(msgs, self.FakeProvider(), "deepseek", context_window=16_000)
         assert compacted
         # 验证 call_id 引用完整性
         call_ids_defined = set()

@@ -23,7 +23,7 @@ OPENAI_COMPATIBLE_BASE_URLS = {
     "efficiency": "",
     "openai_compatible": "",
     "zhipu": "https://open.bigmodel.cn/api/paas/v4",
-    "minimax": "https://api.minimax.chat/v1",
+    "minimax": "https://api.minimaxi.com/v1",
     "deepseek": "https://api.deepseek.com/v1",
     "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "volcengine": "https://ark.cn-beijing.volces.com/api/v3",

@@ -43,7 +43,7 @@ def _get_config() -> dict:
             ak = str(mc.get("api_key", "") or "")
             mc["api_key"] = (ak[:4] + "****" + ak[-4:]) if len(ak) > 8 else ("****" if ak else "")
             safe_models.append(mc)
-        for k in ("models", "default", "fallback"):
+        for k in ("models", "default", "fallback", "light"):
             safe.pop(k, None)
         return {"config": safe, "models": safe_models, "default_model": default_id, "fallback_model": fallback_id}
     except Exception as e:
@@ -768,7 +768,7 @@ async function renderOverview(c){
   // --- data source config ---
   const editableKeys=['tushare_token','tickflow_api_key'];
   html+=`<div class="card fade-in" style="margin-top:12px;animation-delay:.1s"><div class="card-title">${t('ds_config')}</div>`;
-  const keys=Object.entries(cfg).filter(([k])=>k!=='models'&&k!=='default'&&k!=='fallback');
+  const keys=Object.entries(cfg).filter(([k])=>k!=='models'&&k!=='default'&&k!=='fallback'&&k!=='light');
   if(keys.length){keys.forEach(([k,v])=>{
     const isMasked=String(v||'').includes('****');const canEdit=editableKeys.includes(k);
     html+=`<div class="cfg-row"><span class="cfg-key">${k}</span><span class="cfg-val${isMasked?' masked':''}" id="ds-val-${k}">${v||`<span style="color:var(--text-dim)">${t('not_set')}</span>`}</span>`;

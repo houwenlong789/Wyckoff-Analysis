@@ -68,6 +68,44 @@ def test_resolve_turn_expectation_does_not_hijack_explicit_stock_after_portfolio
     assert expectation is None
 
 
+def test_resolve_turn_expectation_ignores_recalled_memory_in_current_user_message():
+    current = (
+        "<relevant-memories>\n"
+        "- 用户偏好直接按清仓指令处理持仓。\n"
+        "- 家联科技趋势最健康，适合持有。\n"
+        "</relevant-memories>\n\n"
+        "<current-user-message>\n金富科技呢\n</current-user-message>"
+    )
+    messages = [
+        {"role": "user", "content": "我的持仓有什么"},
+        {"role": "assistant", "content": "你当前有 2 只持仓，现金 52,292.28 元。"},
+        {"role": "user", "content": current},
+    ]
+
+    expectation = resolve_turn_expectation(messages)
+
+    assert expectation is None
+
+
+def test_resolve_turn_expectation_uses_raw_current_user_inside_memory_wrapper():
+    current = (
+        "<relevant-memories>\n"
+        "- 用户偏好关注单股走势。\n"
+        "</relevant-memories>\n\n"
+        "<current-user-message>\n做一下体检\n</current-user-message>"
+    )
+    messages = [
+        {"role": "user", "content": "我的持仓有什么"},
+        {"role": "assistant", "content": "你当前有 2 只持仓，现金 52,292.28 元。"},
+        {"role": "user", "content": current},
+    ]
+
+    expectation = resolve_turn_expectation(messages)
+
+    assert expectation is not None
+    assert expectation.required_tool == "portfolio"
+
+
 def test_agent_loop_retries_planning_only_portfolio_turn_until_tool_executes():
     def second_round(messages, tools, system_prompt):
         assert messages[-1]["role"] == "user"
@@ -119,6 +157,8 @@ def test_agent_loop_retries_planning_only_portfolio_turn_until_tool_executes():
     assert len(outcome["provider_calls"]) == 3
     assert outcome["messages"][-1]["role"] == "assistant"
     assert "持仓体检已完成" in outcome["messages"][-1]["content"]
+    assert all("你刚才只给了计划" not in str(m.get("content", "")) for m in outcome["messages"])
+    assert all(not m.get("_internal_retry") for m in outcome["messages"])
 
 
 def test_agent_loop_retries_hallucinated_portfolio_list_until_portfolio_runs():
@@ -358,3 +398,29 @@ class TestToolConfirm:
         registry = ToolRegistry()
         result = registry.execute("exec_command", {"command": "echo hi"})
         assert "error" not in result or "拒绝" not in result.get("error", "")
+
+    def test_high_risk_blocked_without_user_question_confirm(self):
+        registry = ToolRegistry()
+        # Without messages context, high-risk command should be blocked
+        result = registry.execute("exec_command", {"command": "echo hi"})
+        assert "error" in result
+        assert "已被拦截" in result["error"]
+        assert "ask_user_question" in result["error"]
+
+        # Old ask_user tool messages are no longer accepted as confirmation.
+        messages = [
+            {"role": "user", "content": "run echo hi"},
+            {"role": "tool", "name": "ask_user", "content": "用户已答复: 确认继续"},
+        ]
+        result = registry.execute("exec_command", {"command": "echo hi"}, messages=messages)
+        assert "error" in result
+        assert "已被拦截" in result["error"]
+
+        messages_confirmed = [
+            {"role": "user", "content": "run echo hi"},
+            {"role": "tool", "name": "ask_user_question", "content": "用户已答复: 确认继续"},
+        ]
+        result_confirmed = registry.execute("exec_command", {"command": "echo hi"}, messages=messages_confirmed)
+        assert "error" not in result_confirmed
+        assert result_confirmed["returncode"] == 0
+        assert "hi" in result_confirmed["stdout"]

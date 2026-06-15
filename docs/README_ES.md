@@ -85,7 +85,7 @@ SPA moderna con chat de AI Agent, gestion de cartera, screener de embudo, seguim
 | Riesgo pre-mercado | Monitoreo de A50 + VIX con cuatro niveles de alerta |
 | Panel local | `wyckoff dashboard` — recomendaciones, senales, cartera, memoria del agente, logs de chat; tema oscuro/claro, bilingue CN/EN |
 | Memoria del agente | Memoria entre sesiones: extrae conclusiones automaticamente, inyecta contexto relevante en la siguiente consulta |
-| Compresion de contexto | Umbral dinamico (25% de la ventana de contexto del modelo) para compresion automatica, resumen inteligente de resultados de herramientas |
+| Compresion de contexto | Presupuesto de ventana restante para compresion automatica, resumen inteligente de resultados de herramientas |
 | Confirmacion de herramientas | `exec_command`, `write_file`, `update_portfolio` requieren aprobacion del usuario antes de ejecutarse |
 | Capacidades generales del Agent | Ejecutar comandos, leer/escribir archivos, obtener paginas web — envia una ruta CSV y lo analiza |
 | MCP Server | 10 herramientas expuestas via protocolo MCP — compatible con Claude Code / Cursor / cualquier cliente MCP |
@@ -173,7 +173,7 @@ Incluye recomendaciones, senales, cartera, memoria del agente, configuracion, lo
 
 ### Grid de backtest
 
-18 combinaciones de parametros en paralelo, salida de parametros optimos, matriz Sharpe y revision de estrategia:
+8 combinaciones enfocadas de parametros por periodo, salida de parametros optimos, matriz Sharpe y revision de estrategia:
 
 | Parametros optimos & Ranking | Matriz de parametros |
 |:---:|:---:|
@@ -231,12 +231,12 @@ Tareas programadas con GitHub Actions integradas en el repositorio:
 
 | Tarea | Hora (Beijing) | Descripcion |
 |-------|---------------|-------------|
-| Embudo + Reporte IA + Rebalanceo | Dom-Jue 18:25 | Totalmente automatico; resultados enviados a Feishu / Telegram |
+| Embudo + Reporte IA + Rebalanceo | Dom-Jue 17:17 | Totalmente automatico; resultados enviados a Feishu / Telegram |
 | Estrategia de compra al cierre | Lun-Vie 13:50 | Puntuacion por reglas + revision LLM |
 | Riesgo pre-mercado | Lun-Vie 08:20 | Alerta A50 + VIX |
 | Resumen de limit-up | Lun-Vie 19:25 | Revision de acciones con alza diaria >= 8 % |
 | Repricing de recomendaciones | Dom-Jue 23:00 | Sincroniza precios de cierre |
-| Grid de backtest | 1 y 15 de cada mes 04:00 | 18 combos de parametros en paralelo → reporte agregado |
+| Grid de backtest | 1 y 15 de cada mes 04:00 | 8 combos enfocados de parametros → reporte agregado |
 | Mantenimiento de base de datos | Diario 23:05 | Limpia cotizaciones, órdenes, señales y datos de mercado fuera de la ventana |
 
 ## Soporte de modelos
@@ -302,9 +302,9 @@ Ideal para dar a cualquier asistente IA una rapida "perspectiva Wyckoff."
 
 ## Comunidad
 
-| Grupo Feishu | Grupo QQ | Contacto Feishu |
-|:---:|:---:|:---:|
-| <img src="../attach/飞书群二维码.png" width="200" /> | <img src="../attach/QQ群二维码.jpg" width="200" /><br/>Grupo: 761348919 | <img src="../attach/飞书个人二维码.png" width="200" /> |
+| Grupo Feishu 1 | Grupo Feishu 2 | Grupo QQ | Contacto Feishu |
+|:---:|:---:|:---:|:---:|
+| <img src="../attach/飞书群二维码.png" width="200" /> | <img src="../attach/飞书二群二维码.png" width="200" /> | <img src="../attach/QQ群二维码.jpg" width="200" /><br/>Grupo: 761348919 | <img src="../attach/飞书个人二维码.png" width="200" /> |
 
 ## Patrocinio
 

@@ -1,7 +1,10 @@
+import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { supabase } from '@/lib/supabase'
+import { checkWhitelist } from '@/lib/kline'
 import { WyckoffLoading } from '@/components/loading'
 import { usePreferences } from '@/lib/preferences'
+import { useAuthStore } from '@/stores/auth'
 
 interface TailBuyRecord {
   code: string
@@ -23,6 +26,25 @@ interface TailBuyRecord {
   dist_vwap_pct?: number
   last30_ret_pct?: number
 }
+
+type TailBuySortKey =
+  | 'code'
+  | 'name'
+  | 'runDate'
+  | 'signal'
+  | 'decision'
+  | 'entryPrice'
+  | 'currentPrice'
+  | 'changePct'
+  | 'vwap'
+  | 'distVwap'
+  | 'last30Ret'
+  | 'ruleScore'
+  | 'priorityScore'
+  | 'llmDecision'
+  | 'reason'
+
+type SortOrder = 'desc' | 'asc'
 
 async function fetchTailBuy(): Promise<TailBuyRecord[]> {
   const { data } = await supabase
@@ -47,9 +69,17 @@ function resolveChangePct(entry: number | undefined, current: number | undefined
   return undefined
 }
 
+function resolveEntryPrice(record: TailBuyRecord): number | undefined {
+  return record.initial_price && record.initial_price > 0 ? record.initial_price : record.last_close
+}
+
+function resolveCurrentPrice(record: TailBuyRecord): number | undefined {
+  return record.current_price && record.current_price > 0 ? record.current_price : resolveEntryPrice(record)
+}
+
 function TailBuyRecordRow({ record }: { record: TailBuyRecord }) {
-  const entryPrice = record.initial_price && record.initial_price > 0 ? record.initial_price : record.last_close
-  const currentPrice = record.current_price && record.current_price > 0 ? record.current_price : entryPrice
+  const entryPrice = resolveEntryPrice(record)
+  const currentPrice = resolveCurrentPrice(record)
   const changePct = resolveChangePct(entryPrice, currentPrice, record.change_pct)
   const changeClass = changePct && changePct > 0
     ? 'text-red-600'
@@ -93,16 +123,27 @@ function TailBuyRecordRow({ record }: { record: TailBuyRecord }) {
 }
 
 export function TailBuyPage() {
-  const { t } = usePreferences()
-  const { data = [], isLoading } = useQuery({
+  const user = useAuthStore((s) => s.user)
+  const whitelist = useQuery({
+    queryKey: ['whitelist', user?.id],
+    queryFn: () => checkWhitelist(user!.id),
+    enabled: !!user?.id,
+  })
+  const tailBuy = useQuery({
     queryKey: ['tail-buy'],
     queryFn: fetchTailBuy,
+    enabled: whitelist.data === true,
   })
 
-  if (isLoading) {
-    return <WyckoffLoading />
-  }
+  if (whitelist.isLoading) return <WyckoffLoading />
+  if (whitelist.data !== true) return <TailBuyLockedView />
+  if (tailBuy.isLoading) return <WyckoffLoading />
 
+  return <TailBuyReadyContent data={tailBuy.data || []} />
+}
+
+function TailBuyReadyContent({ data }: { data: TailBuyRecord[] }) {
+  const { t } = usePreferences()
   return (
     <div className="flex h-full flex-col p-6">
       <div className="mb-6 flex items-center justify-between">
@@ -111,43 +152,157 @@ export function TailBuyPage() {
       </div>
 
       {data.length === 0 ? (
-        <div className="flex flex-1 items-center justify-center text-muted-foreground">
-          <div className="text-center">
-            <div className="mb-3 text-4xl">🌙</div>
-            <p className="text-sm">{t('tailBuy.empty')}</p>
-            <p className="mt-1 text-xs">{t('tailBuy.emptySubtitle')}</p>
-          </div>
-        </div>
+        <TailBuyEmptyView />
       ) : (
-        <div className="min-h-0 flex-1 overflow-hidden rounded-lg border border-border">
-          <div className="h-full overflow-auto">
-            <table className="w-full text-sm">
-              <thead className="sticky top-0 bg-muted/80 backdrop-blur">
-                <tr>
-                  <th className="px-3 py-2.5 text-left font-medium">{t('common.code')}</th>
-                  <th className="px-3 py-2.5 text-left font-medium">{t('common.name')}</th>
-                  <th className="px-3 py-2.5 text-right font-medium">{t('common.date')}</th>
-                  <th className="px-3 py-2.5 text-center font-medium">{t('tailBuy.signal')}</th>
-                  <th className="px-3 py-2.5 text-center font-medium">决策</th>
-                  <th className="px-3 py-2.5 text-right font-medium">入库价</th>
-                  <th className="px-3 py-2.5 text-right font-medium">现价</th>
-                  <th className="px-3 py-2.5 text-right font-medium">涨跌</th>
-                  <th className="px-3 py-2.5 text-right font-medium">VWAP</th>
-                  <th className="px-3 py-2.5 text-right font-medium">距VWAP</th>
-                  <th className="px-3 py-2.5 text-right font-medium">30m</th>
-                  <th className="px-3 py-2.5 text-right font-medium">{t('tailBuy.ruleScore')}</th>
-                  <th className="px-3 py-2.5 text-right font-medium">{t('tailBuy.priorityScore')}</th>
-                  <th className="px-3 py-2.5 text-center font-medium">{t('tailBuy.llmDecision')}</th>
-                  <th className="px-3 py-2.5 text-left font-medium">{t('tailBuy.reason')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.map((record) => <TailBuyRecordRow key={`${record.code}-${record.run_date}`} record={record} />)}
-              </tbody>
-            </table>
-          </div>
-        </div>
+        <TailBuyTable data={data} />
       )}
+    </div>
+  )
+}
+
+function TailBuyEmptyView() {
+  const { t } = usePreferences()
+  return (
+    <div className="flex flex-1 items-center justify-center text-muted-foreground">
+      <div className="text-center">
+        <div className="mb-3 text-4xl">🌙</div>
+        <p className="text-sm">{t('tailBuy.empty')}</p>
+        <p className="mt-1 text-xs">{t('tailBuy.emptySubtitle')}</p>
+      </div>
+    </div>
+  )
+}
+
+function TailBuyTable({ data }: { data: TailBuyRecord[] }) {
+  const [sortBy, setSortBy] = useState<TailBuySortKey>('runDate')
+  const [sortOrder, setSortOrder] = useState<SortOrder>('desc')
+  const sortedData = useMemo(() => sortTailBuyRecords(data, sortBy, sortOrder), [data, sortBy, sortOrder])
+  const handleSort = (next: TailBuySortKey) => {
+    if (next === sortBy) {
+      setSortOrder(sortOrder === 'desc' ? 'asc' : 'desc')
+      return
+    }
+    setSortBy(next)
+    setSortOrder('desc')
+  }
+
+  return (
+    <div className="min-h-0 flex-1 overflow-hidden rounded-lg border border-border">
+      <div className="h-full overflow-auto">
+        <table className="w-full text-sm">
+          <TailBuyTableHead sortBy={sortBy} sortOrder={sortOrder} onSortChange={handleSort} />
+          <tbody>
+            {sortedData.map((record) => <TailBuyRecordRow key={`${record.code}-${record.run_date}`} record={record} />)}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+function TailBuyTableHead({
+  sortBy,
+  sortOrder,
+  onSortChange,
+}: {
+  sortBy: TailBuySortKey
+  sortOrder: SortOrder
+  onSortChange: (sortBy: TailBuySortKey) => void
+}) {
+  const { t } = usePreferences()
+  return (
+    <thead className="sticky top-0 bg-muted/80 backdrop-blur">
+      <tr>
+        <SortableHeader align="left" active={sortBy === 'code'} label={t('common.code')} order={sortOrder} onClick={() => onSortChange('code')} />
+        <SortableHeader align="left" active={sortBy === 'name'} label={t('common.name')} order={sortOrder} onClick={() => onSortChange('name')} />
+        <SortableHeader align="right" active={sortBy === 'runDate'} label={t('common.date')} order={sortOrder} onClick={() => onSortChange('runDate')} />
+        <SortableHeader align="center" active={sortBy === 'signal'} label={t('tailBuy.signal')} order={sortOrder} onClick={() => onSortChange('signal')} />
+        <SortableHeader align="center" active={sortBy === 'decision'} label="决策" order={sortOrder} onClick={() => onSortChange('decision')} />
+        <SortableHeader align="right" active={sortBy === 'entryPrice'} label="入库价" order={sortOrder} onClick={() => onSortChange('entryPrice')} />
+        <SortableHeader align="right" active={sortBy === 'currentPrice'} label="现价" order={sortOrder} onClick={() => onSortChange('currentPrice')} />
+        <SortableHeader align="right" active={sortBy === 'changePct'} label="涨跌" order={sortOrder} onClick={() => onSortChange('changePct')} />
+        <SortableHeader align="right" active={sortBy === 'vwap'} label="VWAP" order={sortOrder} onClick={() => onSortChange('vwap')} />
+        <SortableHeader align="right" active={sortBy === 'distVwap'} label="距VWAP" order={sortOrder} onClick={() => onSortChange('distVwap')} />
+        <SortableHeader align="right" active={sortBy === 'last30Ret'} label="30m" order={sortOrder} onClick={() => onSortChange('last30Ret')} />
+        <SortableHeader align="right" active={sortBy === 'ruleScore'} label={t('tailBuy.ruleScore')} order={sortOrder} onClick={() => onSortChange('ruleScore')} />
+        <SortableHeader align="right" active={sortBy === 'priorityScore'} label={t('tailBuy.priorityScore')} order={sortOrder} onClick={() => onSortChange('priorityScore')} />
+        <SortableHeader align="center" active={sortBy === 'llmDecision'} label={t('tailBuy.llmDecision')} order={sortOrder} onClick={() => onSortChange('llmDecision')} />
+        <SortableHeader align="left" active={sortBy === 'reason'} label={t('tailBuy.reason')} order={sortOrder} onClick={() => onSortChange('reason')} />
+      </tr>
+    </thead>
+  )
+}
+
+function SortableHeader({
+  active,
+  align,
+  label,
+  order,
+  onClick,
+}: {
+  active: boolean
+  align: 'left' | 'right' | 'center'
+  label: string
+  order: SortOrder
+  onClick: () => void
+}) {
+  const alignClass = align === 'right' ? 'justify-end text-right' : align === 'center' ? 'justify-center text-center' : 'justify-start text-left'
+  return (
+    <th className={`px-3 py-2.5 font-medium ${align === 'right' ? 'text-right' : align === 'center' ? 'text-center' : 'text-left'}`}>
+      <button type="button" onClick={onClick} className={`inline-flex w-full items-center gap-1 rounded px-1 py-0.5 hover:bg-muted ${alignClass}`}>
+        <span>{label}</span>
+        <span className={`min-w-3 text-[10px] ${active ? 'text-primary' : 'text-muted-foreground'}`}>
+          {active ? (order === 'desc' ? '↓' : '↑') : '--'}
+        </span>
+      </button>
+    </th>
+  )
+}
+
+function sortTailBuyRecords(records: TailBuyRecord[], sortBy: TailBuySortKey, sortOrder: SortOrder): TailBuyRecord[] {
+  return [...records].sort((left, right) => {
+    const result = compareTailBuyValue(sortValue(left, sortBy), sortValue(right, sortBy))
+    if (result !== 0) return sortOrder === 'desc' ? -result : result
+    return compareTailBuyValue(left.run_date, right.run_date) * -1 || compareTailBuyValue(left.code, right.code)
+  })
+}
+
+function sortValue(record: TailBuyRecord, sortBy: TailBuySortKey): string | number | undefined {
+  switch (sortBy) {
+    case 'code': return record.code
+    case 'name': return record.name
+    case 'runDate': return record.run_date
+    case 'signal': return record.signal_type
+    case 'decision': return record.final_decision
+    case 'entryPrice': return resolveEntryPrice(record)
+    case 'currentPrice': return resolveCurrentPrice(record)
+    case 'changePct': return resolveChangePct(resolveEntryPrice(record), resolveCurrentPrice(record), record.change_pct)
+    case 'vwap': return record.vwap
+    case 'distVwap': return record.dist_vwap_pct
+    case 'last30Ret': return record.last30_ret_pct
+    case 'ruleScore': return record.rule_score
+    case 'priorityScore': return record.priority_score
+    case 'llmDecision': return record.llm_decision
+    case 'reason': return record.llm_reason
+  }
+}
+
+function compareTailBuyValue(left: string | number | undefined, right: string | number | undefined): number {
+  if (left == null && right == null) return 0
+  if (left == null) return -1
+  if (right == null) return 1
+  if (typeof left === 'number' && typeof right === 'number') return left - right
+  return String(left).localeCompare(String(right), 'zh-CN', { numeric: true, sensitivity: 'base' })
+}
+
+function TailBuyLockedView() {
+  const { t } = usePreferences()
+  return (
+    <div className="h-full p-6">
+      <div className="rounded-lg border border-border bg-card p-6">
+        <h1 className="text-xl font-semibold">{t('tailBuy.title')}</h1>
+        <p className="mt-2 text-sm text-muted-foreground">{t('tailBuy.lockedDesc')}</p>
+      </div>
     </div>
   )
 }

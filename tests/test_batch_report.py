@@ -50,10 +50,15 @@ def test_generate_stock_payload_includes_structure_and_conflict_context():
         exit_price=10.5,
         exit_reason="主升趋势破位",
         springboard_grade="B+C",
+        candidate_source="二次确认",
+        signal_status="confirmed",
+        confirm_date="2026-05-10",
+        confirm_reason="缩量站稳",
     )
 
     assert "[结构支撑/阻力] Creek(箱体上沿)" in payload
     assert "[候选类型] 冲突复核" in payload
+    assert "[交易闸门] 来源:二次确认 | 二次确认:confirmed" in payload
     assert "[冲突提示]" in payload
     assert "B+C（B=放量高收突破 + C=支撑多次测试）" in payload
     assert "宽幅高收放量" in payload

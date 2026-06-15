@@ -9,8 +9,12 @@
     "lint": "eslint ."
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "^3.0.84",
+    "@ai-sdk/openai": "^3.0.71",
     "@supabase/supabase-js": "^2.49.0",
-    "hono": "^4.12.18",
+    "@wyckoff/shared": "workspace:*",
+    "ai": "^6.0.205",
+    "hono": "^4.12.21",
     "zod": "^3.25.76"
   },
   "devDependencies": {

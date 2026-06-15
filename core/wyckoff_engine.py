@@ -11,6 +11,7 @@ Layer 4: 威科夫狙击（Spring / SOS / LPS / Effort vs Result）
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -97,6 +98,9 @@ class FunnelConfig:
     rps_accel_slow_min: float = 55.0  # 加速旁路下 RPS120 最低要求
     require_bench_latest_alignment: bool = False
     momentum_bias_200_max: float = 0.25  # 防止主升通道选出离 200 日线太远的鱼尾老妖股
+    # Global Anti-Overfitting Restriction
+    global_entry_max_bias_200: float = 25.0  # 全局统一：凡偏离年线超 25% 的股票，一律拒绝买入（防高位接盘）
+
     # Layer 2 预点火观察池
     enable_pre_ignition_watch: bool = True
     pre_ignition_bias_max: float = 0.20
@@ -148,6 +152,7 @@ class FunnelConfig:
     trend_cont_rps_slow_min: float = 75.0  # RPS120 >= 此值
     trend_cont_max_drawdown_pct: float = 20.0  # 近 N 日最大回撤 < 此值
     trend_cont_drawdown_window: int = 60  # 回撤计算窗口（交易日）
+    trend_cont_vol_ratio_min: float = 0.70  # 近5日均量 / 20日均量，过滤缩量趋势末端
 
     # Layer 2 加速突破通道（Breakout Acceleration Channel）
     # 从底部结构刚起步：价格站上 MA50 但 MA50 尚未上穿 MA200，短期动量已爆发。
@@ -190,12 +195,11 @@ class FunnelConfig:
     # Layer 4 - Effort vs Result
     enable_evr_trigger: bool = True
     evr_lookback: int = 3
-    evr_vol_ratio: float = 1.5
+    evr_vol_ratio: float = 1.8  # 从1.5微调至1.8，略微提高异动门槛
     evr_min_turnover: float = 1.5
     evr_vol_window: int = 20
     evr_max_drop: float = 2.0
     evr_max_rise: float = 2.0
-    evr_max_bias_200: float = 40.0
     evr_confirm_days: int = 1
     evr_confirm_allow_break_pct: float = 0.0
 
@@ -204,15 +208,15 @@ class FunnelConfig:
     compression_lookback: int = 5
     compression_atr_window: int = 20
     compression_atr_quantile: float = 0.20
-    compression_vol_decline_ratio: float = 0.80
-    compression_max_bias_200: float = 40.0
+    compression_vol_decline_ratio: float = 0.60  # 统一"量能枯竭"标准为 0.6倍
+    compression_require_direction: bool = True  # 压缩必须处于非下降结构，避免阴跌缩量误判
 
     # Layer 4 - Trend Pullback (趋势回踩)
     enable_trend_pullback_trigger: bool = True
     trend_pb_lookback: int = 10  # 回踩窗口
     trend_pb_min_pullback_pct: float = 5.0  # 最小回撤深度%
     trend_pb_max_pullback_pct: float = 20.0  # 最大回撤深度%
-    trend_pb_vol_shrink_ratio: float = 0.6  # 回落段缩量确认
+    trend_pb_vol_shrink_ratio: float = 0.6  # 回落段缩量确认，统一为 0.6
     trend_pb_ma_window: int = 20  # 均线窗口
 
     # Funnel score
@@ -220,11 +224,11 @@ class FunnelConfig:
 
     # Layer 4 - SOS / JAC (Sign of Strength / Jump Across the Creek)
     sos_pct_min: float = 6.0  # 提高门槛过滤弱突破（原 4.5 追高触发止损率极高）
-    sos_vol_ratio: float = 2.5  # 要求更强量能确认（原 2.0 噪音太多）
+    sos_vol_ratio: float = 3.0  # 要求更暴力抢筹（原 2.5 噪音太多，修改为 3.0）
     sos_vol_window: int = 20  # 计算点火爆量时的参考窗口
-    sos_breakout_window: int = 10
+    sos_breakout_window: int = 60  # 把突破箱体延长到 60天 (约3个月)，拒绝 10日小打小闹
     sos_breakout_tolerance: float = 0.01  # 改为 0.01：突破容差 1%（从 2% 改为 1%）
-    sos_max_bias_200: float = 35.0  # 放宽以覆盖从底部启动的加速股（原20%过紧）
+    sos_bypass_rps_slow_min: float = 30.0  # L2 点火破局旁路的最低 RPS120 门槛
     # SOS 动态极值爆量
     sos_vol_quantile_window: int = 60  # 计算量能分位数的滚动窗口
     sos_vol_quantile: float = 0.95  # 要求当日量能突破历史 N 日的 95% 分位数
@@ -268,6 +272,88 @@ class FunnelResult(NamedTuple):
     channel_map: dict[str, str]
 
 
+def _trigger_codes_by_score(
+    triggers: dict[str, list[tuple[str, float]]],
+    signal_type: str,
+    *,
+    reverse: bool = True,
+) -> list[str]:
+    rows = triggers.get(signal_type, []) or []
+    return [
+        str(code).strip()
+        for code, _score in sorted(
+            rows,
+            key=lambda item: float(item[1] if item[1] is not None else 0.0),
+            reverse=reverse,
+        )
+        if str(code).strip()
+    ]
+
+
+def _append_scored_codes(
+    candidates: list[tuple[str, float, bool]],
+    codes: list[str],
+    score_fn: Callable[[str], float],
+) -> None:
+    existing = {code for code, _score, _is_fill in candidates}
+    for code in codes:
+        code_s = str(code).strip()
+        if code_s and code_s not in existing:
+            candidates.append((code_s, score_fn(code_s), False))
+            existing.add(code_s)
+
+
+def _build_candidate_priority_scorer(
+    result: FunnelResult,
+    hit_sets: dict[str, set[str]],
+    signal_weight: Callable[[str], float],
+) -> Callable[[str, bool], float]:
+    markup_set = set(result.markup_symbols)
+    sos_hits = hit_sets.get("sos", set())
+    spring_hits = hit_sets.get("spring", set())
+    lps_hits = hit_sets.get("lps", set())
+    evr_hits = hit_sets.get("evr", set())
+    compression_hits = hit_sets.get("compression", set())
+    trend_pb_hits = hit_sets.get("trend_pullback", set())
+    other_hits = spring_hits | lps_hits | evr_hits | compression_hits | trend_pb_hits
+
+    def score(code: str, is_trend_side: bool) -> float:
+        value = 0.0
+        stage_name = result.stage_map.get(code, "")
+        if code in markup_set:
+            value += 100.0
+        if stage_name == "Accum_C":
+            value += 15.0 if not is_trend_side else 5.0
+        elif stage_name == "Accum_B":
+            value += 8.0 if not is_trend_side else 3.0
+        elif stage_name == "Accum_A":
+            value += 3.0 if not is_trend_side else 0.0
+        if code in sos_hits:
+            value += (50.0 if code in other_hits else 15.0) * signal_weight("sos")
+        if code in spring_hits:
+            value += 45.0 * signal_weight("spring")
+        if code in lps_hits:
+            value += 40.0 * signal_weight("lps")
+        if code in evr_hits:
+            value += 25.0 * signal_weight("evr")
+        if code in compression_hits:
+            value += 22.0 * signal_weight("compression")
+        if code in trend_pb_hits:
+            value += 45.0 * signal_weight("trend_pullback")
+        if is_trend_side and (code in sos_hits or code in evr_hits or code in trend_pb_hits):
+            value += 10.0 * max(signal_weight("sos"), signal_weight("evr"), signal_weight("trend_pullback"))
+        if (not is_trend_side) and (code in spring_hits or code in lps_hits or code in compression_hits):
+            value += 10.0 * max(signal_weight("spring"), signal_weight("lps"), signal_weight("compression"))
+        exit_sig = result.exit_signals.get(code, {})
+        if exit_sig.get("signal") == "stop_loss":
+            value -= 100.0
+        elif exit_sig.get("signal") == "distribution_warning":
+            value -= 20.0
+        return value
+
+    return score
+
+
 def fit_ai_candidate_quotas(
     total_cap: int,
     trend_quota: int,
@@ -304,6 +390,33 @@ def fit_ai_candidate_quotas(
     return (trend_eff, accum_eff)
 
 
+def _env_non_negative_int(name: str, default: str) -> int:
+    import os
+
+    return max(int(os.getenv(name, default)), 0)
+
+
+def _ai_candidate_quota_defaults() -> dict[str, tuple[int, int]]:
+    return {
+        "RISK_ON": (
+            _env_non_negative_int("FUNNEL_AI_RISK_ON_TREND", "3"),
+            _env_non_negative_int("FUNNEL_AI_RISK_ON_ACCUM", "5"),
+        ),
+        "BEAR_REBOUND": (
+            _env_non_negative_int("FUNNEL_AI_BEAR_REBOUND_TREND", "1"),
+            _env_non_negative_int("FUNNEL_AI_BEAR_REBOUND_ACCUM", "2"),
+        ),
+        "RISK_OFF": (
+            _env_non_negative_int("FUNNEL_AI_RISK_OFF_TREND", "0"),
+            _env_non_negative_int("FUNNEL_AI_RISK_OFF_ACCUM", "0"),
+        ),
+        "NEUTRAL": (
+            _env_non_negative_int("FUNNEL_AI_NEUTRAL_TREND", "2"),
+            _env_non_negative_int("FUNNEL_AI_NEUTRAL_ACCUM", "3"),
+        ),
+    }
+
+
 def resolve_ai_candidate_policy(
     regime: str,
     override_total_cap: int = -1,
@@ -311,41 +424,24 @@ def resolve_ai_candidate_policy(
     """
     Central source of truth for AI allocation defaults.
 
-    CRASH / PANIC_REPAIR / BLACK_SWAN all share the defensive quota family
+    CRASH / PANIC_REPAIR / BEAR_REBOUND / BLACK_SWAN all share the defensive quota family
     instead of silently falling back to NEUTRAL.
     """
-    import os
-
     total_cap = (
-        max(int(os.getenv("FUNNEL_AI_TOTAL_CAP", "12")), 0)
-        if override_total_cap < 0
-        else max(int(override_total_cap), 0)
+        _env_non_negative_int("FUNNEL_AI_TOTAL_CAP", "8") if override_total_cap < 0 else max(int(override_total_cap), 0)
     )
-    # 配额重平衡：原版严重偏向 Accum 左侧（4/8, 3/7, 1/5），导致大量底部横盘股拉低胜率。
-    # 现改为 Trend 优先：右侧已确认趋势的股票胜率远高于左侧潜伏。
-    risk_on_trend = max(int(os.getenv("FUNNEL_AI_RISK_ON_TREND", "7")), 0)
-    risk_on_accum = max(int(os.getenv("FUNNEL_AI_RISK_ON_ACCUM", "5")), 0)
-    risk_off_trend = max(int(os.getenv("FUNNEL_AI_RISK_OFF_TREND", "2")), 0)
-    risk_off_accum = max(int(os.getenv("FUNNEL_AI_RISK_OFF_ACCUM", "3")), 0)
-    neutral_trend = max(int(os.getenv("FUNNEL_AI_NEUTRAL_TREND", "5")), 0)
-    neutral_accum = max(int(os.getenv("FUNNEL_AI_NEUTRAL_ACCUM", "5")), 0)
-    max_trend_l3_fill = max(int(os.getenv("FUNNEL_AI_MAX_TREND_L3_FILL", "0")), 0)
-    max_accum_l3_fill = max(int(os.getenv("FUNNEL_AI_MAX_ACCUM_L3_FILL", "0")), 0)
 
     regime_norm = str(regime or "").strip().upper()
     if regime_norm == "RISK_ON":
-        requested_trend = risk_on_trend
-        requested_accum = risk_on_accum
         quota_family = "RISK_ON"
+    elif regime_norm in {"BEAR_REBOUND", "PANIC_REPAIR"}:
+        quota_family = "BEAR_REBOUND"
     elif regime_norm in {"RISK_OFF", "CRASH", "BLACK_SWAN"}:
-        requested_trend = risk_off_trend
-        requested_accum = risk_off_accum
         quota_family = "RISK_OFF"
     else:
-        requested_trend = neutral_trend
-        requested_accum = neutral_accum
         quota_family = "NEUTRAL"
 
+    requested_trend, requested_accum = _ai_candidate_quota_defaults()[quota_family]
     trend_quota, accum_quota = fit_ai_candidate_quotas(
         total_cap,
         requested_trend,
@@ -359,8 +455,8 @@ def resolve_ai_candidate_policy(
         "requested_accum_quota": requested_accum,
         "trend_quota": trend_quota,
         "accum_quota": accum_quota,
-        "max_trend_l3_fill": max_trend_l3_fill,
-        "max_accum_l3_fill": max_accum_l3_fill,
+        "max_trend_l3_fill": _env_non_negative_int("FUNNEL_AI_MAX_TREND_L3_FILL", "0"),
+        "max_accum_l3_fill": _env_non_negative_int("FUNNEL_AI_MAX_ACCUM_L3_FILL", "0"),
     }
 
 
@@ -785,6 +881,7 @@ def layer2_strength_detailed(
         if cfg.enable_trend_cont_channel and bullish_alignment and rps_filter_active:
             _tc_rps_ok = rps_slow is not None and rps_slow >= cfg.trend_cont_rps_slow_min
             _tc_dd_ok = False
+            _tc_vol_ok = True
             if _tc_rps_ok:
                 dd_window = max(int(cfg.trend_cont_drawdown_window), 10)
                 recent_close = close.tail(dd_window)
@@ -793,14 +890,23 @@ def layer2_strength_detailed(
                     drawdown = (recent_close - cum_max) / cum_max * 100.0
                     max_dd = float(drawdown.min())
                     _tc_dd_ok = abs(max_dd) < cfg.trend_cont_max_drawdown_pct
-            trend_cont_ok = _tc_rps_ok and _tc_dd_ok
+                vol_tc = pd.to_numeric(df_sorted.get("volume"), errors="coerce").dropna()
+                if len(vol_tc) >= 20:
+                    vol20 = float(vol_tc.tail(20).mean())
+                    vol5 = float(vol_tc.tail(5).mean())
+                    if vol20 > 0:
+                        _tc_vol_ok = (vol5 / vol20) >= float(cfg.trend_cont_vol_ratio_min)
+            trend_cont_ok = _tc_rps_ok and _tc_dd_ok and _tc_vol_ok
 
         # 点火破局通道（SOS Bypass）
-        # 如果当天爆发了放量大阳线，哪怕它此前 RPS 很低或者量能没萎缩，也直接送入 L4 让扳机去二次确认
+        # 如果当天爆发了放量大阳线，要求至少不处于长期相对弱势，避免垃圾股单日异动穿透 L2。
         sos_ok = False
         if hasattr(cfg, "sos_vol_ratio"):
             sos_score = _detect_sos(df_sorted, cfg)
-            if sos_score is not None:
+            sos_rps_ok = (not rps_filter_active) or (
+                rps_slow is not None and rps_slow >= float(cfg.sos_bypass_rps_slow_min)
+            )
+            if sos_score is not None and sos_rps_ok:
                 sos_ok = True
 
         if (
@@ -1121,6 +1227,17 @@ def _detect_spring(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
     prev = df_s.iloc[-2]
     last = df_s.iloc[-1]
 
+    # Global Bias Restriction: Prevent buying Spring at extreme highs
+    if len(df_s) >= 200:
+        close_series = pd.to_numeric(df_s["close"], errors="coerce")
+        ma200 = close_series.rolling(200).mean()
+        ma200_last = ma200.iloc[-1]
+        close_last = close_series.iloc[-1]
+        if pd.notna(ma200_last) and pd.notna(close_last) and float(ma200_last) > 0:
+            bias_200 = (float(close_last) - float(ma200_last)) / float(ma200_last) * 100.0
+            if bias_200 > float(getattr(cfg, "global_entry_max_bias_200", 25.0)):
+                return None
+
     # 允许单日盘中洗盘（长下影锤子线）：只要 prev/last 至少一日跌破即可。
     if (prev["low"] >= support_level) and (last["low"] >= support_level):
         return None
@@ -1157,6 +1274,15 @@ def _detect_lps(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
     last_close = close.iloc[-1]
     if last_close < last_ma:
         return None
+
+    # Global Bias Restriction: Prevent buying LPS at extreme highs
+    if len(close) >= 200:
+        ma200 = close.rolling(200).mean()
+        ma200_last = ma200.iloc[-1]
+        if pd.notna(ma200_last) and pd.notna(last_close) and float(ma200_last) > 0:
+            bias_200 = (float(last_close) - float(ma200_last)) / float(ma200_last) * 100.0
+            if bias_200 > float(getattr(cfg, "global_entry_max_bias_200", 25.0)):
+                return None
 
     rising_offset = cfg.lps_lookback + cfg.lps_ma_rising_window
     if len(ma) > rising_offset:
@@ -1203,7 +1329,7 @@ def _detect_evr(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
     close_last = close.iloc[-1]
     if pd.notna(ma200_last) and pd.notna(close_last) and float(ma200_last) > 0:
         bias_200 = (float(close_last) - float(ma200_last)) / float(ma200_last) * 100.0
-        if bias_200 > float(cfg.evr_max_bias_200):
+        if bias_200 > float(cfg.global_entry_max_bias_200):
             return None
 
     # 基准量能取"最近窗口但剔除最后两天"，避免当前异动污染基线
@@ -1292,7 +1418,7 @@ def _detect_sos(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
         ma200_last = ma200.iloc[-1]
         if pd.notna(ma200_last) and pd.notna(close_last) and float(ma200_last) > 0:
             bias_200 = (float(close_last) - float(ma200_last)) / float(ma200_last) * 100.0
-            if bias_200 > float(cfg.sos_max_bias_200):
+            if bias_200 > float(cfg.global_entry_max_bias_200):
                 return None
 
     # 只看当天（威科夫点火通常是当天的明显大阳线）
@@ -1344,13 +1470,7 @@ def _detect_sos(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
     return vol_ratio
 
 
-def _detect_compression(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
-    """压缩蓄势：连续N日ATR收窄+缩量，爆发前夜形态。返回压缩比或None。"""
-    lookback = cfg.compression_lookback
-    atr_w = cfg.compression_atr_window
-    min_required = atr_w + lookback + 5
-    if len(df) < min_required:
-        return None
+def _compression_ohlcv(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series] | None:
     df_s = _sorted_if_needed(df)
     close = pd.to_numeric(df_s["close"], errors="coerce")
     high = pd.to_numeric(df_s["high"], errors="coerce")
@@ -1358,15 +1478,46 @@ def _detect_compression(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
     volume = pd.to_numeric(df_s["volume"], errors="coerce")
     if close.isna().all() or high.isna().all() or low.isna().all():
         return None
+    return close, high, low, volume
 
+
+def _compression_direction_ok(close: pd.Series, cfg: FunnelConfig) -> bool:
+    if not cfg.compression_require_direction:
+        return True
+    direction_ok = False
+    if len(close) >= 25:
+        ma20 = close.rolling(20).mean()
+        ma20_last = ma20.iloc[-1]
+        ma20_prev = ma20.shift(5).iloc[-1]
+        direction_ok = pd.notna(ma20_last) and pd.notna(ma20_prev) and float(ma20_last) >= float(ma20_prev)
+    if len(close) >= 50:
+        ma50_last = close.rolling(50).mean().iloc[-1]
+        close_last = close.iloc[-1]
+        ma50_ok = pd.notna(ma50_last) and pd.notna(close_last) and float(close_last) >= float(ma50_last)
+        direction_ok = direction_ok or ma50_ok
+    return direction_ok
+
+
+def _compression_bias_ok(close: pd.Series, cfg: FunnelConfig) -> bool:
     if len(close) >= 200:
         ma200 = close.rolling(200).mean()
         ma200_last = ma200.iloc[-1]
         if pd.notna(ma200_last) and float(ma200_last) > 0:
             bias = (float(close.iloc[-1]) - float(ma200_last)) / float(ma200_last) * 100.0
-            if bias > cfg.compression_max_bias_200:
-                return None
+            if bias > cfg.global_entry_max_bias_200:
+                return False
+    return True
 
+
+def _compression_atr_ratio(
+    close: pd.Series,
+    high: pd.Series,
+    low: pd.Series,
+    volume: pd.Series,
+    cfg: FunnelConfig,
+) -> float | None:
+    lookback = cfg.compression_lookback
+    atr_w = cfg.compression_atr_window
     tr = pd.concat(
         [high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()],
         axis=1,
@@ -1394,6 +1545,21 @@ def _detect_compression(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
 
     hist_atr_median = float(hist_atr.median())
     return float(current_atr_avg / hist_atr_median) if hist_atr_median > 0 else None
+
+
+def _detect_compression(df: pd.DataFrame, cfg: FunnelConfig) -> float | None:
+    """压缩蓄势：连续N日ATR收窄+缩量，爆发前夜形态。返回压缩比或None。"""
+    lookback = cfg.compression_lookback
+    atr_w = cfg.compression_atr_window
+    if len(df) < atr_w + lookback + 5:
+        return None
+    ohlcv = _compression_ohlcv(df)
+    if ohlcv is None:
+        return None
+    close, high, low, volume = ohlcv
+    if not _compression_direction_ok(close, cfg) or not _compression_bias_ok(close, cfg):
+        return None
+    return _compression_atr_ratio(close, high, low, volume, cfg)
 
 
 def _trend_pullback_peak_idx(close: pd.Series, cfg: FunnelConfig) -> int | None:
@@ -1455,6 +1621,16 @@ def _detect_trend_pullback(
     volume = pd.to_numeric(df_s["volume"], errors="coerce")
     if close.isna().all() or volume.isna().all():
         return None
+
+    # Global Bias Restriction: Prevent buying Trend Pullbacks at extreme highs
+    if len(close) >= 200:
+        ma200 = close.rolling(200).mean()
+        ma200_last = ma200.iloc[-1]
+        close_last = close.iloc[-1]
+        if pd.notna(ma200_last) and pd.notna(close_last) and float(ma200_last) > 0:
+            bias_200 = (float(close_last) - float(ma200_last)) / float(ma200_last) * 100.0
+            if bias_200 > float(getattr(cfg, "trend_pb_max_bias_200", cfg.global_entry_max_bias_200)):
+                return None
 
     peak_idx = _trend_pullback_peak_idx(close, cfg)
     if peak_idx is None:
@@ -1974,13 +2150,15 @@ def allocate_ai_candidates(
                 out.append(c)
         return out
 
-    sos_hit_set = {str(c).strip() for c, _ in result.triggers.get("sos", [])}
-    spring_hit_set = {str(c).strip() for c, _ in result.triggers.get("spring", [])}
-    lps_hit_set = {str(c).strip() for c, _ in result.triggers.get("lps", [])}
-    evr_hit_set = {str(c).strip() for c, _ in result.triggers.get("evr", [])}
-    compression_hit_set = {str(c).strip() for c, _ in result.triggers.get("compression", [])}
-    trend_pb_hit_set = {str(c).strip() for c, _ in result.triggers.get("trend_pullback", [])}
-    other_trigger_set = spring_hit_set | lps_hit_set | evr_hit_set | compression_hit_set | trend_pb_hit_set
+    hit_sets = {
+        "sos": {str(c).strip() for c, _ in result.triggers.get("sos", [])},
+        "spring": {str(c).strip() for c, _ in result.triggers.get("spring", [])},
+        "lps": {str(c).strip() for c, _ in result.triggers.get("lps", [])},
+        "evr": {str(c).strip() for c, _ in result.triggers.get("evr", [])},
+        "compression": {str(c).strip() for c, _ in result.triggers.get("compression", [])},
+        "trend_pullback": {str(c).strip() for c, _ in result.triggers.get("trend_pullback", [])},
+    }
+    sos_hit_set = hit_sets["sos"]
     blocked_exit_signals = {"stop_loss", "distribution_warning"}
 
     def _stage_name(code: str) -> str:
@@ -2000,68 +2178,24 @@ def allocate_ai_candidates(
     def _signal_weight(signal_type: str) -> float:
         return max(float(weights.get(signal_type, 1.0) or 0.0), 0.0)
 
-    def _calc_priority_score(code: str, is_trend_side: bool) -> float:
-        score = 0.0
-        stage_name = _stage_name(code)
-
-        if code in result.markup_symbols:
-            score += 100.0
-        if stage_name == "Accum_C":
-            score += 15.0 if not is_trend_side else 5.0  # 回测显示 Accum 胜率仅 31.8%，降权
-        elif stage_name == "Accum_B":
-            score += 8.0 if not is_trend_side else 3.0
-        elif stage_name == "Accum_A":
-            score += 3.0 if not is_trend_side else 0.0
-
-        if code in sos_hit_set:
-            score += (50.0 if code in other_trigger_set else 15.0) * _signal_weight("sos")
-        if code in spring_hit_set:
-            score += 45.0 * _signal_weight("spring")
-        if code in lps_hit_set:
-            score += 40.0 * _signal_weight("lps")
-        if code in trend_pb_hit_set:
-            score += 45.0 * _signal_weight("trend_pullback")
-        if is_trend_side and (code in sos_hit_set or code in trend_pb_hit_set):
-            score += 10.0 * max(_signal_weight("sos"), _signal_weight("trend_pullback"))
-        if (not is_trend_side) and (code in spring_hit_set or code in lps_hit_set):
-            score += 10.0 * max(_signal_weight("spring"), _signal_weight("lps"))
-
-        exit_sig = result.exit_signals.get(code, {})
-        if exit_sig.get("signal") == "stop_loss":
-            score -= 100.0
-        elif exit_sig.get("signal") == "distribution_warning":
-            score -= 20.0
-
-        return score
+    score_candidate = _build_candidate_priority_scorer(result, hit_sets, _signal_weight)
 
     trend_candidates_with_score: list[tuple[str, float, bool]] = []
     accum_candidates_with_score: list[tuple[str, float, bool]] = []
 
     markup_trend_candidates = [c for c in result.markup_symbols if _is_trend_track(c) or c in sos_hit_set]
     for code in _dedup_order(markup_trend_candidates):
-        trend_candidates_with_score.append((code, _calc_priority_score(code, True), False))
+        trend_candidates_with_score.append((code, score_candidate(code, True), False))
 
-    sos_hit_codes = [
-        str(c).strip()
-        for c, _ in sorted(result.triggers.get("sos", []), key=lambda x: -float(x[1] if x[1] is not None else 0.0))
-        if str(c).strip()
-    ]
-    for code in _dedup_order(sos_hit_codes):
-        if code not in [c[0] for c in trend_candidates_with_score]:
-            trend_candidates_with_score.append((code, _calc_priority_score(code, True), False))
-
-    trend_pb_codes = [
-        str(c).strip()
-        for c, _ in sorted(
-            result.triggers.get("trend_pullback", []),
-            key=lambda x: float(x[1] if x[1] is not None else 0.0),
-            reverse=True,
-        )
-        if str(c).strip()
-    ]
-    for code in _dedup_order(trend_pb_codes):
-        if code not in [c[0] for c in trend_candidates_with_score]:
-            trend_candidates_with_score.append((code, _calc_priority_score(code, True), False))
+    _append_scored_codes(
+        trend_candidates_with_score,
+        _dedup_order(
+            _trigger_codes_by_score(result.triggers, "sos")
+            + _trigger_codes_by_score(result.triggers, "trend_pullback")
+            + _trigger_codes_by_score(result.triggers, "evr")
+        ),
+        lambda code: score_candidate(code, True),
+    )
 
     # Compute `sorted_codes` implicitly from triggers like funnel does
     all_triggers = []
@@ -2076,16 +2210,24 @@ def allocate_ai_candidates(
         if code in [c[0] for c in trend_candidates_with_score]:
             continue
         if code in result.markup_symbols or code in sos_hit_set:
-            trend_candidates_with_score.append((code, _calc_priority_score(code, True), False))
+            trend_candidates_with_score.append((code, score_candidate(code, True), False))
             continue
         # 移除 L3 filler 逻辑: 宁缺毋滥，如果只有几个好标的，就只送这几个给 AI
 
-    accum_hit_candidates = result.triggers.get("spring", []) + result.triggers.get("lps", [])
-    for code, _ in sorted(accum_hit_candidates, key=lambda x: -float(x[1] if x[1] is not None else 0.0)):
-        code = str(code).strip()
-        if _is_blocked_exit(code):
-            continue
-        accum_candidates_with_score.append((code, _calc_priority_score(code, False), False))
+    accum_hit_codes = [
+        str(code).strip()
+        for code, _score in sorted(
+            result.triggers.get("spring", []) + result.triggers.get("lps", []),
+            key=lambda item: -float(item[1] if item[1] is not None else 0.0),
+        )
+        if str(code).strip()
+    ]
+    accum_hit_codes += _trigger_codes_by_score(result.triggers, "compression", reverse=False)
+    _append_scored_codes(
+        accum_candidates_with_score,
+        [code for code in _dedup_order(accum_hit_codes) if not _is_blocked_exit(code)],
+        lambda code: score_candidate(code, False),
+    )
 
     for code in _dedup_order(l3_ranked_symbols):
         if not _is_accum_track(code) or _is_blocked_exit(code):
@@ -2093,7 +2235,7 @@ def allocate_ai_candidates(
         if code in [c[0] for c in accum_candidates_with_score]:
             continue
         if _stage_name(code) == "Accum_C":
-            accum_candidates_with_score.append((code, _calc_priority_score(code, False), False))
+            accum_candidates_with_score.append((code, score_candidate(code, False), False))
             continue
         # 移除 L3 filler 逻辑: 宁缺毋滥
 

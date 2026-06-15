@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from cli.compaction import get_context_window
+from cli.model_metadata import infer_context_window
 
 
 @dataclass(frozen=True)
@@ -38,22 +38,22 @@ class UsageSummary:
 @dataclass(frozen=True)
 class _ModelPattern:
     pattern: re.Pattern[str]
-    context_window: int | None = None
     supports_reasoning: bool = False
     thinking_levels: tuple[str, ...] = ("off",)
 
 
 _MODEL_PATTERNS: tuple[_ModelPattern, ...] = (
-    _ModelPattern(re.compile(r"gemini-2\.5|gemini-3", re.I), 1_000_000, True, ("off", "low", "medium", "high")),
-    _ModelPattern(re.compile(r"gemini-2|gemini", re.I), 1_000_000, False),
-    _ModelPattern(re.compile(r"claude-(?:opus|sonnet|haiku)", re.I), 200_000, True, ("off", "low", "medium", "high")),
+    _ModelPattern(re.compile(r"gemini-2\.5|gemini-3", re.I), True, ("off", "low", "medium", "high")),
+    _ModelPattern(re.compile(r"gemini-2|gemini", re.I), False),
+    _ModelPattern(re.compile(r"claude-(?:opus|sonnet|haiku)", re.I), True, ("off", "low", "medium", "high")),
     _ModelPattern(
-        re.compile(r"\bo[34](?:-|$)|gpt-5|reasoning", re.I), 128_000, True, ("off", "minimal", "low", "medium", "high")
+        re.compile(r"\bo[34](?:-|$)|gpt-5|reasoning", re.I), True, ("off", "minimal", "low", "medium", "high")
     ),
-    _ModelPattern(re.compile(r"gpt-4o|gpt-4\.1|gpt-4", re.I), 128_000, False),
-    _ModelPattern(re.compile(r"deepseek", re.I), 64_000, True, ("off", "low", "medium", "high")),
-    _ModelPattern(re.compile(r"qwen|kimi|moonshot|minimax|mistral", re.I), 128_000, False),
-    _ModelPattern(re.compile(r"longcat|step", re.I), 64_000, False),
+    _ModelPattern(re.compile(r"gpt-4o|gpt-4\.1|gpt-4", re.I), False),
+    _ModelPattern(re.compile(r"deepseek", re.I), True, ("off", "low", "medium", "high")),
+    _ModelPattern(re.compile(r"minimax-m3", re.I), True, ("off", "adaptive")),
+    _ModelPattern(re.compile(r"qwen|kimi|moonshot|minimax|mistral", re.I), False),
+    _ModelPattern(re.compile(r"longcat|step", re.I), False),
 )
 
 
@@ -89,9 +89,7 @@ def infer_model_info(config: dict[str, Any]) -> ModelInfo:
     pattern_info = next((item for item in _MODEL_PATTERNS if item.pattern.search(model)), None)
     context_window = _int_or_none(config.get("context_window"))
     if context_window is None:
-        context_window = (
-            pattern_info.context_window if pattern_info and pattern_info.context_window else get_context_window(model)
-        )
+        context_window = infer_context_window(model)
     supports_reasoning = (
         bool(config.get("supports_reasoning"))
         if "supports_reasoning" in config

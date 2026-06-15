@@ -12,13 +12,26 @@ class _FakeTable:
         self.payload: list[dict] | None = None
         self.conflict = ""
         self.limit_value: int | None = None
+        self.deleted_filters: list[tuple[str, str]] = []
+        self.kind = ""
 
     def upsert(self, payload: list[dict], *, on_conflict: str):
+        self.kind = "upsert"
         self.payload = payload
         self.conflict = on_conflict
         return self
 
+    def delete(self):
+        self.kind = "delete"
+        return self
+
+    def eq(self, column: str, value: str):
+        if self.kind == "delete":
+            self.deleted_filters.append((column, value))
+        return self
+
     def select(self, _columns: str):
+        self.kind = "select"
         return self
 
     def order(self, _column: str, *, desc: bool = False):
@@ -29,7 +42,7 @@ class _FakeTable:
         return self
 
     def execute(self):
-        if self.payload is not None:
+        if self.kind in {"delete", "upsert"}:
             return _Response()
         rows = self.rows[: self.limit_value] if self.limit_value is not None else self.rows
         return _Response(rows)
@@ -49,6 +62,7 @@ def test_upsert_concept_heat_history_sorts_and_limits(monkeypatch):
     from integrations import supabase_concept_heat as mod
 
     client = _FakeClient()
+    monkeypatch.setenv("WYCKOFF_WRITE_CONTEXT", "server_job")
     monkeypatch.setattr(mod, "_configured", lambda: True)
     monkeypatch.setattr(mod, "_admin", lambda: client)
 
@@ -57,12 +71,14 @@ def test_upsert_concept_heat_history_sorts_and_limits(monkeypatch):
         [
             {"name": "低流入", "pct": 1.0, "net_inflow": 10, "cid": "a"},
             {"name": "高流入", "pct": 2.0, "net_inflow": 20, "cid": "b"},
+            {"name": "证金持股", "pct": 9.0, "net_inflow": 900, "cid": "noise"},
         ],
         top_n=1,
     )
 
     assert written == 1
     assert client.table_name == "concept_heat_history"
+    assert client.table_obj.deleted_filters == [("trade_date", "2026-05-25")]
     assert client.table_obj.conflict == "trade_date,concept_name"
     assert client.table_obj.payload == [
         {
@@ -86,8 +102,7 @@ def test_load_concept_heat_history_groups_recent_days(monkeypatch):
             {"trade_date": "2026-05-23", "concept_name": "C", "pct": 3, "net_inflow": 30, "rank": 1},
         ]
     )
-    monkeypatch.setattr(mod, "_configured", lambda: True)
-    monkeypatch.setattr(mod, "_admin", lambda: client)
+    monkeypatch.setattr(mod, "_read", lambda: client)
 
     history = mod.load_concept_heat_history_from_supabase(limit_days=2)
 

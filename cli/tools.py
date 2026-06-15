@@ -208,11 +208,56 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "start": {"type": "string", "description": "开始日期 YYYY-MM-DD，默认 6 个月前"},
                 "end": {"type": "string", "description": "结束日期 YYYY-MM-DD，默认昨天"},
                 "hold_days": {"type": "integer", "description": "最大持仓天数（5/10/15/30），默认 10"},
-                "top_n": {"type": "integer", "description": "每日最大候选数，默认 3"},
+                "top_n": {"type": "integer", "description": "每日最大候选数，默认 4"},
                 "board": {"type": "string", "description": "股票池：'main_chinext'/'main'/'chinext'/'all'"},
-                "stop_loss_pct": {"type": "number", "description": "止损百分比（负数），默认 -7.0"},
-                "take_profit_pct": {"type": "number", "description": "止盈百分比，默认 18.0"},
+                "stop_loss_pct": {"type": "number", "description": "止损百分比（负数），默认 -8.0"},
+                "take_profit_pct": {"type": "number", "description": "止盈百分比，默认 0.0"},
             },
+        },
+    },
+    {
+        "name": "ask_user_question",
+        "description": "向用户提出一个明确问题，用于澄清缺失参数、二次确认或交互式单选。在需要用户输入时优先使用此工具。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "向用户提问的问题描述文本（如：'这次回测要用哪个时间区间？'）",
+                },
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "提供给用户的单选项列表（例如：['近半年', '近一年']）",
+                },
+                "allow_free_text": {
+                    "type": "boolean",
+                    "description": "是否允许用户手动输入自定义回答。默认 true；纯确认场景可设为 false。",
+                },
+                "default_answer": {
+                    "type": "string",
+                    "description": "用户超时或直接回车时采用的默认回答，可为空。",
+                },
+            },
+            "required": ["question"],
+        },
+    },
+    {
+        "name": "execute_skill",
+        "description": "执行内置或用户自定义的高级投研技能（如 screen, checkup, report, strategy, backtest 等）。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "技能名称，如 'screen'、'checkup'、'report'、'strategy'、'backtest'",
+                },
+                "user_input": {
+                    "type": "string",
+                    "description": "可选参数。如果技能包含 {user_input} 占位符，将替换为该值",
+                },
+            },
+            "required": ["name"],
         },
     },
     # ── 委派工具 ──
@@ -333,6 +378,8 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "read_file": ToolSpec("read_file", "读取文件"),
     "write_file": ToolSpec("write_file", "写入文件", requires_approval=True),
     "web_fetch": ToolSpec("web_fetch", "抓取网页"),
+    "ask_user_question": ToolSpec("ask_user_question", "提问用户", concurrency_safe=False),
+    "execute_skill": ToolSpec("execute_skill", "执行技能", concurrency_safe=True),
     "delegate_to_research": ToolSpec("delegate_to_research", "委派研究员"),
     "delegate_to_analysis": ToolSpec("delegate_to_analysis", "委派分析师"),
     "delegate_to_trading": ToolSpec("delegate_to_trading", "委派交易员"),
@@ -358,6 +405,63 @@ def is_concurrency_safe(name: str) -> bool:
     return bool(spec and spec.concurrency_safe)
 
 
+def ask_user_question(
+    question: str,
+    options: list[str] | None = None,
+    allow_free_text: bool = True,
+    default_answer: str = "",
+    *,
+    tool_context=None,
+) -> dict[str, Any]:
+    """向用户提问并阻塞等待答复。"""
+    registry = getattr(tool_context, "registry", None) if tool_context else None
+    if registry and getattr(registry, "_ask_user_question_callback", None):
+        try:
+            answer = registry._ask_user_question_callback(question, options, allow_free_text, default_answer)
+            return {"status": "answered", "answer": answer, "result": f"用户已答复: {answer}"}
+        except Exception as e:
+            logger.error("ask_user_question_callback failed", exc_info=True)
+            return {"error": f"无法获取用户答复: {e}"}
+
+    # Headless fallback: stdin
+    print(f"\n💬 Agent 提问: {question}")
+    if options:
+        for i, opt in enumerate(options):
+            print(f"  [{i}] {opt}")
+    try:
+        prompt = "请输入回答"
+        if default_answer:
+            prompt += f"（默认: {default_answer}）"
+        val = input(f"{prompt}: ").strip() or default_answer
+        if options and val.isdigit():
+            idx = int(val)
+            if 0 <= idx < len(options):
+                val = options[idx]
+        if options and not allow_free_text and val not in options:
+            return {"error": "用户回答不在可选项内"}
+        return {"status": "answered", "answer": val, "result": f"用户已答复: {val}"}
+    except Exception as e:
+        return {"error": f"获取命令行答复失败: {e}"}
+
+
+def execute_skill(name: str, user_input: str = "", *, tool_context=None) -> dict[str, Any]:
+    """执行内置或用户自定义的技能，将技能 prompt 作为结果返回供模型后续消费。"""
+    from cli.skills import load_skills
+
+    skills = load_skills()
+    skill = skills.get(name)
+    if not skill:
+        return {"error": f"未知技能: {name}"}
+
+    prompt = skill.prompt.replace("{user_input}", user_input).strip()
+    return {
+        "status": "success",
+        "skill": name,
+        "instructions": prompt,
+        "message": f"技能 {name} 已成功加载。请严格按照以下 instructions 执行：",
+    }
+
+
 # ---------------------------------------------------------------------------
 # ToolRegistry — 管理工具注册和执行
 # ---------------------------------------------------------------------------
@@ -379,6 +483,7 @@ class ToolRegistry:
         self._bg_manager = None
         self._on_bg_complete = None
         self._confirm_callback = None
+        self._ask_user_question_callback = None
         self._always_allowed: set[str] = set()
 
     def set_provider(self, provider):
@@ -388,6 +493,10 @@ class ToolRegistry:
     def set_confirm_callback(self, callback):
         """注入确认回调，高风险工具执行前会调用。callback(name, args) -> dict。"""
         self._confirm_callback = callback
+
+    def set_ask_user_question_callback(self, callback):
+        """注入 ask_user_question 回调。"""
+        self._ask_user_question_callback = callback
 
     def set_background_manager(self, bg_manager, on_complete=None):
         from cli.background import BackgroundTaskManager
@@ -437,6 +546,8 @@ class ToolRegistry:
             "query_history": query_history,
             "update_portfolio": update_portfolio,
             "run_backtest": run_backtest,
+            "ask_user_question": ask_user_question,
+            "execute_skill": execute_skill,
             "delegate_to_research": delegate_to_research,
             "delegate_to_analysis": delegate_to_analysis,
             "delegate_to_trading": delegate_to_trading,
@@ -446,11 +557,28 @@ class ToolRegistry:
             "web_fetch": web_fetch,
         }
 
-    def schemas(self) -> list[dict[str, Any]]:
-        """返回所有工具的 JSON Schema。"""
-        return TOOL_SCHEMAS
+    def schemas(self, allowed_tools: set[str] | tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+        """返回工具 JSON Schema；allowed_tools 存在时只暴露当前 workflow 范围。"""
+        if not allowed_tools:
+            return TOOL_SCHEMAS
+        allowed = set(allowed_tools)
+        return [schema for schema in TOOL_SCHEMAS if schema["name"] in allowed]
 
-    def execute(self, name: str, args: dict[str, Any]) -> Any:
+    def _check_user_confirmed_in_history(self, messages: list[dict[str, Any]] | None) -> bool:
+        if not messages:
+            return False
+        for m in reversed(messages):
+            if m.get("role") == "tool" and m.get("name") == "ask_user_question":
+                content = m.get("content", "")
+                lower_content = content.lower()
+                if any(
+                    word in lower_content
+                    for word in ("确认", "允许", "继续", "执行", "yes", "ok", "allow", "confirm", "opt_0")
+                ):
+                    return True
+        return False
+
+    def execute(self, name: str, args: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Any:
         """执行指定工具，返回结果。长任务自动提交后台。"""
         # check_background_tasks 直接返回状态
         if name == "check_background_tasks":
@@ -462,16 +590,9 @@ class ToolRegistry:
         if fn is None:
             return {"error": f"未知工具: {name}"}
 
-        # 高风险工具确认
-        if self.requires_approval(name) and self._confirm_callback and name not in self._always_allowed:
-            confirm = self._confirm_callback(name, args)
-            action = confirm.get("action", "deny")
-            if action == "deny":
-                return {"error": "用户拒绝执行此操作"}
-            if action == "always":
-                self._always_allowed.add(name)
-            if action == "edit":
-                args = confirm.get("modified_args", args)
+        args, blocked = self._confirm_high_risk_call(name, args, messages)
+        if blocked:
+            return blocked
 
         # 用副本注入 tool_context，避免污染原始 args（会被序列化进 messages）
         call_args = dict(args)
@@ -501,6 +622,34 @@ class ToolRegistry:
         except Exception as e:
             logger.exception("Tool %s execution failed", name)
             return {"error": f"工具执行失败: {e}"}
+
+    def _confirm_high_risk_call(
+        self,
+        name: str,
+        args: dict[str, Any],
+        messages: list[dict[str, Any]] | None,
+    ) -> tuple[dict[str, Any], dict[str, str] | None]:
+        if not self.requires_approval(name) or name in self._always_allowed:
+            return args, None
+        if self._check_user_confirmed_in_history(messages):
+            return args, None
+        if not self._confirm_callback:
+            return args, {
+                "error": (
+                    f"操作 [{name}] 具有高风险或破坏性参数，已被拦截。 "
+                    "你必须先调用 `ask_user_question` 工具向用户解释其风险并获取显式确认（如单选项或回复“确认”），"
+                    "在用户确认后你才可以再次提交此操作。"
+                )
+            }
+        confirm = self._confirm_callback(name, args)
+        action = confirm.get("action", "deny")
+        if action == "deny":
+            return args, {"error": "用户拒绝执行此操作"}
+        if action == "always":
+            self._always_allowed.add(name)
+        if action == "edit":
+            return confirm.get("modified_args", args), None
+        return args, None
 
     def display_name(self, name: str) -> str:
         """返回工具的中文显示名。"""

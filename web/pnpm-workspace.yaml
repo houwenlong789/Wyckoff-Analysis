@@ -1,0 +1,13 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+overrides:
+  ws: 8.20.1
+allowBuilds:
+  esbuild: true
+  sharp: true
+  workerd: true
+minimumReleaseAgeExclude:
+  - '@ai-sdk/gateway@3.0.131'
+  - '@ai-sdk/react@3.0.207'
+  - ai@6.0.205

@@ -106,14 +106,27 @@ _TOOL_CN_NAMES = {
     "analyze_stock": "个股分析",
 }
 
+_CURRENT_USER_OPEN = "<current-user-message>"
+_CURRENT_USER_CLOSE = "</current-user-message>"
+
 
 def _normalize_text(text: str) -> str:
     return str(text or "").strip().lower()
 
 
+def _strip_recall_context(text: str) -> str:
+    raw = str(text or "")
+    start = raw.rfind(_CURRENT_USER_OPEN)
+    end = raw.rfind(_CURRENT_USER_CLOSE)
+    if start >= 0 and end > start:
+        start += len(_CURRENT_USER_OPEN)
+        return raw[start:end].strip()
+    return raw
+
+
 def _message_text(message: dict[str, Any]) -> str:
     content = message.get("content", "")
-    return str(content) if isinstance(content, str) else ""
+    return _strip_recall_context(content) if isinstance(content, str) else ""
 
 
 def _last_user_text(messages: list[dict[str, Any]]) -> str:

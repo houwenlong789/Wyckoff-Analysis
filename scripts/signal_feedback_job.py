@@ -37,6 +37,13 @@ def _parse_horizons(raw: str) -> tuple[int, ...]:
     return tuple(values or [1, 3, 5, 10, 20])
 
 
+def _default_registry_horizon() -> int:
+    try:
+        return max(int(float(os.getenv("SIGNAL_REGISTRY_HORIZON", "5"))), 1)
+    except (TypeError, ValueError):
+        return 5
+
+
 def _date_minus(raw: Any, days: int) -> str:
     parsed = datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
     return (parsed - timedelta(days=max(days, 0))).isoformat()
@@ -143,7 +150,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=5000)
     parser.add_argument("--outcome-limit", type=int, default=20000)
     parser.add_argument("--min-samples", type=int, default=20)
-    parser.add_argument("--registry-horizon", type=int, default=10)
+    parser.add_argument("--registry-horizon", type=int, default=_default_registry_horizon())
     parser.add_argument("--health-only", action="store_true")
     return parser.parse_args()
 

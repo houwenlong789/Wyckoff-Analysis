@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import sys
+from datetime import date
+
+import pandas as pd
 
 
 def test_preview_only_skips_persistence_and_keeps_llm_input_path(monkeypatch, tmp_path):
@@ -32,10 +35,19 @@ def test_preview_only_skips_persistence_and_keeps_llm_input_path(monkeypatch, tm
 
     def fake_run_step2_5(*_args, dry_run=False, **_kwargs):
         captured["signal_dry_run"] = dry_run
-        return [{"code": "000002", "name": "万科A", "tag": "pending confirmed"}]
+        return [
+            {
+                "code": "000002",
+                "name": "万科A",
+                "tag": "EVR(二次确认)",
+                "selection_source": "signal_confirmed",
+                "confirm_reason": "守住 10.00",
+            }
+        ]
 
     def fake_run_step3(symbols_info, webhook_url, *_args, **_kwargs):
         captured["step3_symbols"] = [item["code"] for item in symbols_info]
+        captured["step3_items"] = symbols_info
         captured["step3_webhook"] = webhook_url
         return True, "ok_preview", "# Step3 模型输入预演"
 
@@ -44,7 +56,8 @@ def test_preview_only_skips_persistence_and_keeps_llm_input_path(monkeypatch, tm
     monkeypatch.setenv("DAILY_JOB_PREVIEW_ONLY", "1")
     monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://example.invalid/webhook")
     monkeypatch.setattr(sys, "argv", ["daily_job.py", "--logs", str(tmp_path / "preview.log")])
-    monkeypatch.setattr(daily_job, "next_trading_day", lambda today: today)
+    monkeypatch.setattr(daily_job, "resolve_end_calendar_day", lambda: date(2026, 5, 31))
+    monkeypatch.setattr(daily_job, "is_a_share_trading_day", lambda d: d == date(2026, 6, 1))
     monkeypatch.setattr(daily_job, "_latest_trade_date_str", lambda: "2026-05-19")
     monkeypatch.setattr(daily_job, "upsert_market_signal_daily", forbidden_write)
     monkeypatch.setattr(daily_job, "prepare_recommendation_payload", forbidden_write)
@@ -63,6 +76,60 @@ def test_preview_only_skips_persistence_and_keeps_llm_input_path(monkeypatch, tm
     assert captured["signal_dry_run"] is True
     assert captured["step3_webhook"] == "https://example.invalid/webhook"
     assert captured["step3_symbols"] == ["000001", "000002"]
+    assert captured["step3_items"][1]["selection_source"] == "signal_confirmed"
+    assert captured["step3_items"][1]["confirm_reason"] == "守住 10.00"
+
+
+def test_non_trading_skip_message_allows_when_next_day_trades(monkeypatch):
+    import scripts.daily_job as daily_job
+
+    monkeypatch.setattr(daily_job, "is_a_share_trading_day", lambda d: d == date(2026, 6, 1))
+
+    assert daily_job._non_trading_skip_message(date(2026, 5, 31)) is None
+
+
+def test_non_trading_skip_message_skips_when_next_day_is_closed(monkeypatch):
+    import scripts.daily_job as daily_job
+
+    monkeypatch.setattr(daily_job, "is_a_share_trading_day", lambda _day: False)
+
+    msg = daily_job._non_trading_skip_message(date(2026, 5, 29))
+
+    assert msg == "📅 明日 2026-05-30 非 A 股交易日，任务跳过"
+
+
+def test_non_trading_skip_message_skips_holiday_before_next_trade(monkeypatch):
+    import scripts.daily_job as daily_job
+
+    monkeypatch.setattr(daily_job, "is_a_share_trading_day", lambda d: d == date(2026, 6, 3))
+
+    msg = daily_job._non_trading_skip_message(date(2026, 5, 30))
+
+    assert msg == "📅 明日 2026-05-31 非 A 股交易日，任务跳过"
+
+
+def test_step4_candidate_confirmation_gate_accepts_only_confirmed():
+    import scripts.daily_job as daily_job
+
+    assert daily_job._is_confirmed_step4_candidate({"tag": "SOS(确认)"})
+    assert daily_job._is_confirmed_step4_candidate({"status": "confirmed"})
+    assert not daily_job._is_confirmed_step4_candidate({"tag": "SOS（量价点火）"})
+
+
+def test_step3_codes_filter_keeps_only_confirmed_candidates():
+    import scripts.daily_job as daily_job
+
+    kept, blocked = daily_job._filter_confirmed_step3_codes(
+        ["000001", "000002", "000003"],
+        [
+            {"code": "000001", "signal_status": "confirmed"},
+            {"code": "000002", "tag": "SOS（量价点火）"},
+            {"code": "000003", "tag": "LPS(确认)"},
+        ],
+    )
+
+    assert kept == ["000001", "000003"]
+    assert blocked == ["000002"]
 
 
 def test_signal_confirmation_dry_run_does_not_write(monkeypatch):
@@ -87,6 +154,47 @@ def test_signal_confirmation_dry_run_does_not_write(monkeypatch):
 
     assert confirmed == [{"code": "000001"}]
     assert writes == []
+
+
+def test_step3_confirmed_preview_lists_signal_pending_source():
+    import scripts.step3_batch_report as step3
+
+    preview = step3._build_signal_confirmed_preview(
+        pd.DataFrame(
+            [
+                {
+                    "code": "603039",
+                    "name": "泛微网络",
+                    "input_order": 0,
+                    "signal_status": "confirmed",
+                    "signal_type": "evr",
+                    "signal_date": "2026-06-11",
+                    "confirm_date": "2026-06-12",
+                    "confirm_reason": "守住 44.01，收盘 47.61",
+                }
+            ]
+        )
+    )
+
+    assert "二次确认补充" in preview
+    assert "603039 泛微网络" in preview
+    assert "2026-06-11 → 2026-06-12" in preview
+
+
+def test_shadow_observation_inputs_build_added_and_removed_sources():
+    import scripts.daily_job as daily_job
+
+    triggers, source_map, score_map = daily_job._shadow_observation_inputs(
+        {
+            "shadow_added": ["000001"],
+            "shadow_removed": ["000002"],
+            "shadow_score_map": {"000001": 3.5, "000002": 1.2},
+        }
+    )
+
+    assert triggers == {"shadow_added": [("000001", 3.5)], "shadow_removed": [("000002", 1.2)]}
+    assert source_map == {"000001": "shadow_added", "000002": "shadow_removed"}
+    assert score_map["000001"] == 3.5
 
 
 def test_persist_signal_observations_reports_write_failure(monkeypatch):

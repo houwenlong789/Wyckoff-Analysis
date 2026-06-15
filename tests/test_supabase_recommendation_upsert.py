@@ -47,6 +47,7 @@ class FakeSupabaseQuery:
 
 
 def _enable_fake_supabase(monkeypatch, client: FakeSupabaseClient) -> None:
+    monkeypatch.setenv("WYCKOFF_WRITE_CONTEXT", "server_job")
     monkeypatch.setattr("integrations.supabase_recommendation.is_supabase_configured", lambda: True)
     monkeypatch.setattr("integrations.supabase_recommendation._get_supabase_admin_client", lambda: client)
 
@@ -83,8 +84,33 @@ def test_upsert_recommendations_dedupes_same_code_same_date(monkeypatch):
     ok = upsert_recommendations(
         20260518,
         [
-            {"code": "600203", "name": "福日电子", "initial_price": 10.0, "funnel_score": 6.0},
-            {"code": "600203", "name": "福日电子", "initial_price": 10.5, "funnel_score": 9.0},
+            {
+                "code": "600203",
+                "name": "福日电子",
+                "initial_price": 10.0,
+                "funnel_score": 6.0,
+                "primary_signal": "evr",
+                "selection_source": "l3_fill",
+                "priority_rank": 3,
+            },
+            {
+                "code": "600203",
+                "name": "福日电子",
+                "initial_price": 10.5,
+                "funnel_score": 9.0,
+                "primary_signal": "sos",
+                "signal_types": ["sos", "lps"],
+                "selection_source": "l4_hit",
+                "priority_rank": 1,
+                "market_regime": "PANIC_REPAIR",
+                "springboard_a": True,
+                "springboard_b": True,
+                "springboard_c": False,
+                "springboard_combo": "A+B",
+                "springboard_met_count": 2,
+                "springboard_evidence": {"a_hits": [{"date": "2026-05-18"}]},
+                "springboard_scored": True,
+            },
         ],
     )
 
@@ -92,6 +118,14 @@ def test_upsert_recommendations_dedupes_same_code_same_date(monkeypatch):
     assert len(client.upserts[0]) == 1
     assert client.upserts[0][0]["code"] == 600203
     assert client.upserts[0][0]["funnel_score"] == 9.0
+    assert client.upserts[0][0]["primary_signal"] == "sos"
+    assert client.upserts[0][0]["signal_types"] == ["sos", "lps"]
+    assert client.upserts[0][0]["selection_source"] == "l4_hit"
+    assert client.upserts[0][0]["selection_rank"] == 1
+    assert client.upserts[0][0]["market_regime"] == "PANIC_REPAIR"
+    assert client.upserts[0][0]["springboard_combo"] == "A+B"
+    assert client.upserts[0][0]["springboard_met_count"] == 2
+    assert client.upserts[0][0]["springboard_evidence"]["a_hits"][0]["date"] == "2026-05-18"
 
 
 def test_upsert_recommendations_writes_large_payload_in_chunks(monkeypatch):
@@ -118,6 +152,17 @@ def test_write_recommendation_backup_artifact_marks_ai_and_sql(tmp_path):
             "recommend_count": 2,
             "funnel_score": 9.0,
             "is_ai_recommended": False,
+            "primary_signal": "sos",
+            "signal_types": ["sos", "lps"],
+            "selection_source": "l4_hit",
+            "market_regime": "PANIC_REPAIR",
+            "springboard_a": True,
+            "springboard_b": False,
+            "springboard_c": True,
+            "springboard_combo": "A+C",
+            "springboard_met_count": 2,
+            "springboard_evidence": {"c_support": {"touch_dates": ["2026-05-24"]}},
+            "springboard_scored": True,
             "updated_at": "2026-05-26T10:00:00+00:00",
         }
     ]
@@ -132,4 +177,6 @@ def test_write_recommendation_backup_artifact_marks_ai_and_sql(tmp_path):
     sql = (tmp_path / "recommendation_tracking_20260526.sql").read_text(encoding="utf-8")
     assert "insert into public.recommendation_tracking" in sql
     assert "on conflict (code, recommend_date) do update set" in sql
+    assert "array['sos', 'lps']::text[]" in sql
+    assert '\'{"c_support": {"touch_dates": ["2026-05-24"]}}\'::jsonb' in sql
     assert "'O''Reilly setup'" in sql

@@ -2,7 +2,7 @@
 阶段 4：私人账户再平衡决策（OMS 重构版）
 1) LLM 只输出结构化动作 JSON
 2) Python 订单管理引擎负责仓位/手数/风险计算
-3) 输出标准交易工单并推送 Telegram
+3) 输出标准交易工单并推送 Telegram / Feishu
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ from tools.data_fetcher import (
     latest_trade_date_from_hist as _latest_trade_date_from_hist,
 )
 from tools.report_builder import _extract_json_block
+from utils.feishu import send_feishu_notification
 from utils.notify import send_to_telegram
 from utils.trading_clock import CN_TZ, resolve_end_calendar_day
 
@@ -115,6 +116,7 @@ STEP4_MAX_NEW_BUYS_RISK_OFF = max(int(os.getenv("STEP4_MAX_NEW_BUYS_RISK_OFF", "
 BENCHMARK_REGIME_SEVERITY = {
     "RISK_ON": 0,
     "NEUTRAL": 1,
+    "BEAR_REBOUND": 2,
     "PANIC_REPAIR": 2,
     "RISK_OFF": 3,
     "CRASH": 4,
@@ -461,6 +463,7 @@ def _resolve_chase_limits(dec: DecisionItem, market_regime: str) -> tuple[float,
         "RISK_ON": 1.10,
         "NEUTRAL": 1.00,
         "CAUTION": 0.92,
+        "BEAR_REBOUND": 0.92,
         "PANIC_REPAIR": 0.95,
         "RISK_OFF": 0.85,
         "CRASH": 0.70,
@@ -1448,7 +1451,7 @@ def _max_new_buy_names(market_regime: str) -> int:
     regime = _clean_text(market_regime).upper() or "NEUTRAL"
     if regime == "RISK_ON":
         return STEP4_MAX_NEW_BUYS_RISK_ON
-    if regime in {"CAUTION", "PANIC_REPAIR"}:
+    if regime in {"CAUTION", "BEAR_REBOUND", "PANIC_REPAIR"}:
         return STEP4_MAX_NEW_BUYS_CAUTION
     if regime == "RISK_OFF":
         return STEP4_MAX_NEW_BUYS_RISK_OFF
@@ -1609,6 +1612,26 @@ def _render_trade_ticket(
     return "\n".join(lines)
 
 
+def _send_feishu_trade_ticket(report: str) -> None:
+    webhook = os.getenv("FEISHU_WEBHOOK_URL", "").strip()
+    if not webhook:
+        print("[step4] FEISHU_WEBHOOK_URL 未配置，跳过 Step4 飞书发送")
+        return
+    ok = send_feishu_notification(webhook, "Alpha-OMS 交易执行工单", report)
+    print(f"[step4] Feishu: {'ok' if ok else 'failed'}")
+
+
+def _send_trade_ticket(report: str, tg_bot_token: str, tg_chat_id: str) -> bool:
+    sent = send_to_telegram(
+        report,
+        tg_bot_token=tg_bot_token,
+        tg_chat_id=tg_chat_id,
+    )
+    if sent:
+        _send_feishu_trade_ticket(report)
+    return sent
+
+
 def _build_user_message(
     *,
     benchmark_text: str,
@@ -1646,7 +1669,7 @@ def _build_user_message(
         + "TRIM: 只在逼近止损、放量跌破关键位、上涨后出现派发/滞涨时使用；不能只因为浮亏或持有天数而减仓。\n"
         + "HOLD: 默认动作。结构未破坏、止损未触发、无更强替代候选时必须继续持有。\n"
         + "PROBE/ATTACK加仓: 只允许已有持仓浮盈、止损已上移、且当前结构明显强于原买点时使用；禁止亏损补仓。\n"
-        + "新开仓: 只有候选明显强于现有最弱持仓且不挤占风控预算时才允许。\n\n"
+        + "新开仓: 只允许二次确认候选；候选还必须明显强于现有最弱持仓且不挤占风控预算。\n\n"
         + "[内部持仓量价切片]\n"
         + (positions_payload if positions_payload else "当前无持仓，仅现金。")
         + "\n\n[漏斗候选量价切片]\n"
@@ -1730,6 +1753,7 @@ def run(
     candidate_codes: list[str] = []
     seen_candidate_codes: set[str] = set()
     candidate_items: list[dict] = []
+    allow_external_report_candidates = candidate_meta is None
     for item in candidate_meta or []:
         if not isinstance(item, dict):
             continue
@@ -1741,11 +1765,12 @@ def run(
         seen_candidate_codes.add(code)
         candidate_codes.append(code)
         candidate_items.append(dict(item))
-    for code in _extract_stock_codes(external_report):
-        if code in position_code_set or code in seen_candidate_codes:
-            continue
-        seen_candidate_codes.add(code)
-        candidate_codes.append(code)
+    if allow_external_report_candidates:
+        for code in _extract_stock_codes(external_report):
+            if code in position_code_set or code in seen_candidate_codes:
+                continue
+            seen_candidate_codes.add(code)
+            candidate_codes.append(code)
     allowed_codes = set(position_codes + candidate_codes)
     candidate_meta_map = _build_candidate_meta_map(candidate_meta, portfolio.positions)
     name_map = {p.code: p.name for p in portfolio.positions}
@@ -1952,11 +1977,7 @@ def run(
         free_cash_after=free_cash_after,
         tickets=tickets,
     )
-    sent = send_to_telegram(
-        report,
-        tg_bot_token=tg_bot_token,
-        tg_chat_id=tg_chat_id,
-    )
+    sent = _send_trade_ticket(report, tg_bot_token, tg_chat_id)
     if not sent:
         return (False, "telegram_failed")
 

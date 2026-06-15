@@ -17,7 +17,8 @@ import argparse
 import os
 import sys
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 # Ensure project root is on sys.path for direct script invocation
@@ -33,7 +34,7 @@ from integrations.supabase_recommendation import (
     upsert_recommendation_payload,
     write_recommendation_backup_artifact,
 )
-from utils.trading_clock import next_trading_day, resolve_end_calendar_day
+from utils.trading_clock import is_a_share_trading_day, resolve_end_calendar_day
 
 TZ = ZoneInfo("Asia/Shanghai")
 STEP3_REASON_MAP = {
@@ -58,6 +59,13 @@ STEP4_REASON_MAP = {
 
 def _env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_flag_default(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _now() -> str:
@@ -92,6 +100,13 @@ def _notify_skip(msg: str, feishu: str = "", wecom: str = "", dingtalk: str = ""
             from utils.notify import send_dingtalk_notification
 
             send_dingtalk_notification(dingtalk, "定时任务跳过", msg)
+
+
+def _non_trading_skip_message(today: date) -> str | None:
+    next_day = today + timedelta(days=1)
+    if is_a_share_trading_day(next_day):
+        return None
+    return f"📅 明日 {next_day} 非 A 股交易日，任务跳过"
 
 
 class _TeeStream:
@@ -241,6 +256,346 @@ def _mark_step3_recommendations(
         _log(f"推荐记录AI标记失败: {e}", logs_path)
 
 
+def _shadow_observation_inputs(step2_details: dict) -> tuple[dict[str, list[tuple[str, float]]], dict[str, str], dict]:
+    score_map = step2_details.get("shadow_score_map") or {}
+    triggers: dict[str, list[tuple[str, float]]] = {}
+    source_map: dict[str, str] = {}
+    for signal_type, source_key in (("shadow_added", "shadow_added"), ("shadow_removed", "shadow_removed")):
+        rows: list[tuple[str, float]] = []
+        for code in step2_details.get(signal_type, []) or []:
+            code_s = str(code).strip()
+            if not code_s:
+                continue
+            rows.append((code_s, float(score_map.get(code_s, 0.0) or 0.0)))
+            source_map[code_s] = source_key
+        if rows:
+            triggers[signal_type] = rows
+    return triggers, source_map, score_map
+
+
+def _merge_observation_trigger_maps(step2_details: dict) -> dict[str, list[tuple[str, float]]]:
+    metrics = step2_details.get("metrics", {}) or {}
+    out: dict[str, list[tuple[str, float]]] = {}
+    for trigger_map in (
+        step2_details.get("review_triggers") or step2_details.get("triggers") or {},
+        metrics.get("external_seed_l4_triggers") or {},
+    ):
+        for signal_type, hits in trigger_map.items():
+            out.setdefault(str(signal_type).strip().lower(), []).extend(hits or [])
+    return {signal_type: hits for signal_type, hits in out.items() if signal_type and hits}
+
+
+def _build_footprint_map(step2_details: dict) -> dict[str, dict]:
+    from core.price_action_footprint import build_price_action_footprint_map
+
+    metrics = step2_details.get("metrics", {}) or {}
+    df_map = step2_details.get("all_df_map") or metrics.get("all_df_map") or {}
+    return build_price_action_footprint_map(_merge_observation_trigger_maps(step2_details), df_map)
+
+
+def _tail_confirmation_trigger_items(step2_details: dict, ai_codes: list[str]) -> list[tuple[str, str, float]]:
+    target_order: list[str] = []
+    for raw in list(step2_details.get("selected_for_ai", []) or []) + list(ai_codes or []):
+        code = str(raw or "").strip()
+        if code and code not in target_order:
+            target_order.append(code)
+    if not target_order:
+        return []
+    targets = set(target_order)
+    items: list[tuple[str, str, float]] = []
+    for signal_type, hits in (step2_details.get("review_triggers") or step2_details.get("triggers") or {}).items():
+        sig = str(signal_type or "").strip().lower()
+        if not sig:
+            continue
+        for code, raw_score in hits or []:
+            code_s = str(code or "").strip()
+            if code_s not in targets:
+                continue
+            try:
+                score = float(raw_score or 0.0)
+            except (TypeError, ValueError):
+                score = 0.0
+            items.append((sig, code_s, score))
+    return items
+
+
+def _intraday_tail_payload(
+    df_1m: Any,
+    *,
+    signal_type: str,
+    trigger_score: float,
+    daily_context: dict | None,
+) -> dict:
+    from core.tail_buy_strategy import compute_tail_features, score_tail_features
+
+    features = compute_tail_features(df_1m, daily_context=daily_context)
+    tail_score, tail_decision, reasons = score_tail_features(
+        features,
+        signal_score=trigger_score,
+        signal_type=signal_type,
+        status="pending",
+    )
+    return {
+        "version": "intraday_tail_confirmation_v1",
+        "source": "tickflow_1m",
+        "tail_score": round(float(tail_score), 1),
+        "tail_decision": tail_decision,
+        "tail_reasons": reasons[:6],
+        **features,
+    }
+
+
+def _build_intraday_tail_map(step2_details: dict, ai_codes: list[str], logs_path: str | None) -> dict[str, dict]:
+    if os.getenv("FUNNEL_INTRADAY_TAIL_CONFIRMATION", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return {}
+    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not api_key:
+        _log("尾盘分钟线确认: 跳过（TICKFLOW_API_KEY 未配置）", logs_path)
+        return {}
+    items = _tail_confirmation_trigger_items(step2_details, ai_codes)
+    if not items:
+        return {}
+    try:
+        max_symbols = max(int(os.getenv("FUNNEL_TAIL_CONFIRMATION_MAX_SYMBOLS", "40")), 1)
+    except ValueError:
+        max_symbols = 40
+    codes = list(dict.fromkeys(code for _sig, code, _score in items))[:max_symbols]
+    allowed = set(codes)
+    try:
+        from integrations.tickflow_client import TickFlowClient, normalize_cn_symbol
+
+        symbols = [normalize_cn_symbol(code) for code in codes]
+        data_map = TickFlowClient(api_key=api_key).get_intraday_batch(symbols, period="1m", count=5000)
+        springboard_map = step2_details.get("springboard_map") or _build_springboard_map(step2_details)
+        out: dict[str, dict[str, Any]] = {}
+        for sig, code, trigger_score in items:
+            if code not in allowed:
+                continue
+            df_1m = data_map.get(normalize_cn_symbol(code))
+            if df_1m is None or df_1m.empty:
+                continue
+            springboard = springboard_map.get(f"{sig}:{code}") or springboard_map.get(code) or {}
+            support = springboard.get("springboard_support")
+            daily_context = {"support_level": support} if support else None
+            payload = _intraday_tail_payload(
+                df_1m,
+                signal_type=sig,
+                trigger_score=trigger_score,
+                daily_context=daily_context,
+            )
+            out[f"{sig}:{code}"] = payload
+            out.setdefault(code, payload)
+        feature_count = sum(1 for key in out if ":" in key)
+        _log(f"尾盘分钟线确认: requested={len(codes)}, features={feature_count}", logs_path)
+        return out
+    except Exception as e:
+        _log(f"尾盘分钟线确认失败（已降级）: {e}", logs_path)
+        return {}
+
+
+def _external_capital_codes(step2_details: dict, ai_codes: list[str]) -> list[str]:
+    ordered: list[str] = []
+    for raw in list(step2_details.get("selected_for_ai", []) or []) + list(ai_codes or []):
+        code = str(raw or "").strip()
+        if code and code not in ordered:
+            ordered.append(code)
+    if ordered:
+        return ordered
+    return list(dict.fromkeys(code for _sig, code, _score in _tail_confirmation_trigger_items(step2_details, ai_codes)))
+
+
+def _build_external_capital_context_map(
+    step2_details: dict, ai_codes: list[str], logs_path: str | None
+) -> dict[str, dict]:
+    flag = os.getenv("FUNNEL_EXTERNAL_CAPITAL_CONTEXT", "1").strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return {}
+    codes = _external_capital_codes(step2_details, ai_codes)
+    if not codes:
+        return {}
+    try:
+        max_symbols = max(int(os.getenv("FUNNEL_EXTERNAL_CAPITAL_MAX_SYMBOLS", "20")), 1)
+    except ValueError:
+        max_symbols = 20
+    include_tick = _env_flag("FUNNEL_EXTERNAL_CAPITAL_TICK_CONTEXT")
+    try:
+        tick_max = max(int(os.getenv("FUNNEL_EXTERNAL_CAPITAL_TICK_MAX_SYMBOLS", "3")), 0)
+    except ValueError:
+        tick_max = 3
+    try:
+        tick_min = float(os.getenv("FUNNEL_EXTERNAL_CAPITAL_TICK_MIN_AMOUNT_YUAN", "1000000"))
+    except ValueError:
+        tick_min = 1_000_000.0
+    try:
+        from integrations.external_capital_context import build_external_capital_context
+
+        requested = codes[:max_symbols]
+        out = build_external_capital_context(
+            requested,
+            _latest_trade_date_str(),
+            include_tick=include_tick,
+            tick_max_symbols=tick_max,
+            tick_min_amount_yuan=tick_min,
+        )
+        _log(
+            f"外部资金佐证: requested={len(requested)}, features={len(out)}, tick={'on' if include_tick else 'off'}",
+            logs_path,
+        )
+        return out
+    except Exception as e:
+        _log(f"外部资金佐证失败（已降级）: {e}", logs_path)
+        return {}
+
+
+def _observation_context(step2_details: dict) -> tuple[dict, dict, dict, dict, dict, dict, dict, dict]:
+    metrics = step2_details.get("metrics", {}) or {}
+    footprint_map = step2_details.get("footprint_map")
+    if footprint_map is None:
+        footprint_map = _build_footprint_map(step2_details)
+        step2_details["footprint_map"] = footprint_map
+    return (
+        metrics,
+        step2_details.get("name_map", {}) or {},
+        step2_details.get("sector_map", {}) or {},
+        metrics.get("accum_stage_map", {}) or {},
+        metrics.get("layer2_channel_map", {}) or {},
+        metrics.get("latest_close_map", {}) or {},
+        step2_details.get("springboard_map") or _build_springboard_map(step2_details),
+        footprint_map,
+    )
+
+
+def _signal_observation_source_map(step2_details: dict) -> dict[str, str]:
+    metrics = step2_details.get("metrics", {}) or {}
+    bypass_codes = {str(c).strip() for c in step2_details.get("l2_bypass_selected", []) if str(c).strip()}
+    strategic_codes = {str(c).strip() for c in step2_details.get("strategic_l2_bypass_selected", []) if str(c).strip()}
+    external_codes = {str(c).strip() for c in step2_details.get("external_seed_selected", []) if str(c).strip()}
+    source_map = {code: "l2_bypass" for code in bypass_codes}
+    source_map.update({code: "strategic_l2_bypass" for code in strategic_codes})
+    source_map.update(
+        {code: f"external_seed:{metrics.get('external_seed_source') or 'external'}" for code in external_codes}
+    )
+    return source_map
+
+
+def _build_signal_observation_rows(
+    step2_details: dict,
+    regime: str,
+    ai_codes: list[str],
+) -> list[dict]:
+    from core.signal_feedback import build_signal_observations
+
+    metrics, name_map, sector_map, stage_map, channel_map, close_map, springboard_map, footprint_map = (
+        _observation_context(step2_details)
+    )
+    selected_for_ai = step2_details.get("selected_for_ai", []) or []
+    intraday_tail_map = step2_details.get("intraday_tail_map") or {}
+    source_context_map = step2_details.get("source_context_map") or {}
+    return build_signal_observations(
+        _latest_trade_date_str(),
+        step2_details.get("review_triggers") or step2_details.get("triggers") or {},
+        regime=regime,
+        selected_for_ai=selected_for_ai,
+        ai_recommended=ai_codes,
+        name_map=name_map,
+        sector_map=sector_map,
+        score_map=step2_details.get("priority_score_map", {}) or {},
+        stage_map=stage_map,
+        channel_map=channel_map,
+        latest_close_map=close_map,
+        source_map=_signal_observation_source_map(step2_details),
+        springboard_map=springboard_map,
+        footprint_map=footprint_map,
+        intraday_tail_map=intraday_tail_map,
+        source_context_map=source_context_map,
+        selection_mode=os.getenv("FUNNEL_AI_SELECTION_MODE", "quota"),
+        policy_version=f"dynamic:{os.getenv('FUNNEL_DYNAMIC_POLICY', 'off')}",
+        rank_map={str(code): idx + 1 for idx, code in enumerate(selected_for_ai)},
+    )
+
+
+def _build_shadow_observation_rows(step2_details: dict, regime: str) -> list[dict]:
+    from core.signal_feedback import build_signal_observations
+
+    shadow_triggers, shadow_source_map, shadow_score_map = _shadow_observation_inputs(step2_details)
+    if not shadow_triggers:
+        return []
+    _, name_map, sector_map, stage_map, channel_map, close_map, _, footprint_map = _observation_context(step2_details)
+    intraday_tail_map = step2_details.get("intraday_tail_map") or {}
+    source_context_map = step2_details.get("source_context_map") or {}
+    return build_signal_observations(
+        _latest_trade_date_str(),
+        shadow_triggers,
+        regime=regime,
+        name_map=name_map,
+        sector_map=sector_map,
+        score_map=shadow_score_map,
+        stage_map=stage_map,
+        channel_map=channel_map,
+        latest_close_map=close_map,
+        source_map=shadow_source_map,
+        footprint_map=footprint_map,
+        intraday_tail_map=intraday_tail_map,
+        source_context_map=source_context_map,
+        selection_mode="shadow",
+        policy_version=f"dynamic:{os.getenv('FUNNEL_DYNAMIC_POLICY', 'off')}",
+    )
+
+
+def _build_external_seed_signal_rows(step2_details: dict, regime: str) -> list[dict]:
+    from core.signal_feedback import build_signal_observations
+
+    metrics, name_map, sector_map, stage_map, channel_map, close_map, springboard_map, footprint_map = (
+        _observation_context(step2_details)
+    )
+    intraday_tail_map = step2_details.get("intraday_tail_map") or {}
+    source_context_map = step2_details.get("source_context_map") or {}
+    selected = {str(code).strip() for code in step2_details.get("selected_for_ai", []) if str(code).strip()}
+    triggers = {
+        signal_type: [(code, score) for code, score in hits if str(code).strip() not in selected]
+        for signal_type, hits in (metrics.get("external_seed_l4_triggers") or {}).items()
+    }
+    triggers = {signal_type: hits for signal_type, hits in triggers.items() if hits}
+    if not triggers:
+        return []
+    source = f"external_seed:{metrics.get('external_seed_source') or 'external'}"
+    source_map = {str(code): source for hits in triggers.values() for code, _score in hits}
+    return build_signal_observations(
+        _latest_trade_date_str(),
+        triggers,
+        regime=regime,
+        name_map=name_map,
+        sector_map=sector_map,
+        score_map=step2_details.get("priority_score_map", {}) or {},
+        stage_map=stage_map,
+        channel_map=channel_map,
+        latest_close_map=close_map,
+        source_map=source_map,
+        springboard_map=springboard_map,
+        footprint_map=footprint_map,
+        intraday_tail_map=intraday_tail_map,
+        source_context_map=source_context_map,
+        selection_mode="external_seed_shadow",
+        policy_version=f"external_seed:{metrics.get('external_seed_source') or 'external'}",
+    )
+
+
+def _persist_external_seed_observations(step2_details: dict, logs_path: str | None, *, dry_run: bool = False) -> None:
+    rows = (step2_details.get("metrics", {}) or {}).get("external_seed_observation_rows") or []
+    if not rows:
+        return
+    if dry_run:
+        _log(f"预演模式: 跳过外部观察入库 rows={len(rows)}", logs_path)
+        return
+    try:
+        from integrations.supabase_external_seeds import upsert_external_seed_observations
+
+        written = upsert_external_seed_observations(rows)
+        _log(f"外部观察入库: rows={len(rows)}, written={written}", logs_path)
+    except Exception as e:
+        _log(f"外部观察入库失败（已降级）: {e}", logs_path)
+
+
 def _persist_signal_observations(
     step2_details: dict,
     benchmark_context: dict,
@@ -255,30 +610,18 @@ def _persist_signal_observations(
         _log("预演模式: 跳过信号观察样本入库", logs_path)
         return True
     try:
-        from core.signal_feedback import build_signal_observations
         from integrations.supabase_signal_feedback import upsert_signal_observations
 
-        metrics = step2_details.get("metrics", {}) or {}
-        bypass_codes = {str(c).strip() for c in step2_details.get("l2_bypass_selected", []) if str(c).strip()}
-        strategic_bypass_codes = {
-            str(c).strip() for c in step2_details.get("strategic_l2_bypass_selected", []) if str(c).strip()
-        }
-        source_map = {code: "l2_bypass" for code in bypass_codes}
-        source_map.update({code: "strategic_l2_bypass" for code in strategic_bypass_codes})
-        rows = build_signal_observations(
-            _latest_trade_date_str(),
-            step2_details.get("review_triggers") or step2_details.get("triggers") or {},
-            regime=str((benchmark_context or {}).get("regime") or "NEUTRAL"),
-            selected_for_ai=step2_details.get("selected_for_ai", []) or [],
-            ai_recommended=ai_codes,
-            name_map=step2_details.get("name_map", {}) or {},
-            sector_map=step2_details.get("sector_map", {}) or {},
-            score_map=step2_details.get("priority_score_map", {}) or {},
-            stage_map=metrics.get("accum_stage_map", {}) or {},
-            channel_map=metrics.get("layer2_channel_map", {}) or {},
-            latest_close_map=metrics.get("latest_close_map", {}) or {},
-            source_map=source_map,
-        )
+        regime = str((benchmark_context or {}).get("regime") or "NEUTRAL")
+        if "intraday_tail_map" not in step2_details:
+            step2_details["intraday_tail_map"] = _build_intraday_tail_map(step2_details, ai_codes, logs_path)
+        if "source_context_map" not in step2_details:
+            step2_details["source_context_map"] = _build_external_capital_context_map(
+                step2_details, ai_codes, logs_path
+            )
+        rows = _build_signal_observation_rows(step2_details, regime, ai_codes)
+        rows.extend(_build_shadow_observation_rows(step2_details, regime))
+        rows.extend(_build_external_seed_signal_rows(step2_details, regime))
         written = upsert_signal_observations(rows)
         _log(f"信号观察样本入库: rows={len(rows)}, written={written}", logs_path)
         return True
@@ -317,8 +660,9 @@ def _run_signal_confirmation(
     logs_path: str | None,
     *,
     dry_run: bool = False,
-) -> None:
+) -> list[dict]:
     """Step2.5: pending 信号确认，confirmed 追加到 symbols_info。"""
+    confirmed_extra: list[dict] = []
     try:
         from integrations.supabase_signal_pending import run_step2_5
 
@@ -338,12 +682,26 @@ def _run_signal_confirmation(
             )
             suffix = "（preview dry-run，不写库）" if dry_run else ""
             _log(f"Step2.5 信号确认{suffix}: confirmed={len(confirmed_extra)}", logs_path)
-            existing_codes = {str(s.get("code", "")).strip() for s in symbols_info}
+            existing_by_code = {str(s.get("code", "")).strip(): s for s in symbols_info if isinstance(s, dict)}
             for cs in confirmed_extra:
-                if str(cs.get("code", "")).strip() not in existing_codes:
+                code = str(cs.get("code", "")).strip()
+                if not code:
+                    continue
+                existing = existing_by_code.get(code)
+                if existing is not None:
+                    for key, value in cs.items():
+                        if value in (None, ""):
+                            continue
+                        if key == "selection_source" and str(existing.get("selection_source", "")).strip():
+                            continue
+                        existing[key] = value
+                else:
                     symbols_info.append(cs)
+                    existing_by_code[code] = cs
+            step2_details["signal_confirmed_selected"] = confirmed_extra
     except Exception as e:
         _log(f"Step2.5 信号确认失败（已降级）: {e}", logs_path)
+    return confirmed_extra
 
 
 def _run_springboard_scoring(
@@ -351,30 +709,95 @@ def _run_springboard_scoring(
     step2_details: dict,
 ) -> int:
     """从 triggers 反查 code→signal_type，调用量化评分器。"""
-    from core.signal_confirmation import score_springboard_abc
-
-    all_df_map = step2_details.get("all_df_map", {})
-    triggers = step2_details.get("triggers", {})
-    code_to_sig: dict[str, str] = {}
-    for sig_type, hits in triggers.items():
-        for code, _ in hits:
-            code_to_sig.setdefault(str(code).strip(), sig_type)
+    springboard_map = _build_springboard_map(step2_details)
+    step2_details["springboard_map"] = springboard_map
 
     scored = 0
     for item in symbols_info:
         code = str(item.get("code", "")).strip()
-        sig_type = str(item.get("signal_type", "")).strip().lower() or code_to_sig.get(code, "")
-        df = all_df_map.get(code)
-        if df is None or df.empty or not sig_type:
-            item["springboard_grade"] = "none"
-            continue
-        result = score_springboard_abc(df, sig_type)
-        item["springboard_a"] = result["a"]
-        item["springboard_b"] = result["b"]
-        item["springboard_c"] = result["c"]
-        item["springboard_grade"] = result["grade"]
-        scored += 1
+        fields = springboard_map.get(code) or _empty_springboard_fields()
+        item.update(fields)
+        if fields.get("springboard_scored"):
+            scored += 1
     return scored
+
+
+def _empty_springboard_fields() -> dict:
+    return {
+        "springboard_a": False,
+        "springboard_b": False,
+        "springboard_c": False,
+        "springboard_grade": "none",
+        "springboard_met_count": 0,
+        "springboard_support": None,
+        "springboard_touch_count": 0,
+        "springboard_evidence": {},
+        "springboard_scored": False,
+    }
+
+
+def _springboard_fields(result: dict) -> dict:
+    return {
+        "springboard_a": bool(result.get("a")),
+        "springboard_b": bool(result.get("b")),
+        "springboard_c": bool(result.get("c")),
+        "springboard_grade": str(result.get("grade") or "none"),
+        "springboard_met_count": int(result.get("met_count") or 0),
+        "springboard_support": result.get("support"),
+        "springboard_touch_count": int(result.get("touch_count") or 0),
+        "springboard_evidence": result.get("evidence") or {},
+        "springboard_scored": True,
+    }
+
+
+def _build_springboard_map(step2_details: dict) -> dict[str, dict]:
+    from core.signal_confirmation import score_springboard_abc
+
+    all_df_map = step2_details.get("all_df_map", {})
+    triggers = step2_details.get("review_triggers") or step2_details.get("triggers", {})
+    pairs: list[tuple[str, str]] = []
+    for sig_type, hits in triggers.items():
+        for code, _ in hits:
+            code_s = str(code).strip()
+            sig_s = str(sig_type).strip().lower()
+            if code_s and sig_s:
+                pairs.append((code_s, sig_s))
+
+    out: dict[str, dict] = {}
+    for code, sig_type in pairs:
+        df = all_df_map.get(code)
+        key = f"{sig_type}:{code}"
+        if df is None or df.empty or not sig_type:
+            out[key] = _empty_springboard_fields()
+            out.setdefault(code, out[key])
+            continue
+        out[key] = _springboard_fields(score_springboard_abc(df, sig_type))
+        out.setdefault(code, out[key])
+    return out
+
+
+def _is_confirmed_step4_candidate(item: dict) -> bool:
+    values = [
+        item.get("status"),
+        item.get("signal_status"),
+        item.get("confirm_status"),
+        item.get("source_type"),
+        item.get("tag"),
+        item.get("recommend_reason"),
+    ]
+    text = " ".join(str(v or "").strip().lower() for v in values)
+    return "confirmed" in text or "确认" in text
+
+
+def _filter_confirmed_step3_codes(codes: list[str], symbols_info: list[dict]) -> tuple[list[str], list[str]]:
+    allowed = {
+        str(item.get("code", "")).strip()
+        for item in symbols_info
+        if isinstance(item, dict) and _is_confirmed_step4_candidate(item)
+    }
+    kept = [code for code in codes if str(code).strip() in allowed]
+    blocked = [code for code in codes if str(code).strip() not in allowed]
+    return kept, blocked
 
 
 def _run_step4_holdings_diagnosis(portfolio_id: str, logs_path: str | None) -> str:
@@ -441,6 +864,8 @@ def _run_step4_pipeline(
     user_id = str(step4_target.get("user_id", "") or "").strip()
     portfolio_id = str(step4_target.get("portfolio_id", "") or "").strip()
     step4_candidate_meta: list[dict] = []
+    require_confirmed = _env_flag_default("STEP4_REQUIRE_CONFIRMED_BUY_CANDIDATE", True)
+    blocked_unconfirmed = 0
     if step3_springboard_codes:
         allowed_set = set(step3_springboard_codes)
         for item in symbols_info:
@@ -448,8 +873,16 @@ def _run_step4_pipeline(
                 continue
             code = str(item.get("code", "")).strip()
             if code in allowed_set:
+                if require_confirmed and not _is_confirmed_step4_candidate(item):
+                    blocked_unconfirmed += 1
+                    continue
                 step4_candidate_meta.append(item)
-    _log(f"Step4 私人再平衡: 候选收口为 Step3 起跳板 {len(step4_candidate_meta)} 只", logs_path)
+    _log(
+        "Step4 私人再平衡: 候选收口为 "
+        f"Step3 起跳板 {len(step4_candidate_meta)} 只"
+        + (f"，未二次确认拦截 {blocked_unconfirmed} 只" if require_confirmed else "，确认闸门关闭"),
+        logs_path,
+    )
 
     holdings_diag_text = _run_step4_holdings_diagnosis(portfolio_id, logs_path)
 
@@ -458,7 +891,7 @@ def _run_step4_pipeline(
     step4_err = None
     try:
         step4_ok, step4_reason = run_step4(
-            external_report=step3_report_text,
+            external_report=step3_report_text if step4_candidate_meta else "",
             benchmark_context=benchmark_context,
             api_key=api_key,
             model=model,
@@ -592,11 +1025,9 @@ def main() -> int:
         _log("--dry-run: 配置校验通过，退出", logs_path)
         return 0
 
-    # 非交易日跳过：检查下一个交易日是否在 2 天内（周日跑 → 周一应该开盘）
     today = resolve_end_calendar_day()
-    nxt = next_trading_day(today)
-    if nxt and (nxt - today).days > 2:
-        skip_msg = f"📅 下一交易日 {nxt} 距今超过 2 天，任务跳过"
+    skip_msg = _non_trading_skip_message(today)
+    if skip_msg:
         _log(skip_msg, logs_path)
         _notify_skip(skip_msg, webhook, wecom_webhook, dingtalk_webhook)
         return 0
@@ -657,11 +1088,17 @@ def main() -> int:
         _persist_benchmark_context(benchmark_context, logs_path, dry_run=preview_only)
     if step2_ok and step2_details:
         _persist_theme_radar(step2_details, logs_path, dry_run=preview_only)
+        _persist_external_seed_observations(step2_details, logs_path, dry_run=preview_only)
 
     # Step2.5: 信号确认（pending → confirmed/expired）— 必须在推荐写入前执行，
     # 使 confirmed 信号能沉淀进 recommendation_tracking
     if step2_ok and step2_details:
         _run_signal_confirmation(symbols_info, step2_details, benchmark_context, logs_path, dry_run=preview_only)
+
+    # Step2.7: 起跳板 A/B/C 量化评分。必须在推荐写库前执行，推荐表才能沉淀 AI 推荐时的结构组合。
+    if symbols_info and step2_details:
+        _scored = _run_springboard_scoring(symbols_info, step2_details)
+        _log(f"Step2.7 起跳板评分: scored={_scored}/{len(symbols_info)}", logs_path)
 
     # 形态复盘写库（按 recommend_date=最近交易日）
     if step2_ok and symbols_info:
@@ -670,11 +1107,6 @@ def main() -> int:
             logs_path,
             dry_run=preview_only,
         )
-
-    # Step2.7: 起跳板 A/B/C 量化评分
-    if symbols_info and step2_details:
-        _scored = _run_springboard_scoring(symbols_info, step2_details)
-        _log(f"Step2.7 起跳板评分: scored={_scored}/{len(symbols_info)}", logs_path)
 
     # Step3: 批量研报（可降级：失败不影响 Funnel 成功）
     step3_ok = True
@@ -708,6 +1140,15 @@ def main() -> int:
                     report=step3_report_text,
                     allowed_codes=allowed_codes,
                 )
+                step3_springboard_codes, blocked_unconfirmed = _filter_confirmed_step3_codes(
+                    step3_springboard_codes, symbols_info
+                )
+                if blocked_unconfirmed:
+                    _log(
+                        "Step3 批量研报: 未二次确认起跳板已拦截 "
+                        f"{len(blocked_unconfirmed)}只 ({', '.join(blocked_unconfirmed[:8])})",
+                        logs_path,
+                    )
             except Exception as e:
                 step3_springboard_codes = []
                 _log(f"Step3 批量研报: 起跳板解析失败，已降级为空。err={e}", logs_path)

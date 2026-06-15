@@ -2,8 +2,26 @@
 
 from __future__ import annotations
 
+from typing import Any
 
-def _create_provider(provider_name: str, api_key: str, model: str = "", base_url: str = ""):
+
+def provider_config_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "provider_name": config["provider_name"],
+        "api_key": config["api_key"],
+        "model": config.get("model", ""),
+        "base_url": config.get("base_url", ""),
+        "context_window": config.get("context_window"),
+    }
+
+
+def _create_provider(
+    provider_name: str,
+    api_key: str,
+    model: str = "",
+    base_url: str = "",
+    context_window: int | None = None,
+):
     import inspect
 
     from cli.providers import PROVIDERS
@@ -27,4 +45,11 @@ def _create_provider(provider_name: str, api_key: str, model: str = "", base_url
     sig = inspect.signature(cls.__init__)
     kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
 
-    return cls(**kwargs), None
+    provider = cls(**kwargs)
+    try:
+        window = int(context_window or 0)
+    except (TypeError, ValueError):
+        window = 0
+    if window > 0:
+        provider.context_window = window
+    return provider, None

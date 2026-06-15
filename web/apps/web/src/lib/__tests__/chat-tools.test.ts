@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import type { ToolDeps, KlineRow } from '../chat-tools'
+import type { ToolDeps, KlineRow } from '@wyckoff/shared'
 import {
   buildValueAgentDigest,
   buildKlineDigest,
@@ -12,7 +12,7 @@ import {
   execScreenStocks,
   execAnalyzeStock,
   execMarketHistory,
-} from '../chat-tools'
+} from '@wyckoff/shared'
 
 function createMockChain(resolvedData: unknown = null, error: unknown = null) {
   const chain: Record<string, unknown> = {}
@@ -302,9 +302,8 @@ describe('execScreenStocks', () => {
   it('returns no-data message when empty', async () => {
     const deps = createMockDeps({ recommendation_tracking: [] })
     const result = await execScreenStocks(deps)
-    const parsed = JSON.parse(result)
-    expect(parsed.stocks).toEqual([])
-    expect(parsed.meta.ai_count).toBe(0)
+    expect(result.stocks).toEqual([])
+    expect(result.meta.ai_count).toBe(0)
   })
 })
 
@@ -349,7 +348,7 @@ describe('execAnalyzeStock', () => {
       '贵州茅台',
     )
 
-    expect(result).toBe('mocked LLM response')
+    expect(result.markdown).toBe('mocked LLM response')
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining('/api/llm-proxy/v1/financials/metrics?'),
       expect.objectContaining({ headers: expect.objectContaining({ 'x-api-key': 'tf-test' }) }),
@@ -393,7 +392,7 @@ describe('execAnalyzeStock', () => {
       '苹果',
     )
 
-    expect(result).toBe('mocked LLM response')
+    expect(result.markdown).toBe('mocked LLM response')
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
       expect.stringContaining('/api/llm-proxy/v1/klines/batch?'),
@@ -413,7 +412,7 @@ describe('execAnalyzeStock', () => {
       '苹果',
     )
 
-    expect(result).toContain('设置页配置 TickFlow API Key')
+    expect(result.summary).toContain('设置页配置 TickFlow API Key')
     expect(deps.fetch).not.toHaveBeenCalled()
   })
 })

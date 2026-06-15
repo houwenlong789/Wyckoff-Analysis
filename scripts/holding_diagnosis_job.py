@@ -21,6 +21,7 @@ from scripts.tail_buy_intraday_job import (
     _analyze_holdings_actions,
     _build_holdings_markdown,
 )
+from utils.feishu import send_feishu_notification
 from utils.notify import send_to_telegram
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -223,6 +224,15 @@ def _run_llm_and_report(
     return _build_report(llm_results, holdings, free_cash, total_equity, rule_section, elapsed)
 
 
+def _send_feishu_report(report: str) -> None:
+    webhook = os.getenv("FEISHU_WEBHOOK_URL", "").strip()
+    if not webhook:
+        print("[holding-diag] FEISHU_WEBHOOK_URL 未配置，跳过飞书发送")
+        return
+    ok = send_feishu_notification(webhook, "持仓诊断", report)
+    print(f"[holding-diag] Feishu: {'ok' if ok else 'failed'}")
+
+
 def main() -> int:
     t0 = time.time()
     tickflow_api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
@@ -258,6 +268,7 @@ def main() -> int:
     rule_section = _build_holdings_markdown(holdings=holdings, portfolio_meta=meta, tickflow_limit_hit=limit_hit)
     report = _run_llm_and_report(holdings, rule_section, portfolio_id, deadline_at, t0)
     print(report)
+    _send_feishu_report(report)
 
     if tg_bot_token and tg_chat_id:
         ok = send_to_telegram(f"📊 持仓诊断\n\n{report}", tg_bot_token=tg_bot_token, tg_chat_id=tg_chat_id)

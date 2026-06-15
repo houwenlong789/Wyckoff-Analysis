@@ -28,6 +28,30 @@ def test_theme_bonus_promotes_formal_l4_candidate(monkeypatch) -> None:
     assert score_map["000001"] == 19.0
 
 
+def test_theme_promotion_respects_total_cap(monkeypatch) -> None:
+    from scripts import wyckoff_funnel as mod
+
+    monkeypatch.setattr(mod, "FUNNEL_THEME_RADAR_PROMOTE_CAP", 6)
+    selected = ["000001"]
+    trend_selected = ["000001"]
+    accum_selected: list[str] = []
+
+    added = mod._promote_theme_l4_for_ai(
+        selected,
+        trend_selected,
+        accum_selected,
+        {"000002", "000003"},
+        {"000002": 12.0, "000003": 10.0},
+        {"000002": 19.0, "000003": 18.0},
+        {"000002": ["sos"], "000003": ["sos"]},
+        {},
+        total_cap=2,
+    )
+
+    assert added == 1
+    assert selected == ["000001", "000002"]
+
+
 def test_theme_report_fields_are_empty_for_non_strategic_code() -> None:
     from scripts import wyckoff_funnel as mod
 

@@ -15,6 +15,13 @@ def dynamic_policy_mode() -> str:
     return mode if mode in {"off", "shadow", "on"} else "off"
 
 
+def dynamic_policy_horizon() -> int:
+    try:
+        return max(int(float(os.getenv("FUNNEL_DYNAMIC_POLICY_HORIZON", "5"))), 1)
+    except (TypeError, ValueError):
+        return 5
+
+
 def _float(raw: Any, default: float = 1.0) -> float:
     try:
         if raw is None or str(raw).strip() == "":
@@ -73,10 +80,11 @@ def build_signal_weight_map(
     registry_rows: list[dict[str, Any]] | None = None,
     *,
     regime: str = "NEUTRAL",
-    horizon_days: int = 10,
+    horizon_days: int | None = None,
 ) -> dict[str, float]:
     weights: dict[str, float] = {}
-    for signal_type, row in _latest_health_by_signal(health_rows, regime, horizon_days).items():
+    horizon = dynamic_policy_horizon() if horizon_days is None else max(int(horizon_days), 1)
+    for signal_type, row in _latest_health_by_signal(health_rows, regime, horizon).items():
         weights[signal_type] = max(_float(row.get("weight_multiplier")), 0.0)
     for row in registry_rows or []:
         signal_type = normalize_signal_type(row.get("signal_type"))

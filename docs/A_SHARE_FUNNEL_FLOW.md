@@ -2,7 +2,7 @@
 
 > 本文描述 A 股 Wyckoff 主漏斗从 GitHub Actions 触发到 Supabase 写库、跨日反馈闭环的完整执行链路。策略逻辑详见 [`../README_STRATEGY.md`](../README_STRATEGY.md)，架构与数据表详见 [`ARCHITECTURE.md`](ARCHITECTURE.md)。
 
-**主入口**：`.github/workflows/wyckoff_funnel.yml` → `scripts/daily_job.py`（工作日 **18:25** 北京时间）
+**主入口**：`.github/workflows/wyckoff_funnel.yml` → `scripts/daily_job.py`（周日到周四 **17:17** 北京时间；仅次日为 A 股交易日时继续）
 
 ---
 
@@ -11,12 +11,13 @@
 ```mermaid
 flowchart TB
     subgraph UPSTREAM["⬆️ 上游（漏斗运行前已存在）"]
-        U1["GitHub Actions 触发<br/>wyckoff_funnel.yml<br/>工作日 18:25 北京"]
+        U1["GitHub Actions 触发<br/>wyckoff_funnel.yml<br/>周日到周四 17:17 北京"]
         U2["环境变量 / Secrets<br/>TICKFLOW / TUSHARE / LLM / Supabase / IM"]
         U3["本地元数据<br/>行业映射 / 概念映射 / 股票池"]
         U4["前日反馈闭环<br/>signal_health_daily<br/>signal_registry"]
         U5["前日盘前风控<br/>premarket_risk → market_signal_daily"]
         U6["前日漏斗产出<br/>signal_pending 待确认信号"]
+        U7["外部观察名单<br/>profile / env / symbols_file"]
     end
 
     subgraph CORE["🔬 核心：daily_job.py"]
@@ -44,6 +45,7 @@ flowchart TB
     U4 --> S2
     U5 --> S4
     U6 --> S25
+    U7 --> S2
 
     S2 --> S25 --> S26 --> S27 --> S3 --> S4
 
@@ -68,9 +70,9 @@ flowchart TB
 
 ```mermaid
 flowchart TD
-    START(["GitHub Actions 18:25<br/>wyckoff_funnel.yml"]) --> CHECK1{"配置校验<br/>LLM Key / Model"}
+    START(["GitHub Actions 17:17<br/>wyckoff_funnel.yml"]) --> CHECK1{"配置校验<br/>LLM Key / Model"}
     CHECK1 -->|缺失| FAIL1["exit 1"]
-    CHECK1 -->|通过| CHECK2{"交易日判定<br/>trading_clock<br/>下一交易日 ≤ 2 天?"}
+    CHECK1 -->|通过| CHECK2{"次日交易日判定<br/>明日是否 A 股交易日?"}
     CHECK2 -->|否| SKIP["IM 通知跳过<br/>exit 0"]
     CHECK2 -->|是| STEP2
 
@@ -123,6 +125,7 @@ flowchart TD
         P5["fetch_all_ohlcv 批量拉 K 线<br/>TickFlow → tushare → akshare → baostock → efinance"]
         P6["dump funnel_snapshots<br/>离线快照"]
         P7["ETF 增强扫描<br/>_run_etf_enhancement"]
+        P8["加载 external_seeds<br/>追加到观察池"]
     end
 
     subgraph GATE["阶段 0.5：大盘总闸"]
@@ -162,23 +165,26 @@ flowchart TD
         R4A["Trend 轨：主升 + 点火"]
         R4B["Accum 轨：潜伏 + 吸筹 + 地量 + 护盘"]
         R5{"FUNNEL_AI_SELECTION_MODE"}
-        R5 -->|all_formal_l4 当前默认| R6["正式 L4 全量送 AI"]
-        R5 -->|legacy| R7["按 regime 静态配额<br/>FUNNEL_AI_*_TREND/ACCUM"]
+        R5 -->|all_formal_l4| R6["正式 L4 全量送 AI<br/>不含 L3 补位"]
+        R5 -->|quota 当前默认| R7["按 regime 静态配额<br/>FUNNEL_AI_*_TREND/ACCUM"]
         R8{"FUNNEL_DYNAMIC_POLICY"}
         R8 -->|off| R9["静态配额"]
         R8 -->|shadow| R10["静态出结果 + shadow 差异写库"]
         R8 -->|on| R11["读 signal_health/registry 动态配额"]
         R12["L2旁路 / 战略旁路 / 主线加权送审"]
+        R14["外部观察 Shadow<br/>只验证不入 AI"]
         R13["飞书推送漏斗报告"]
     end
 
     PREP --> GATE --> L1 --> L2
+    P1 --> P8
     L2 --> L2A & L2B & L2C & L2D & L2E & L2F
     L2A & L2B & L2C & L2D & L2E & L2F --> L3 --> L4
     L1 --> BYPASS
     L4 --> L5
     L4 --> POST
     BYPASS --> POST
+    P8 --> POST
     L5 --> POST
 ```
 
@@ -191,6 +197,15 @@ flowchart TD
 | LPS | 缩量回踩 | Accum |
 | EVR | 放量不跌 | Trend |
 | Compression | 压缩蓄势 | 通用 |
+
+### 外部观察名单
+
+`external_seeds` 用于把人工关注、社区反馈或其它系统给出的股票加入同一套漏斗观察，而不是作为正式候选来源：
+
+- 配置来源：`config/profiles/a_share_prod.yml`、`FUNNEL_EXTERNAL_SEED_SYMBOLS`、`FUNNEL_EXTRA_SYMBOLS` 或 `symbols_file`
+- 默认只做 shadow 观察：记录是否通过 L1/L2、是否在 L2 后触发 L4、是否过期
+- 外部观察名单固定为 shadow-only，不进入 `selected_for_ai`
+- 通过 L4 的外部观察对象会额外写入 `signal_observations`，`selection_mode=external_seed_shadow`
 
 ---
 
@@ -246,13 +261,13 @@ flowchart TD
 
 ```mermaid
 sequenceDiagram
-    participant T1 as Day N 18:25 漏斗
+    participant T1 as Day N 17:17 漏斗
     participant OBS as signal_observations
     participant REC as recommendation_tracking
     participant FB as Day N 23:30 feedback
     participant HL as signal_health_daily
     participant REG as signal_registry
-    participant T2 as Day N+1 18:25 漏斗
+    participant T2 as Day N+1 17:17 漏斗
 
     T1->>OBS: L4 命中 + AI 起跳板标记
     T1->>REC: 形态复盘记录
@@ -283,13 +298,13 @@ sequenceDiagram
 | 时间（北京） | 工作流 | 与漏斗关系 |
 |-------------|--------|-----------|
 | **08:20** | `premarket_risk.yml` | **上游门控**：A50 + VIX → Step4 次日买入权限 |
-| **18:25** | `wyckoff_funnel.yml` | **主漏斗** daily_job Step2→3→4 |
+| **周日-周四 17:17** | `wyckoff_funnel.yml` | **主漏斗** daily_job Step2→3→4；次日非 A 股交易日则跳过 |
 | **19:25** | `review_list_replay.yml` | 下游：涨停复盘 |
 | **21:10 周五** | `theme_radar.yml` | 下游：主线雷达周报（新闻增强） |
 | **23:00 日–四** | `recommendation_tracking_reprice.yml` | 下游：复盘重定价 |
 | **23:05** | `db_maintenance.yml` | 下游：清理过期数据 |
 | **23:30** | `signal_feedback.yml` | **下游反馈**：刷新 health / registry |
-| **次日 13:50** | `tail_buy_1420.yml` | **下游执行**：读 `signal_pending` 尾盘策略 |
+| **次日 13:50** | `tail_buy_1420.yml` | **下游执行**：读 `signal_pending` 尾盘策略；pending 只观察，confirmed 才可 BUY |
 
 ---
 
@@ -302,6 +317,7 @@ flowchart LR
         W2["theme_radar_snapshot"]
         W3["signal_pending<br/>待确认信号"]
         W4["recommendation_tracking<br/>形态复盘"]
+        W12["external_seed_observations<br/>外部观察验证"]
     end
 
     subgraph STEP3_WRITE["Step3 写入"]
@@ -352,10 +368,14 @@ efinance
 
 | 变量 | 当前值 | 作用 |
 |------|--------|------|
-| `FUNNEL_AI_SELECTION_MODE` | `all_formal_l4` | 正式 L4 全量进 Step3 |
-| `FUNNEL_AI_TOTAL_CAP` | `8` | AI 总量上限（legacy 模式用） |
-| `FUNNEL_DYNAMIC_POLICY` | `off` | 反馈闭环暂不介入配额 |
-| `STEP4_BUY_HARD_STOP_PCT` | `9.0` | 硬止损 |
+| `FUNNEL_AI_SELECTION_MODE` | `tradeable_l4` | 只把可交易 L4 结构送入 Step3，减少裸 SOS/EVR 追高噪声 |
+| `FUNNEL_AI_TOTAL_CAP` | `8` | AI 总量硬上限；战略/主题补位也受此限制 |
+| `FUNNEL_DYNAMIC_POLICY` | `shadow` | 主流程用静态配额，同时记录动态策略差异 |
+| `FUNNEL_AI_NEUTRAL_TREND` / `FUNNEL_AI_NEUTRAL_ACCUM` | `2` / `3` | 中性市场保留更多 Accum 槽位给 Spring/LPS/Compression |
+| `FUNNEL_EXTERNAL_SEED_SYMBOLS` / `FUNNEL_EXTRA_SYMBOLS` | 空 | 临时追加外部观察名单；存在时自动启用 external seed shadow |
+| `STEP4_BUY_HARD_STOP_PCT` | `8.0` | 新开仓硬止损 |
+| `STEP4_REQUIRE_CONFIRMED_BUY_CANDIDATE` | `1` | Step4 新开仓只允许二次确认候选；未确认候选只观察 |
+| `TAIL_BUY_CONFIRMED_ONLY_BUY` | `1` | 尾盘买入只对二次确认候选输出 BUY |
 | `STEP4_BUY_BLOCK_REGIMES` | `CRASH,BLACK_SWAN,RISK_OFF` | 极寒熔断 |
 
 ---

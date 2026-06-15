@@ -6,11 +6,13 @@
 
 ## 一句话
 
-漏斗负责**发现机会并生产信号样本**，feedback 负责**盘后验收信号表现并更新策略状态**，动态策略在**下一轮漏斗**读取这些状态。默认不是强同步链路，而是错峰运行的反馈闭环。
+漏斗负责**发现机会并生产信号样本**，feedback 负责**盘后验收信号表现并更新策略状态**，动态策略在**下一轮漏斗**读取这些状态。外部观察名单只进入同一套观察闭环，不作为正式候选来源。默认不是强同步链路，而是错峰运行的反馈闭环。
 
 ```mermaid
 flowchart LR
   A["本轮漏斗<br/>选股 + AI + OMS"] --> B["写 signal_observations"]
+  X["外部观察名单<br/>人工/社区/其它系统"] --> B
+  X --> Y["写 external_seed_observations"]
   B --> C["盘后 feedback<br/>计算 outcomes"]
   C --> D["更新 health / registry"]
   D --> E["下一轮漏斗<br/>读取动态策略状态"]
@@ -21,7 +23,7 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-  subgraph F["T 日 18:25：A 股漏斗"]
+  subgraph F["T 日 17:17：A 股漏斗"]
     A["wyckoff_funnel.yml<br/>定时或手动触发"] --> B["scripts/daily_job.py"]
     B --> C["Step2: run_funnel"]
     C --> D["读取上一轮<br/>signal_health_daily / signal_registry"]
@@ -35,6 +37,7 @@ flowchart TD
     G --> H["Step3: AI 三阵营研报"]
     H --> I["Step4: OMS 风控决断 + 推送"]
     I --> J["写 signal_observations"]
+    G --> X["写 external_seed_observations"]
     F2 --> K["写 signal_policy_shadow_runs"]
   end
 
@@ -75,6 +78,9 @@ GitHub Actions 中建议用 Repository Variables 配置：
 | 配置项 | 推荐值 | 说明 |
 |--------|--------|------|
 | `FUNNEL_DYNAMIC_POLICY` | `shadow` | 非敏感配置，优先放 GitHub Variables；也兼容 Secrets。 |
+| `FUNNEL_EXTERNAL_SEED_SYMBOLS` / `FUNNEL_EXTRA_SYMBOLS` | 空 | 临时追加外部观察名单；存在时自动启用 external seed shadow。 |
+| `WYCKOFF_WRITE_CONTEXT` | `server_job` | 只有 Actions / server job 可写共享信号、推荐、策略表；CLI 默认只读云端。 |
+| `WYCKOFF_STRATEGY_REFLECTION` | `shadow` | 开启策略反思 shadow 写入，不自动晋级生产策略。 |
 | `SUPABASE_SERVICE_ROLE_KEY` | service role key | 定时任务写反馈表需要绕过 RLS。 |
 
 本地临时验证：
@@ -88,11 +94,25 @@ uv run python scripts/signal_feedback_job.py
 
 | 表 | 写入方 | 读取方 | 作用 |
 |----|--------|--------|------|
-| `signal_observations` | 漏斗 `daily_job.py` | feedback job | 记录某日某股票触发了什么 L4 信号，是否进入 AI，是否被 AI 推荐。 |
+| `signal_observations` | 漏斗 `daily_job.py` | feedback job | 记录某日某股票触发了什么 L4 信号，是否进入 AI，是否被 AI 推荐，以及当日 price-action footprint。 |
 | `signal_outcomes` | feedback job | feedback job | 记录每个 observation 在 1/3/5/10/20 日后的收益、回撤和完成状态。 |
 | `signal_health_daily` | feedback job | 漏斗 | 按 signal / regime / horizon 聚合胜率、平均收益、样本数和权重。 |
 | `signal_registry` | feedback job | 漏斗 | 管理信号生命周期：`ACTIVE`、`WATCH`、`EXPERIMENTAL`、`RETIRED`。 |
 | `signal_policy_shadow_runs` | 漏斗 shadow 模式 | 人工复盘 | 比较静态策略和动态策略的候选差异。 |
+| `external_seed_observations` | 漏斗 | 人工复盘 / maintenance | 记录外部观察名单是否通过 L1/L2/L4、watch 状态和过期时间。 |
+| `strategy_reflections` | strategy reflection job | 人工复盘 | 保存基于 outcomes / shadow 的策略反思快照。 |
+| `strategy_policy_candidates` | strategy reflection job | 人工复盘 | 保存 `READY_FOR_REVIEW` 候选策略，不自动切生产。 |
+
+## 外部观察 Shadow
+
+`external_seed_observations` 解决的是“我额外关注的股票，为什么没被漏斗选中”的复盘问题。它记录外部观察名单在当天主漏斗里的真实位置：
+
+- `REJECTED_L1`：基础流动性、ST、财务或股票池过滤未通过。
+- `PASSED_L2`：已经进入六通道主路径。
+- `L4_CONFIRMED`：没进 L2，但在外部观察旁路里出现 L4 触发。
+- `WATCH`：通过 L1 但暂时没有 L2/L4 结构。
+
+当外部观察名单触发 L4 且没有进入正式候选时，系统会补写 `signal_observations`，`source=external_seed:<source>`，`selection_mode=external_seed_shadow`。这部分只用于后续 outcome 复盘，不影响真实推荐和 AI 候选池。
 
 ## 信号生命周期
 
@@ -109,13 +129,68 @@ stateDiagram-v2
 
 registry 只负责控制动态策略是否使用信号；原始 observations 仍会记录，避免因为下线后失去后续观测能力。
 
+## Price-Action Footprint
+
+`signal_observations.features_json.price_action_footprint` 记录每个信号日的量价痕迹，用于后续回答“哪一种主力行为痕迹有效”，不作为新的候选来源：
+
+- `absorption_score`：放量但收盘不弱、支撑收回、下影承接等吸收迹象。
+- `dry_up_score`：缩量回踩、波动收窄，验证卖压是否枯竭。
+- `breakout_quality_score`：突破位、量能、收盘位置和上影压力。
+- `supply_pressure_score`：放量弱收、长上影、潜在派发压力。
+- `failed_breakout_score`：盘中突破后收不住，标记失败突破风险。
+- `reclaim_score`：跌破支撑后快速收回的 Spring / reclaim 质量。
+
+这些字段和 `springboard_*` 一起落库，后续由 `signal_outcomes` 验证，而不是直接把外部或人工名单推入 AI 候选池。
+
+## Intraday Tail Confirmation
+
+`signal_observations.features_json.intraday_tail_confirmation` 记录正式主漏斗候选的尾盘 1m 分钟线确认特征。它复用 tail-buy 链路里的 VWAP、尾段量能、尾盘聪明钱和尾盘规则评分，用来复盘“日线候选在收盘前是否被分钟线确认”：
+
+- `tail_score` / `tail_decision`：按尾盘规则得到的 BUY / WATCH / SKIP 观察标签。
+- `dist_vwap_pct`：尾盘最新价相对当日 VWAP 的距离。
+- `tail30_volume_share`：最后 30 根 1m 的成交量占比。
+- `smart_money_score`：尾盘量价方向相对早盘的强弱。
+- `last30_ret_pct` / `last15_ret_pct`：尾段价格动量。
+
+这部分只写入 `features_json` 做 outcome 复盘，不改变主漏斗候选、AI 候选池、loss guard 或 Step4。
+
+## External Capital Context
+
+`signal_observations.features_json.source_context` 记录正式主漏斗候选的外部资金佐证。当前通过 AkShare 按需读取龙虎榜、融资融券和大宗交易；逐笔大单使用腾讯分笔源作为可选项，默认不打开，避免日常任务被慢速网页源拖住：
+
+- `lhb`：东方财富龙虎榜详情，记录上榜原因、净买额、买入额和卖出额。
+- `margin`：上交所 / 深交所融资融券明细，记录融资余额、融资买入、融资偿还和融券变化。
+- `block_trade`：东方财富大宗交易每日明细，记录成交笔数、成交额、折溢率和主要买卖席位。
+- `tick_large_order`：腾讯分笔数据汇总的大额成交，仅在 `FUNNEL_EXTERNAL_CAPITAL_TICK_CONTEXT=1` 时启用。
+- `source_status`：每个外部源的成功、失败或降级状态，便于复盘时区分“没有资金痕迹”和“源失败”。
+
+这部分只作为外部资金痕迹解释和 outcome 复盘特征，不改变主漏斗候选、AI 候选池、loss guard 或 Step4。
+
+## Candidate Shadow Score
+
+`signal_observations.features_json.candidate_shadow_score` 记录候选影子评分。它把主漏斗优先级、量价痕迹、起跳板质量、尾盘确认、外部资金佐证和风险扣分合成 0-100 分，用来复盘“哪些候选更像真机会”：
+
+- `score` / `grade`：总分和 S/A/B/C/D 评级。
+- `components.funnel`：主漏斗触发分或优先级分。
+- `components.price_action`：承接、缩量、突破质量和支撑收回等量价痕迹加分。
+- `components.springboard`：ABC 起跳板确认加分。
+- `components.tail_confirmation`：尾盘 VWAP、尾盘规则评分和 BUY/WATCH 确认加分。
+- `components.external_capital`：龙虎榜净买、融资买入、大宗交易和大单净买等资金佐证加分。
+- `components.risk_penalty`：派发压力、失败突破、弱收盘、尾盘跌破 VWAP 等扣分。
+- `positive_tags` / `negative_tags`：可解释的正负证据标签。
+
+这部分只做 shadow 复盘，不新增候选表，也不改变正式候选、AI 候选池或 Step4。只有当后续 `signal_outcomes` 证明它能提高胜率或降低回撤时，才考虑把总分升成结构化列或用于真实排序。
+
+`strategy_attribution_report.py` 会把 `candidate_shadow_score.grade` 聚合进 `score_bucket_stats_json._candidate_shadow_grade`，Web 端策略归因页展示 S/A/B/C/D 各档在不同持有周期下的胜率、平均收益、大涨率、大跌率和平均回撤。
+
 ## Shadow 复盘怎么看
 
 Shadow 模式不会影响真实推荐。它的价值是回答三个问题：
 
 1. 动态策略比静态策略多选了哪些股票？
 2. 动态策略会移除哪些原本会进 AI 的股票？
-3. 这些差异背后的 `signal_weights` 和 `registry_snapshot` 是否合理？
+3. `diff_added` 的后续收益/回撤是否长期好于 `diff_removed`？
+4. 这些差异背后的 `signal_weights` 和 `registry_snapshot` 是否合理？
 
 常用查询：
 
@@ -132,6 +207,11 @@ from signal_policy_shadow_runs
 order by trade_date desc
 limit 10;
 ```
+
+`strategy_attribution_report.py` 会把 shadow 差异和已有 `signal_outcomes` 关联到
+`shadow_diff_stats_json.outcome_stats`。只有当 `diff_added` 在多个周期的收益/回撤稳定好于
+`diff_removed`，并且 missing outcome 不高时，才考虑把 `FUNNEL_DYNAMIC_POLICY` 从 `shadow`
+切到 `on`。
 
 ## 和迭代策略的对应关系
 

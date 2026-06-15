@@ -18,6 +18,7 @@ from integrations.data_source import _CONCEPT_HEAT_HISTORY
 from integrations.supabase_concept_heat import load_concept_heat_history_from_supabase
 from integrations.theme_radar_storage import persist_theme_radar_snapshot
 from scripts.wyckoff_funnel import run_funnel_job
+from utils.feishu import send_feishu_notification
 
 STATE_LABELS = {
     "observe": "萌芽观察",
@@ -41,6 +42,7 @@ def main() -> None:
         html_output.parent.mkdir(parents=True, exist_ok=True)
         html_output.write_text(render_theme_radar_html(snapshot), encoding="utf-8")
         print(f"[theme_radar] html: {html_output}")
+    _notify_report(snapshot, report)
     print(report)
 
 
@@ -81,6 +83,17 @@ def render_theme_radar_report(snapshot: dict) -> str:
     if not themes and grouped:
         lines.extend(_orphan_candidate_sections(grouped))
     return "\n".join(lines)
+
+
+def _notify_report(snapshot: dict, report: str) -> None:
+    webhook = os.getenv("FEISHU_WEBHOOK_URL", "").strip()
+    if not webhook:
+        print("[theme_radar] FEISHU_WEBHOOK_URL 未配置，跳过飞书发送")
+        return
+    trade_date = str(snapshot.get("trade_date") or "").strip()
+    title = f"主线雷达周报 {trade_date}".strip()
+    ok = send_feishu_notification(webhook, title, report)
+    print(f"[theme_radar] 飞书发送{'成功' if ok else '失败'}")
 
 
 def render_theme_radar_html(snapshot: dict) -> str:

@@ -5,9 +5,33 @@ import argparse
 import pandas as pd
 import pytest
 
-from core.dynamic_policy import filter_triggers_by_registry, resolve_dynamic_candidate_policy
+from core.dynamic_policy import build_signal_weight_map, filter_triggers_by_registry, resolve_dynamic_candidate_policy
+from core.price_action_footprint import compute_price_action_footprint
+from core.signal_confirmation import score_springboard_abc
 from core.signal_feedback import build_signal_observations, build_signal_registry_updates, summarize_signal_health
-from scripts.signal_feedback_job import _outcome_rows
+from scripts.signal_feedback_job import _default_registry_horizon, _outcome_rows
+
+
+def _make_intraday_df(*, start: float = 10.0, end: float = 10.9, bars: int = 180) -> pd.DataFrame:
+    idx = pd.date_range("2026-06-10 09:30", periods=bars, freq="1min", tz="Asia/Shanghai")
+    close = pd.Series([start + (end - start) * i / max(bars - 1, 1) for i in range(bars)])
+    tail_n = min(30, bars)
+    close.iloc[-tail_n:] = (
+        close.iloc[-tail_n:].to_numpy() + pd.Series([0.5 * (i + 1) / tail_n for i in range(tail_n)]).to_numpy()
+    )
+    volume = pd.Series([1200.0] * bars)
+    volume.iloc[-tail_n:] = volume.iloc[-tail_n:] * 1.8
+    return pd.DataFrame(
+        {
+            "datetime": idx,
+            "open": close.shift(1).fillna(close.iloc[0]).values,
+            "high": (close * 1.003).values,
+            "low": (close * 0.997).values,
+            "close": close.values,
+            "volume": volume.values,
+            "amount": (close * volume).values,
+        }
+    )
 
 
 class _FailingUpsertQuery:
@@ -23,6 +47,56 @@ class _FailingUpsertClient:
         return _FailingUpsertQuery()
 
 
+class _CapturingUpsertQuery:
+    def __init__(self, client):
+        self.client = client
+
+    def upsert(self, rows: list[dict], *, on_conflict: str):
+        self.client.rows = rows
+        self.client.conflict = on_conflict
+        return self
+
+    def execute(self):
+        return None
+
+
+class _CapturingUpsertClient:
+    def __init__(self):
+        self.rows: list[dict] = []
+        self.conflict = ""
+
+    def table(self, name: str):
+        self.table_name = name
+        return _CapturingUpsertQuery(self)
+
+
+class _SchemaMissThenCaptureQuery:
+    def __init__(self, client):
+        self.client = client
+
+    def upsert(self, rows: list[dict], *, on_conflict: str):
+        self.client.calls += 1
+        self.client.rows = rows
+        self.client.conflict = on_conflict
+        return self
+
+    def execute(self):
+        if self.client.calls == 1:
+            raise RuntimeError("Could not find column features_json in schema cache")
+        return None
+
+
+class _SchemaMissThenCaptureClient:
+    def __init__(self):
+        self.calls = 0
+        self.rows: list[dict] = []
+        self.conflict = ""
+
+    def table(self, name: str):
+        self.table_name = name
+        return _SchemaMissThenCaptureQuery(self)
+
+
 def test_build_signal_observations_marks_selection_and_source():
     rows = build_signal_observations(
         "2026-05-25",
@@ -35,6 +109,53 @@ def test_build_signal_observations_marks_selection_and_source():
         score_map={"000001": 88},
         latest_close_map={"000001": 10.5},
         source_map={"000002": "l2_bypass"},
+        footprint_map={
+            "sos:000001": {
+                "version": "price_action_footprint_v1",
+                "bias": "demand",
+                "tags": ["quality_breakout"],
+                "negative_tags": [],
+            }
+        },
+        springboard_map={
+            "sos:000001": {
+                "springboard_grade": "A+B",
+                "springboard_met_count": 2,
+                "springboard_a": True,
+                "springboard_b": True,
+                "springboard_c": False,
+                "springboard_support": 10.1,
+                "springboard_touch_count": 1,
+                "springboard_evidence": {"a_hits": [{"date": "2026-05-24"}]},
+            },
+            "spring:000002": {
+                "springboard_grade": "C",
+                "springboard_met_count": 1,
+                "springboard_a": False,
+                "springboard_b": False,
+                "springboard_c": True,
+                "springboard_support": 8.8,
+                "springboard_touch_count": 3,
+                "springboard_evidence": {"c_support": {"touch_dates": ["2026-05-20"]}},
+            },
+        },
+        intraday_tail_map={
+            "sos:000001": {
+                "version": "intraday_tail_confirmation_v1",
+                "tail_score": 78.5,
+                "tail_decision": "BUY",
+                "dist_vwap_pct": 1.2,
+                "smart_money_score": 3.4,
+                "tail30_volume_share": 0.22,
+            }
+        },
+        source_context_map={
+            "000001": {
+                "version": "external_capital_context_v1",
+                "lhb": {"net_buy": 123.0},
+                "margin": {"margin_balance": 456.0},
+            }
+        },
     )
 
     first = rows[0]
@@ -44,14 +165,227 @@ def test_build_signal_observations_marks_selection_and_source():
     assert first["selected_for_ai"] is True
     assert first["ai_recommended"] is True
     assert first["entry_price"] == 10.5
+    assert first["springboard_grade"] == "A+B"
+    assert first["springboard_met_count"] == 2
+    assert first["springboard_a"] is True
+    assert first["springboard_evidence"]["a_hits"][0]["date"] == "2026-05-24"
+    assert first["features_json"]["price_action_footprint"]["tags"] == ["quality_breakout"]
+    assert first["features_json"]["springboard"]["springboard_grade"] == "A+B"
+    assert first["features_json"]["intraday_tail_confirmation"]["tail_decision"] == "BUY"
+    assert first["features_json"]["intraday_tail_confirmation"]["smart_money_score"] == 3.4
+    assert first["features_json"]["source_context"]["lhb"]["net_buy"] == 123.0
+    assert first["features_json"]["source_context"]["margin"]["margin_balance"] == 456.0
+    shadow_score = first["features_json"]["candidate_shadow_score"]
+    assert shadow_score["version"] == "candidate_shadow_score_v1"
+    assert shadow_score["components"]["funnel"] == 26.4
+    assert shadow_score["components"]["springboard"] == 12.0
+    assert "springboard_confirmed" in shadow_score["positive_tags"]
+    assert "tail_buy_confirmation" in shadow_score["positive_tags"]
     assert second["track"] == "Accum"
     assert second["source"] == "l2_bypass"
+    assert second["springboard_grade"] == "C"
+    assert second["springboard_c"] is True
+
+
+def test_daily_job_builds_intraday_tail_confirmation_map(monkeypatch):
+    from integrations import tickflow_client
+    from scripts import daily_job
+
+    class FakeTickFlow:
+        def __init__(self, api_key: str):
+            assert api_key == "tf-key"
+
+        def get_intraday_batch(self, symbols: list[str], *, period: str, count: int):
+            assert symbols == ["000001.SZ"]
+            assert period == "1m"
+            assert count == 5000
+            return {"000001.SZ": _make_intraday_df()}
+
+    monkeypatch.setenv("TICKFLOW_API_KEY", "tf-key")
+    monkeypatch.setenv("FUNNEL_INTRADAY_TAIL_CONFIRMATION", "1")
+    monkeypatch.setenv("FUNNEL_TAIL_CONFIRMATION_MAX_SYMBOLS", "1")
+    monkeypatch.setattr(tickflow_client, "TickFlowClient", FakeTickFlow)
+
+    got = daily_job._build_intraday_tail_map(
+        {
+            "selected_for_ai": ["000001", "000002"],
+            "review_triggers": {"sos": [("000001", 6.0), ("000002", 5.0)]},
+            "springboard_map": {"sos:000001": {"springboard_support": 10.0}},
+        },
+        [],
+        None,
+    )
+
+    assert "sos:000001" in got
+    assert "sos:000002" not in got
+    assert got["sos:000001"]["version"] == "intraday_tail_confirmation_v1"
+    assert got["sos:000001"]["source"] == "tickflow_1m"
+    assert got["sos:000001"]["bars"] == 180
+    assert got["sos:000001"]["tail_score"] > 0
+    assert got["000001"]["tail_decision"] in {"BUY", "WATCH", "SKIP"}
+
+
+def test_daily_job_intraday_tail_map_skips_without_tickflow_key(monkeypatch):
+    from scripts import daily_job
+
+    monkeypatch.delenv("TICKFLOW_API_KEY", raising=False)
+    monkeypatch.setenv("FUNNEL_INTRADAY_TAIL_CONFIRMATION", "1")
+
+    got = daily_job._build_intraday_tail_map(
+        {"selected_for_ai": ["000001"], "review_triggers": {"sos": [("000001", 6.0)]}},
+        [],
+        None,
+    )
+
+    assert got == {}
+
+
+def test_external_capital_context_normalizes_sources():
+    from integrations.external_capital_context import build_external_capital_context
+
+    class FakeAk:
+        def stock_lhb_detail_em(self, *, start_date: str, end_date: str):
+            assert start_date == "20260612"
+            assert end_date == "20260612"
+            return pd.DataFrame([{"代码": "000001", "龙虎榜净买额": 1200, "解读": "机构净买"}])
+
+        def stock_margin_detail_sse(self, *, date: str):
+            assert date == "20260612"
+            return pd.DataFrame([{"标的证券代码": "600000", "融资余额": 9000, "融资买入额": 300}])
+
+        def stock_margin_detail_szse(self, *, date: str):
+            assert date == "20260612"
+            return pd.DataFrame([{"标的证券代码": "000001", "融资余额": 8000, "融资买入额": 200}])
+
+        def stock_dzjy_mrmx(self, *, symbol: str, start_date: str, end_date: str):
+            assert symbol == "A股"
+            assert start_date == "20260612"
+            assert end_date == "20260612"
+            return pd.DataFrame(
+                [
+                    {"证券代码": "000001", "成交额": 500.0, "折溢率": -2.5, "买方营业部": "买方A"},
+                    {"证券代码": "000001", "成交额": 300.0, "折溢率": -1.5, "买方营业部": "买方B"},
+                ]
+            )
+
+        def stock_zh_a_tick_tx_js(self, *, symbol: str):
+            assert symbol == "sz000001"
+            return pd.DataFrame(
+                [
+                    {"成交时间": "09:30:00", "成交价格": 10.1, "成交金额": 2_000_000, "性质": "买盘"},
+                    {"成交时间": "09:31:00", "成交价格": 10.0, "成交金额": 1_500_000, "性质": "卖盘"},
+                    {"成交时间": "09:32:00", "成交价格": 10.0, "成交金额": 200_000, "性质": "买盘"},
+                ]
+            )
+
+    got = build_external_capital_context(
+        ["000001", "600000"],
+        "2026-06-12",
+        include_tick=True,
+        tick_max_symbols=1,
+        tick_min_amount_yuan=1_000_000,
+        ak_module=FakeAk(),
+    )
+
+    assert got["000001"]["lhb"]["net_buy"] == 1200
+    assert got["000001"]["margin"]["margin_balance"] == 8000
+    assert got["000001"]["block_trade"]["trade_count"] == 2
+    assert got["000001"]["tick_large_order"]["large_net_amount_yuan"] == 500_000
+    assert got["600000"]["margin"]["margin_buy"] == 300
+    assert "tick_large_order" not in got["600000"]
+
+
+def test_daily_job_builds_external_capital_context_map(monkeypatch):
+    from integrations import external_capital_context
+    from scripts import daily_job
+
+    captured = {}
+
+    def fake_build(codes, trade_date, *, include_tick, tick_max_symbols, tick_min_amount_yuan):
+        captured.update(
+            {
+                "codes": codes,
+                "trade_date": trade_date,
+                "include_tick": include_tick,
+                "tick_max_symbols": tick_max_symbols,
+                "tick_min_amount_yuan": tick_min_amount_yuan,
+            }
+        )
+        return {"000001": {"version": "external_capital_context_v1", "margin": {"margin_balance": 1}}}
+
+    monkeypatch.setenv("FUNNEL_EXTERNAL_CAPITAL_CONTEXT", "1")
+    monkeypatch.setenv("FUNNEL_EXTERNAL_CAPITAL_MAX_SYMBOLS", "1")
+    monkeypatch.setenv("FUNNEL_EXTERNAL_CAPITAL_TICK_CONTEXT", "0")
+    monkeypatch.setattr(daily_job, "_latest_trade_date_str", lambda: "2026-06-12")
+    monkeypatch.setattr(external_capital_context, "build_external_capital_context", fake_build)
+
+    got = daily_job._build_external_capital_context_map(
+        {
+            "selected_for_ai": ["000001", "000002"],
+            "review_triggers": {"sos": [("000001", 6.0), ("000002", 5.0)]},
+        },
+        [],
+        None,
+    )
+
+    assert captured["codes"] == ["000001"]
+    assert captured["trade_date"] == "2026-06-12"
+    assert captured["include_tick"] is False
+    assert captured["tick_max_symbols"] == 3
+    assert captured["tick_min_amount_yuan"] == 1_000_000
+    assert got["000001"]["margin"]["margin_balance"] == 1
+
+
+def test_price_action_footprint_marks_breakout_and_supply_pressure():
+    dates = pd.date_range("2026-05-01", periods=30, freq="D")
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": [10.0] * 30,
+            "high": [10.4] * 29 + [11.2],
+            "low": [9.8] * 30,
+            "close": [10.1] * 29 + [9.95],
+            "volume": [100.0] * 29 + [260.0],
+        }
+    )
+
+    fp = compute_price_action_footprint(df, "sos")
+
+    assert fp["failed_breakout_20"] is True
+    assert "failed_breakout" in fp["negative_tags"]
+    assert fp["supply_pressure_score"] >= 70
+
+
+def test_score_springboard_abc_returns_persistable_metadata():
+    dates = pd.date_range("2026-05-01", periods=25, freq="D")
+    df = pd.DataFrame(
+        {
+            "date": dates,
+            "open": [10.0] * 25,
+            "high": [11.0] * 25,
+            "low": [10.0] * 25,
+            "close": [10.5] * 25,
+            "volume": [100.0] * 25,
+        }
+    )
+    df.loc[22, ["close", "volume"]] = [10.8, 50.0]
+    df.loc[24, ["close", "volume"]] = [10.9, 220.0]
+
+    result = score_springboard_abc(df, "spring")
+
+    assert result["a"] is True
+    assert result["b"] is True
+    assert result["c"] is True
+    assert result["grade"] == "A+B+C"
+    assert result["touch_count"] >= 2
+    assert result["evidence"]["b_last"]["date"] == "2026-05-25"
 
 
 def test_signal_feedback_upsert_errors_propagate(monkeypatch):
     from integrations import supabase_signal_feedback
 
     closed = []
+    monkeypatch.setenv("WYCKOFF_WRITE_CONTEXT", "server_job")
     monkeypatch.setattr(supabase_signal_feedback, "_configured", lambda: True)
     monkeypatch.setattr(supabase_signal_feedback, "_admin", _FailingUpsertClient)
     monkeypatch.setattr(supabase_signal_feedback, "_close", closed.append)
@@ -60,6 +394,59 @@ def test_signal_feedback_upsert_errors_propagate(monkeypatch):
         supabase_signal_feedback.upsert_signal_outcomes([{"observation_id": 1, "horizon_days": 1}])
 
     assert len(closed) == 1
+
+
+def test_signal_feedback_upsert_rejects_cli_context(monkeypatch):
+    from integrations import supabase_signal_feedback
+
+    monkeypatch.delenv("WYCKOFF_WRITE_CONTEXT", raising=False)
+    monkeypatch.setattr(supabase_signal_feedback, "_configured", lambda: True)
+
+    with pytest.raises(PermissionError, match="server_job"):
+        supabase_signal_feedback.upsert_signal_outcomes([{"observation_id": 1, "horizon_days": 1}])
+
+
+def test_signal_observations_conflict_keeps_daily_tags(monkeypatch):
+    from integrations import supabase_signal_feedback
+
+    client = _CapturingUpsertClient()
+    monkeypatch.setenv("WYCKOFF_WRITE_CONTEXT", "server_job")
+    monkeypatch.setattr(supabase_signal_feedback, "_configured", lambda: True)
+    monkeypatch.setattr(supabase_signal_feedback, "_admin", lambda: client)
+    monkeypatch.setattr(supabase_signal_feedback, "_close", lambda _client: None)
+
+    rows = [
+        {"market": "cn", "trade_date": "2026-06-10", "code": "000001", "signal_type": "spring"},
+        {"market": "cn", "trade_date": "2026-06-11", "code": "000001", "signal_type": "lps"},
+    ]
+
+    assert supabase_signal_feedback.upsert_signal_observations(rows) == 2
+    assert client.conflict == "market,trade_date,code,signal_type"
+    assert [row["trade_date"] for row in client.rows] == ["2026-06-10", "2026-06-11"]
+
+
+def test_signal_observations_drop_features_json_when_schema_missing(monkeypatch):
+    from integrations import supabase_signal_feedback
+
+    client = _SchemaMissThenCaptureClient()
+    monkeypatch.setenv("WYCKOFF_WRITE_CONTEXT", "server_job")
+    monkeypatch.setattr(supabase_signal_feedback, "_configured", lambda: True)
+    monkeypatch.setattr(supabase_signal_feedback, "_admin", lambda: client)
+    monkeypatch.setattr(supabase_signal_feedback, "_close", lambda _client: None)
+
+    rows = [
+        {
+            "market": "cn",
+            "trade_date": "2026-06-10",
+            "code": "000001",
+            "signal_type": "spring",
+            "features_json": {"price_action_footprint": {"bias": "demand"}},
+        }
+    ]
+
+    assert supabase_signal_feedback.upsert_signal_observations(rows) == 1
+    assert client.calls == 2
+    assert "features_json" not in client.rows[0]
 
 
 def test_summarize_signal_health_classifies_watch_and_all_regime():
@@ -100,6 +487,24 @@ def test_dynamic_policy_shifts_quota_toward_healthier_track():
 
     assert policy["quota_family"] == "NEUTRAL+DYNAMIC"
     assert policy["trend_quota"] > policy["accum_quota"]
+
+
+def test_dynamic_policy_uses_configured_feedback_horizon(monkeypatch):
+    monkeypatch.setenv("FUNNEL_DYNAMIC_POLICY_HORIZON", "5")
+    weights = build_signal_weight_map(
+        [
+            {"as_of_date": "2026-06-10", "horizon_days": 10, "signal_type": "lps", "weight_multiplier": 1.2},
+            {"as_of_date": "2026-06-10", "horizon_days": 5, "signal_type": "lps", "weight_multiplier": 0.4},
+        ]
+    )
+
+    assert weights["lps"] == 0.4
+
+
+def test_signal_feedback_registry_horizon_defaults_to_five(monkeypatch):
+    monkeypatch.delenv("SIGNAL_REGISTRY_HORIZON", raising=False)
+
+    assert _default_registry_horizon() == 5
 
 
 def test_registry_retires_after_repeated_decay():

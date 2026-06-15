@@ -22,7 +22,7 @@ class AgentCancelled(Exception):
     """Agent 运行被用户主动取消。"""
 
 
-from cli.compaction import compact_messages, shrink_stale_tool_results
+from cli.compaction import compact_messages
 from cli.loop_guard import (
     MAX_INCOMPLETE_TOOL_RETRIES,
     MAX_TOOL_ROUNDS,
@@ -36,12 +36,14 @@ from cli.providers.base import LLMProvider
 from cli.scratchpad import AgentScratchpad
 from cli.tool_results import format_tool_result_for_context
 from cli.tools import ToolRegistry
+from cli.workflows.router import build_workflow_system_prompt
 
 logger = logging.getLogger(__name__)
 
 RuntimeEvent = dict[str, Any]
 
 STREAM_CHUNK_TIMEOUT = 60.0
+_INTERNAL_RETRY_MARKER = "_internal_retry"
 
 
 def _iter_with_timeout(stream, timeout: float, cancel_check: Callable[[], bool] | None = None):
@@ -113,6 +115,10 @@ class RunState:
     recent_args_texts: list[str] = field(default_factory=list)
 
 
+def _drop_internal_retry_messages(messages: list[dict[str, Any]]) -> None:
+    messages[:] = [m for m in messages if not m.get(_INTERNAL_RETRY_MARKER)]
+
+
 def partition_tool_calls(
     tool_calls: list[dict],
     concurrency_safe: Callable[[str], bool],
@@ -140,12 +146,20 @@ class AgentRuntime:
         scratchpad: AgentScratchpad | None = None,
         max_tool_rounds: int = MAX_TOOL_ROUNDS,
         cancel_check: Callable[[], bool] | None = None,
+        stream_chunk_timeout: float = STREAM_CHUNK_TIMEOUT,
+        allowed_tools: set[str] | tuple[str, ...] | None = None,
+        workflow: Any | None = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self.scratchpad = scratchpad
         self.max_tool_rounds = max_tool_rounds
         self.cancel_check = cancel_check
+        self.stream_chunk_timeout = stream_chunk_timeout
+        workflow_tools = getattr(workflow, "allowed_tools", ()) if workflow else ()
+        tool_scope = tuple(allowed_tools or workflow_tools or ())
+        self.allowed_tools = set(tool_scope) if tool_scope else None
+        self.workflow = workflow
 
     def run_stream(
         self,
@@ -154,14 +168,16 @@ class AgentRuntime:
     ) -> Iterator[RuntimeEvent]:
         """Run the agent loop and yield normalized runtime events."""
 
+        system_prompt = self._prepare_system_prompt(system_prompt)
         state = RunState(started_at=time.monotonic())
         expectation = resolve_turn_expectation(messages)
         model_name = getattr(self.provider, "name", "")
+        workflow_event = self._workflow_start_event()
+        if workflow_event:
+            yield workflow_event
 
         for round_idx in range(self.max_tool_rounds):
-            if round_idx > 0:
-                shrink_stale_tool_results(messages)
-            messages, event = self._compact_if_needed(messages, model_name)
+            messages, event = self._compact_if_needed(messages, model_name, self._provider_context_window())
             if event:
                 yield event
 
@@ -194,9 +210,10 @@ class AgentRuntime:
         self,
         messages: list[dict[str, Any]],
         model_name: str,
+        context_window: int | None,
     ) -> tuple[list[dict[str, Any]], RuntimeEvent | None]:
         prev_len = len(messages)
-        compacted_messages, compacted = compact_messages(messages, self.provider, model_name)
+        compacted_messages, compacted = compact_messages(messages, self.provider, model_name, context_window)
         if not compacted:
             return compacted_messages, None
         messages[:] = compacted_messages
@@ -208,6 +225,38 @@ class AgentRuntime:
             "after_messages": len(compacted_messages),
         }
 
+    def _provider_context_window(self) -> int | None:
+        try:
+            window = int(getattr(self.provider, "context_window", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        return window if window > 0 else None
+
+    def _prepare_system_prompt(self, system_prompt: str) -> str:
+        system_prompt += build_workflow_system_prompt(self.workflow)
+        try:
+            return self._append_skills_prompt(system_prompt)
+        except Exception:
+            logger.debug("Failed to load/inject skills into system prompt", exc_info=True)
+            return system_prompt
+
+    def _append_skills_prompt(self, system_prompt: str) -> str:
+        from cli.skills import load_skills
+
+        skills = load_skills()
+        if not skills or not self._tool_allowed_for_prompt("execute_skill"):
+            return system_prompt
+        skills_text = "\n".join(f"- {s.name}: {s.description}" for s in skills.values())
+        return (
+            system_prompt
+            + "\n\n<system-reminder>\n"
+            + "The following skills are available for use with the execute_skill tool:\n\n"
+            + f"{skills_text}\n\n"
+            + "When a skill matches the user's intent, you should call the execute_skill tool first "
+            + "to retrieve the detailed instructions, and then follow them to accomplish the task.\n"
+            + "</system-reminder>"
+        )
+
     def _collect_model_round(
         self,
         messages: list[dict[str, Any]],
@@ -215,8 +264,8 @@ class AgentRuntime:
         round_number: int,
     ) -> Iterator[RuntimeEvent | RoundState]:
         round_state = RoundState()
-        stream = self.provider.chat_stream(messages, self.tools.schemas(), system_prompt)
-        for chunk in _iter_with_timeout(stream, STREAM_CHUNK_TIMEOUT, self.cancel_check):
+        stream = self.provider.chat_stream(messages, self._tool_schemas(), system_prompt)
+        for chunk in _iter_with_timeout(stream, self.stream_chunk_timeout, self.cancel_check):
             event = self._consume_model_chunk(round_state, chunk, round_number)
             if event:
                 yield event
@@ -326,11 +375,15 @@ class AgentRuntime:
         retry_prompt: str,
     ) -> None:
         if round_state.text:
-            retry_msg: dict[str, Any] = {"role": "assistant", "content": round_state.text}
+            retry_msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": round_state.text,
+                _INTERNAL_RETRY_MARKER: True,
+            }
             if round_state.thinking:
                 retry_msg["reasoning_content"] = round_state.thinking
             messages.append(retry_msg)
-        messages.append({"role": "user", "content": retry_prompt})
+        messages.append({"role": "user", "content": retry_prompt, _INTERNAL_RETRY_MARKER: True})
 
     def _apply_missing_tool_warning(self, round_state: RoundState, state: RunState, expectation: Any) -> None:
         if missing_required_tool(expectation, state.used_tools):
@@ -344,6 +397,7 @@ class AgentRuntime:
         state: RunState,
         rounds: int,
     ) -> RuntimeEvent:
+        _drop_internal_retry_messages(messages)
         final_msg: dict[str, Any] = {"role": "assistant", "content": round_state.text}
         if round_state.thinking:
             final_msg["reasoning_content"] = round_state.thinking
@@ -384,7 +438,7 @@ class AgentRuntime:
             yield self._tool_start_event(call, concurrent=True)
 
         with ThreadPoolExecutor(max_workers=min(len(calls), 5)) as pool:
-            futures = {pool.submit(self._execute_tool_call_raw, c): c for c in calls}
+            futures = {pool.submit(self._execute_tool_call_raw, c, messages): c for c in calls}
             for future in as_completed(futures):
                 call = futures[future]
                 name = call["name"]
@@ -455,7 +509,7 @@ class AgentRuntime:
             return "doom"
 
         yield self._tool_start_event(call)
-        raw = self._execute_tool_call_raw(call)
+        raw = self._execute_tool_call_raw(call, messages)
         yield from self._append_tool_result(
             messages,
             name,
@@ -479,11 +533,20 @@ class AgentRuntime:
             event["concurrent"] = True
         return event
 
-    def _execute_tool_call_raw(self, call: dict[str, Any]) -> dict[str, Any]:
+    def _execute_tool_call_raw(
+        self, call: dict[str, Any], messages: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
         t_tool = time.monotonic()
         status = "ok"
+        if self.allowed_tools is not None and call["name"] not in self.allowed_tools:
+            return {
+                "call": call,
+                "result": {"error": f"工具 {call['name']} 不在当前 workflow 允许范围内"},
+                "status": "error",
+                "elapsed_ms": 0,
+            }
         try:
-            result = self.tools.execute(call["name"], call["args"])
+            result = self.tools.execute(call["name"], call["args"], messages=messages)
             if isinstance(result, dict) and result.get("error"):
                 status = "error"
         except Exception as exc:
@@ -494,6 +557,29 @@ class AgentRuntime:
             "result": result,
             "status": status,
             "elapsed_ms": int((time.monotonic() - t_tool) * 1000),
+        }
+
+    def _tool_schemas(self) -> list[dict[str, Any]]:
+        try:
+            return self.tools.schemas(self.allowed_tools)
+        except TypeError:
+            schemas = self.tools.schemas()
+            if self.allowed_tools is None:
+                return schemas
+            return [schema for schema in schemas if schema.get("name") in self.allowed_tools]
+
+    def _tool_allowed_for_prompt(self, name: str) -> bool:
+        return self.allowed_tools is None or name in self.allowed_tools
+
+    def _workflow_start_event(self) -> RuntimeEvent | None:
+        workflow = self.workflow
+        if not workflow or getattr(workflow, "is_general", False):
+            return None
+        return {
+            "type": "workflow_start",
+            "workflow": getattr(workflow, "name", ""),
+            "label": getattr(workflow, "label", ""),
+            "allowed_tools": sorted(self.allowed_tools or []),
         }
 
     def _is_doom_loop(self, name: str, args: dict[str, Any], state: RunState) -> bool:

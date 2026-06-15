@@ -85,7 +85,7 @@ Modern React SPA with AI Agent chat, portfolio management, funnel screening, rec
 | Pre-Market Risk | A50 futures + VIX monitoring with four alert levels |
 | Local Dashboard | `wyckoff dashboard` — recommendations, signals, portfolio, agent memory, chat logs; dark/light theme, bilingual CN/EN |
 | Agent Memory | Cross-session memory: auto-extracts session conclusions, injects relevant context on next query |
-| Context Compaction | Dynamic threshold (25% of model context window) auto-compresses long conversations, smart tool result summarization preserves key data |
+| Context Compaction | Remaining-window budget auto-compresses long conversations, smart tool result summarization preserves key data |
 | Tool Confirmation | `exec_command`, `write_file`, `update_portfolio` require user approval before execution |
 | General Agent Capabilities | Execute commands, read/write files, fetch web pages — send a CSV path and it will analyze it |
 | MCP Server | 10 tools exposed via MCP protocol — plug into Claude Code / Cursor / any MCP client |
@@ -173,7 +173,7 @@ Pages include recommendations, signals, portfolio, agent memory, configuration, 
 
 ### Backtest Grid
 
-18 parameter combos run in parallel, outputs optimal parameters, Sharpe matrix, and strategy health check:
+8 focused parameter combos per period, outputs optimal parameters, Sharpe matrix, and strategy health check:
 
 | Optimal Params & Ranking | Parameter Matrix |
 |:---:|:---:|
@@ -231,12 +231,12 @@ Built-in GitHub Actions cron jobs:
 
 | Task | Schedule (Beijing Time) | Description |
 |---|---|---|
-| Funnel + AI Report + Rebalance | Sun–Thu 18:25 | Fully automated; results pushed to Feishu / Telegram |
+| Funnel + AI Report + Rebalance | Sun–Thu 17:17 | Fully automated; results pushed to Feishu / Telegram |
 | Tail-Buy Strategy | Mon–Fri 13:50 | Rule scoring + LLM review, end-of-day entry screening |
 | Pre-Market Risk | Mon–Fri 08:20 | A50 + VIX alert |
 | Limit-Up Review | Mon–Fri 19:25 | Review stocks that rose >= 8% today |
 | Recommendation Reprice | Sun–Thu 23:00 | Sync closing prices |
-| Backtest Grid | 1st & 15th monthly 04:00 | 18 parallel parameter combos → aggregated report |
+| Backtest Grid | 1st & 15th monthly 04:00 | 8 focused parameter combos → aggregated report |
 | DB Maintenance | Daily 23:05 | Purge stale quotes, orders, signals, market signals, and other rolling-window data |
 
 ## Model Support
@@ -302,9 +302,9 @@ Ideal for giving any AI assistant a quick "Wyckoff lens."
 
 ## Community
 
-| Feishu Group | QQ Group | Feishu Contact |
-|:---:|:---:|:---:|
-| <img src="../attach/飞书群二维码.png" width="200" /> | <img src="../attach/QQ群二维码.jpg" width="200" /><br/>Group: 761348919 | <img src="../attach/飞书个人二维码.png" width="200" /> |
+| Feishu Group 1 | Feishu Group 2 | QQ Group | Feishu Contact |
+|:---:|:---:|:---:|:---:|
+| <img src="../attach/飞书群二维码.png" width="200" /> | <img src="../attach/飞书二群二维码.png" width="200" /> | <img src="../attach/QQ群二维码.jpg" width="200" /><br/>Group: 761348919 | <img src="../attach/飞书个人二维码.png" width="200" /> |
 
 ## Sponsor
 

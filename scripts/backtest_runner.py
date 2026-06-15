@@ -20,14 +20,31 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 # Ensure project root is on sys.path for direct script invocation
 if __name__ == "__main__" or not __package__:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.candidate_policy import (
+    apply_loss_guard as _apply_loss_guard,
+)
+from core.candidate_policy import (
+    apply_regime_position_filter as _apply_regime_position_filter,
+)
+from core.candidate_policy import (
+    is_tradeable_l4_trigger_combo,
+    trigger_sets_by_code,
+)
+from core.cash_portfolio import (
+    STYLE_LABELS,
+    CashPortfolioConfig,
+    expand_portfolio_styles,
+    simulate_cash_portfolio,
+)
 from core.funnel_pipeline import (
     analyze_benchmark_and_tune_cfg as _tune_cfg_by_regime,
 )
@@ -52,10 +69,10 @@ from tools.funnel_config import apply_funnel_cfg_overrides as _shared_apply_funn
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HOLD_DAYS = 30
+DEFAULT_HOLD_DAYS = 10
 DEFAULT_EXIT_MODE = "sltp"
-DEFAULT_STOP_LOSS_PCT = -7.0
-DEFAULT_TAKE_PROFIT_PCT = 18.0
+DEFAULT_STOP_LOSS_PCT = -8.0
+DEFAULT_TAKE_PROFIT_PCT = 0.0
 DEFAULT_TRAILING_STOP_PCT = 0.0  # 0 = 不启用移动止盈；如 -5.0 表示从最高点回撤 5% 卖出
 DEFAULT_TRAILING_ACTIVATE_PCT = 0.0  # 移动止盈激活门槛(%)，如 10.0 表示浮盈 ≥10% 后才启用移动止盈
 
@@ -71,16 +88,37 @@ DEFAULT_SELL_FRICTION_PCT = float(os.getenv("BACKTEST_SELL_FRICTION_PCT", "0.5")
 DEFAULT_METRICS_ENGINE = os.getenv("BACKTEST_METRICS_ENGINE", "legacy").strip().lower() or "legacy"
 DEFAULT_WBT_FEE_RATE = float(os.getenv("BACKTEST_WBT_FEE_RATE", "0.0"))
 DEFAULT_WBT_N_JOBS = int(os.getenv("BACKTEST_WBT_N_JOBS", "1"))
+DEFAULT_CASH_PORTFOLIO_INITIAL_CASH = 100_000.0
+DEFAULT_CASH_PORTFOLIO_MAX_POSITIONS = 4
+DEFAULT_CASH_PORTFOLIO_COMMISSION_RATE = 0.0002
+DEFAULT_CASH_PORTFOLIO_SMALL_TRADE_THRESHOLD = 10_000.0
+DEFAULT_CASH_PORTFOLIO_SMALL_TRADE_FEE = 5.0
+DEFAULT_CASH_PORTFOLIO_LOT_SIZE = 100
+DEFAULT_CASH_PORTFOLIO_STYLES = (
+    os.getenv("BACKTEST_PORTFOLIO_STYLES", "confirmation_only").strip() or "confirmation_only"
+)
+DEFAULT_ENTRY_PRICE_TIME = "14:55"
+DEFAULT_ENTRY_PRICE_FALLBACK = os.getenv("BACKTEST_ENTRY_PRICE_FALLBACK", "close").strip().lower() or "close"
+CN_ZONE = ZoneInfo("Asia/Shanghai")
 
-# ── 大盘水温仓位控制：根据 regime 调节每日候选上限，减少逆势开仓。 ──
-REGIME_POSITION_RATIO: dict[str, float] = {
-    "NEUTRAL": 1.0,  # 震荡市 → 全仓
-    "RISK_ON": 0.2,  # 热点追涨期反转率高 → 轻仓试探
-    "PANIC_REPAIR": 0.5,  # 恐慌修复 → 半仓试探
-    "RISK_OFF": 0.2,  # 避险 → 轻仓（回测 Sharpe -0.48）
-    "CRASH": 0.0,  # 崩盘 → 不开仓
+FUNNEL_AI_SELECTION_MODE = os.getenv("FUNNEL_AI_SELECTION_MODE", "tradeable_l4").strip().lower()
+try:
+    BACKTEST_FULL_FORMAL_L4_MAX = max(int(float(os.getenv("FUNNEL_FULL_FORMAL_L4_MAX", "25"))), 0)
+except Exception:
+    BACKTEST_FULL_FORMAL_L4_MAX = 25
+_TRADEABLE_L4_SELECTION_MODES = {
+    "tradeable_l4",
 }
-FUNNEL_AI_SELECTION_MODE = os.getenv("FUNNEL_AI_SELECTION_MODE", "legacy_full_hits").strip().lower()
+_STRICT_L4_SELECTION_MODES = {
+    "quality_l4",
+    "strict_l4",
+}
+_FORMAL_L4_SELECTION_MODES = {
+    "all_formal_l4",
+    "all_l4",
+    "full_formal_l4",
+    "full_l4",
+}
 _LEGACY_SELECTION_MODES = {
     "legacy_full_hits",
     "legacy_hits",
@@ -103,6 +141,11 @@ class TradeRecord:
     ret_pct: float
     track: str = ""  # "Trend" / "Accum" / "" (unclassified)
     regime: str = ""  # market regime at signal time
+    entry_price_source: str = "daily_open"
+    entry_target_time: str = ""
+    exit_reason: str = "unknown"
+    mfe_pct: float | None = None
+    mae_pct: float | None = None
 
 
 def _parse_date(v: str) -> date:
@@ -371,6 +414,78 @@ def _dedup_order(codes: list[str]) -> list[str]:
     return out
 
 
+def _track_map_for_hits(
+    codes: list[str],
+    triggers: dict[str, list[tuple[str, float]]],
+) -> dict[str, str]:
+    sos_hit_set = {str(c).strip() for c, _ in triggers.get("sos", [])}
+    evr_hit_set = {str(c).strip() for c, _ in triggers.get("evr", [])}
+    spring_hit_set = {str(c).strip() for c, _ in triggers.get("spring", [])}
+    lps_hit_set = {str(c).strip() for c, _ in triggers.get("lps", [])}
+    track_map = {}
+    for code in codes:
+        if code in sos_hit_set or code in evr_hit_set:
+            track_map[code] = "Trend"
+        elif code in spring_hit_set or code in lps_hit_set:
+            track_map[code] = "Accum"
+        else:
+            track_map[code] = "Trend"
+    return track_map
+
+
+def _quota_ai_inputs(
+    *,
+    result: FunnelResult,
+    day_df_map: dict[str, pd.DataFrame],
+    sector_map: dict[str, str],
+    regime: str,
+) -> tuple[list[str], list[str], list[str], dict[str, float]]:
+    sector_rotation = analyze_sector_rotation(
+        day_df_map,
+        sector_map,
+        universe_symbols=list(day_df_map.keys()),
+        focus_sectors=result.top_sectors,
+    )
+    l3_ranked_symbols, _ = rank_l3_candidates(
+        l3_symbols=result.layer3_symbols,
+        df_map=day_df_map,
+        sector_map=sector_map,
+        triggers=result.triggers,
+        top_sectors=result.top_sectors,
+        l2_channel_map=result.channel_map,
+        sector_rotation_map=(sector_rotation or {}).get("state_map", {}) or {},
+    )
+    trend_sel, accum_sel, score_map = allocate_ai_candidates(
+        result,
+        l3_ranked_symbols or result.layer3_symbols,
+        regime,
+        sector_map=sector_map,
+        max_per_sector=2,
+    )
+    return _dedup_order(trend_sel + accum_sel), trend_sel, accum_sel, score_map
+
+
+def _select_l4_mode_codes(
+    *,
+    result: FunnelResult,
+    sorted_hit_codes: list[str],
+    hit_score_map: dict[str, float],
+    selection_mode: str,
+) -> tuple[list[str], dict[str, float], dict[str, str]] | None:
+    if selection_mode in _STRICT_L4_SELECTION_MODES:
+        trigger_sets = trigger_sets_by_code(result.triggers)
+        selected_codes = [
+            code for code in sorted_hit_codes if is_tradeable_l4_trigger_combo(trigger_sets.get(code, set()))
+        ]
+    elif selection_mode in _FORMAL_L4_SELECTION_MODES or selection_mode in _LEGACY_SELECTION_MODES:
+        cap = int(BACKTEST_FULL_FORMAL_L4_MAX)
+        selected_codes = sorted_hit_codes if cap <= 0 else sorted_hit_codes[:cap]
+    else:
+        return None
+    score_map = {code: hit_score_map.get(code, 0.0) for code in selected_codes}
+    return selected_codes, score_map, _track_map_for_hits(selected_codes, result.triggers)
+
+
 def _select_ai_input_codes(
     *,
     result: FunnelResult,
@@ -379,12 +494,7 @@ def _select_ai_input_codes(
     regime: str,
     selection_mode: str,
 ) -> tuple[list[str], dict[str, float], dict[str, str]]:
-    """
-    按线上漏斗口径选出“送给 AI 的候选池”：
-    - legacy_full_hits：全量 L4 命中，按触发分值排序
-    - modern quotas：L3 排序 + allocate_ai_candidates 动态配额
-    返回 (selected_codes, priority_score_map, track_map)
-    """
+    """按线上漏斗口径选出送给 AI 的候选池。"""
     merged_trigger_map = _combine_trigger_scores(result.triggers)
     hit_score_map = {code: float(v[0]) for code, v in merged_trigger_map.items()}
     sorted_hit_codes = sorted(
@@ -392,52 +502,64 @@ def _select_ai_input_codes(
         key=lambda c: -hit_score_map.get(c, 0.0),
     )
 
-    sos_hit_set = {str(c).strip() for c, _ in result.triggers.get("sos", [])}
-    evr_hit_set = {str(c).strip() for c, _ in result.triggers.get("evr", [])}
-    spring_hit_set = {str(c).strip() for c, _ in result.triggers.get("spring", [])}
-    lps_hit_set = {str(c).strip() for c, _ in result.triggers.get("lps", [])}
+    l4_selection = _select_l4_mode_codes(
+        result=result,
+        sorted_hit_codes=sorted_hit_codes,
+        hit_score_map=hit_score_map,
+        selection_mode=selection_mode,
+    )
+    if l4_selection is not None:
+        return l4_selection
 
-    if selection_mode in _LEGACY_SELECTION_MODES:
-        track_map = {}
-        for code in sorted_hit_codes:
-            if code in sos_hit_set or code in evr_hit_set:
-                track_map[code] = "Trend"
-            elif code in spring_hit_set or code in lps_hit_set:
-                track_map[code] = "Accum"
-            else:
-                track_map[code] = "Trend"
-        return sorted_hit_codes, hit_score_map, track_map
-
-    sector_rotation = analyze_sector_rotation(
-        day_df_map,
-        sector_map,
-        universe_symbols=list(day_df_map.keys()),
-        focus_sectors=result.top_sectors,
-    )
-    sector_rotation_map = (sector_rotation or {}).get("state_map", {}) or {}
-    l3_ranked_symbols, _ = rank_l3_candidates(
-        l3_symbols=result.layer3_symbols,
-        df_map=day_df_map,
+    selected_codes, trend_sel, accum_sel, priority_score_map = _quota_ai_inputs(
+        result=result,
+        day_df_map=day_df_map,
         sector_map=sector_map,
-        triggers=result.triggers,
-        top_sectors=result.top_sectors,
-        l2_channel_map=result.channel_map,
-        sector_rotation_map=sector_rotation_map,
+        regime=regime,
     )
-    trend_sel, accum_sel, priority_score_map = allocate_ai_candidates(
-        result,
-        l3_ranked_symbols or result.layer3_symbols,
-        regime,
-        sector_map=sector_map,
-        max_per_sector=2,
-    )
-    selected_codes = _dedup_order(trend_sel + accum_sel)
+    if selection_mode in _TRADEABLE_L4_SELECTION_MODES:
+        selected_codes, trend_sel, accum_sel, _ = _apply_loss_guard(
+            selected_codes,
+            trend_sel,
+            accum_sel,
+            regime=regime,
+            code_to_trigger_keys=trigger_sets_by_code(result.triggers),
+            code_to_total_score=hit_score_map,
+            channel_map=result.channel_map,
+            df_map=day_df_map,
+        )
     min_score = float(getattr(FunnelConfig, "min_funnel_score", 0.15) or 0)
     if min_score > 0 and priority_score_map:
         selected_codes = [c for c in selected_codes if priority_score_map.get(c, 0.0) >= min_score]
     track_map = dict.fromkeys(trend_sel, "Trend")
     track_map.update(dict.fromkeys(accum_sel, "Accum"))
     return selected_codes, priority_score_map, track_map
+
+
+def _entry_price_source_counts(trades_df: pd.DataFrame) -> dict[str, int]:
+    if trades_df.empty or "entry_price_source" not in trades_df.columns:
+        return {}
+    counts = trades_df["entry_price_source"].value_counts(dropna=False).to_dict()
+    return {str(k): int(v) for k, v in counts.items()}
+
+
+def _calc_trade_excursion_pct(
+    day_ohlc: dict[date, tuple[float, float, float, float]],
+    window: list[date],
+    entry_price: float,
+) -> tuple[float | None, float | None]:
+    if entry_price <= 0:
+        return None, None
+    max_high = entry_price
+    min_low = entry_price
+    for day in window:
+        candle = day_ohlc.get(day)
+        if candle is None:
+            continue
+        _, high, low, _ = candle
+        max_high = max(max_high, float(high))
+        min_low = min(min_low, float(low))
+    return (max_high / entry_price - 1.0) * 100.0, (min_low / entry_price - 1.0) * 100.0
 
 
 def _close_on_date(df: pd.DataFrame, d: date) -> float | None:
@@ -497,6 +619,106 @@ def _open_on_or_after(df: pd.DataFrame, d: date, *, skip_limit_up: bool = True) 
     return None, None
 
 
+def _parse_entry_time(raw: str) -> time:
+    try:
+        hour_s, minute_s = str(raw or DEFAULT_ENTRY_PRICE_TIME).strip().split(":", 1)
+        return time(hour=int(hour_s), minute=int(minute_s))
+    except (TypeError, ValueError):
+        return time(hour=14, minute=55)
+
+
+def _intraday_ms_window(day: date, entry_time: str) -> tuple[int, int]:
+    target = _parse_entry_time(entry_time)
+    start_dt = datetime.combine(day, time(hour=9, minute=30), tzinfo=CN_ZONE)
+    end_dt = datetime.combine(day, target, tzinfo=CN_ZONE) + timedelta(minutes=1)
+    return int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+
+
+def _price_at_or_before(df: pd.DataFrame, day: date, entry_time: str) -> float | None:
+    if df is None or df.empty or "close" not in df.columns:
+        return None
+    work = df.copy()
+    if "datetime" in work.columns:
+        dt = pd.to_datetime(work["datetime"], errors="coerce")
+    elif "timestamp" in work.columns:
+        dt = pd.to_datetime(work["timestamp"], unit="ms", utc=True, errors="coerce").dt.tz_convert(CN_ZONE)
+    else:
+        return None
+    work["datetime"] = dt
+    work["close"] = pd.to_numeric(work["close"], errors="coerce")
+    target = datetime.combine(day, _parse_entry_time(entry_time), tzinfo=CN_ZONE)
+    hit = work[(work["datetime"].dt.date == day) & (work["datetime"] <= target)].dropna(subset=["close"]).tail(1)
+    return None if hit.empty else float(hit.iloc[0]["close"])
+
+
+def _resolve_tickflow_entry_price(
+    code: str,
+    day: date,
+    entry_time: str,
+    cache: dict,
+) -> float | None:
+    key = (str(code), day, str(entry_time))
+    if key in cache:
+        return cache[key]
+    api_key = os.getenv("TICKFLOW_API_KEY", "").strip()
+    if not api_key:
+        cache[key] = None
+        return None
+    from integrations.tickflow_client import TickFlowClient
+
+    client = cache.get("_client")
+    if client is None:
+        client = TickFlowClient(api_key=api_key)
+        cache["_client"] = client
+    start_ms, end_ms = _intraday_ms_window(day, entry_time)
+    try:
+        df = client.get_klines(
+            code,
+            period="1m",
+            count=500,
+            intraday=True,
+            start_time_ms=start_ms,
+            end_time_ms=end_ms,
+        )
+        cache[key] = _price_at_or_before(df, day, entry_time)
+    except Exception as exc:
+        logger.warning("TickFlow %s %s %s 分钟入场价失败，回退日线收盘: %s", code, day, entry_time, exc)
+        cache[key] = None
+    return cache[key]
+
+
+def _entry_on_or_after(
+    df: pd.DataFrame,
+    code: str,
+    d: date,
+    *,
+    mode: str,
+    entry_time: str,
+    fallback: str,
+    intraday_cache: dict,
+    skip_limit_up: bool = True,
+) -> tuple[float | None, date | None, str]:
+    candidates = df[df["date"] >= d].head(5)
+    for _, row_s in candidates.iterrows():
+        if skip_limit_up and _is_limit_up_locked(row_s):
+            continue
+        hit_date = row_s["date"]
+        if mode == "tail_1455":
+            price = _resolve_tickflow_entry_price(code, hit_date, entry_time, intraday_cache)
+            if price is not None and price > 0:
+                return price, hit_date, f"tickflow_1m_{entry_time}"
+            if fallback == "error":
+                raise RuntimeError(f"{code} {hit_date} {entry_time} 分钟线入场价缺失")
+            if fallback == "skip":
+                return None, None, "tail_1455_missing_skip"
+            close_v = pd.to_numeric(pd.Series([row_s.get("close")]), errors="coerce").dropna()
+            if not close_v.empty:
+                return float(close_v.iloc[0]), hit_date, "daily_close_fallback"
+        price, entry_date = _open_on_or_after(df, hit_date, skip_limit_up=False)
+        return price, entry_date, "daily_open"
+    return None, None, ""
+
+
 def _close_on_or_before(
     df: pd.DataFrame,
     d: date,
@@ -554,6 +776,21 @@ def _ensure_ohlc_lookup_cache(
         df = all_df_map.get(record.code)
         if df is not None and not df.empty:
             ohlc_cache[record.code] = _build_daily_ohlc_lookup(df)
+
+
+def _cash_mark_price_fn(
+    all_df_map: dict[str, pd.DataFrame],
+    ohlc_cache: dict[str, dict[date, tuple[float, float, float, float]]],
+):
+    def _mark(code: str, day: date) -> float | None:
+        if code not in ohlc_cache:
+            df = all_df_map.get(code)
+            if df is not None and not df.empty:
+                ohlc_cache[code] = _build_daily_ohlc_lookup(df)
+        candle = ohlc_cache.get(code, {}).get(day)
+        return float(candle[3]) if candle else None
+
+    return _mark
 
 
 def _calc_atr_from_ohlc(
@@ -633,10 +870,27 @@ def run_backtest(
     wbt_fee_rate: float = DEFAULT_WBT_FEE_RATE,
     wbt_n_jobs: int = DEFAULT_WBT_N_JOBS,
     abc_filter: bool = False,
+    entry_price_mode: str = "open",
+    entry_price_time: str = DEFAULT_ENTRY_PRICE_TIME,
+    entry_price_fallback: str = DEFAULT_ENTRY_PRICE_FALLBACK,
+    cash_portfolio: bool = False,
+    initial_cash: float = DEFAULT_CASH_PORTFOLIO_INITIAL_CASH,
+    max_positions: int = DEFAULT_CASH_PORTFOLIO_MAX_POSITIONS,
+    commission_rate: float = DEFAULT_CASH_PORTFOLIO_COMMISSION_RATE,
+    small_trade_threshold: float = DEFAULT_CASH_PORTFOLIO_SMALL_TRADE_THRESHOLD,
+    small_trade_fee: float = DEFAULT_CASH_PORTFOLIO_SMALL_TRADE_FEE,
+    lot_size: int = DEFAULT_CASH_PORTFOLIO_LOT_SIZE,
+    portfolio_styles: str | list[str] = DEFAULT_CASH_PORTFOLIO_STYLES,
 ) -> tuple[pd.DataFrame, dict]:
     metrics_engine = str(metrics_engine or "legacy").strip().lower()
+    entry_price_mode = str(entry_price_mode or "open").strip().lower()
+    entry_price_fallback = str(entry_price_fallback or DEFAULT_ENTRY_PRICE_FALLBACK).strip().lower()
     if metrics_engine not in {"legacy", "auto", "both", "wbt"}:
         raise ValueError("metrics_engine 必须是 legacy / auto / both / wbt")
+    if entry_price_mode not in {"open", "tail_1455"}:
+        raise ValueError("entry_price_mode 必须是 open 或 tail_1455")
+    if entry_price_fallback not in {"close", "skip", "error"}:
+        raise ValueError("entry_price_fallback 必须是 close / skip / error")
     if pending_mode not in {"off", "only", "both"}:
         raise ValueError("pending_mode 必须是 off / only / both")
     if pending_merge_order not in {"funnel_first", "confirmed_first"}:
@@ -665,6 +919,15 @@ def run_backtest(
         raise ValueError("wbt_fee_rate 必须 >= 0")
     if wbt_n_jobs < 1:
         raise ValueError("wbt_n_jobs 必须 >= 1")
+    if initial_cash <= 0:
+        raise ValueError("initial_cash 必须 > 0")
+    if max_positions < 1:
+        raise ValueError("max_positions 必须 >= 1")
+    portfolio_style_list = expand_portfolio_styles(portfolio_styles)
+    if commission_rate < 0 or small_trade_threshold < 0 or small_trade_fee < 0:
+        raise ValueError("commission_rate / small_trade_threshold / small_trade_fee 必须 >= 0")
+    if lot_size < 1:
+        raise ValueError("lot_size 必须 >= 1")
 
     # ── 快照模式：优先从快照加载股票列表，避免网络调用 ──
     snapshot_name_map: dict[str, str] | None = None
@@ -772,6 +1035,8 @@ def run_backtest(
     signal_days = 0
     eval_days = 0
     ohlc_lookup_cache: dict[str, dict[date, tuple[float, float, float, float]]] = {}
+    intraday_entry_cache: dict = {}
+    entry_price_missing_skipped = 0
 
     pending_pool = PendingPool() if pending_mode != "off" else None
     pending_confirmed_total = 0
@@ -826,6 +1091,7 @@ def run_backtest(
         confirmed_codes: list[str] = []
         confirmed_score_map: dict[str, float] = {}
         confirmed_track_map: dict[str, str] = {}
+        confirmed_trigger_map: dict[str, str] = {}
         if pending_pool is not None:
             pending_pool.write(signal_date_str, result.triggers, day_df_map, regime, name_map, sector_map, day_cfg)
             for cs in pending_pool.tick(day_df_map, signal_date_str):
@@ -834,6 +1100,7 @@ def run_backtest(
                     confirmed_codes.append(c)
                     confirmed_score_map[c] = float(cs.get("score", 0))
                     confirmed_track_map[c] = str(cs.get("track", "Trend"))
+                    confirmed_trigger_map[c] = str(cs.get("signal_type", "confirmed"))
             pending_confirmed_total += len(confirmed_codes)
 
         selected_for_ai, p_score_map, track_map = _select_ai_input_codes(
@@ -860,29 +1127,33 @@ def run_backtest(
                 merged = list(selected_for_ai) + [c for c in confirmed_codes if c not in seen]
             if not merged:
                 continue
-            ranked_codes = merged if int(top_n) <= 0 else merged[:top_n]
+            ranked_codes = merged
             p_score_map.update(confirmed_score_map)
             track_map.update(confirmed_track_map)
         else:
             if not selected_for_ai:
                 continue
-            ranked_codes = selected_for_ai if int(top_n) <= 0 else selected_for_ai[:top_n]
+            ranked_codes = selected_for_ai
 
         if regime_filter and ranked_codes:
-            ratio = REGIME_POSITION_RATIO.get(regime, 1.0)
-            if ratio <= 0:
+            ranked_codes = _apply_regime_position_filter(ranked_codes, str(regime))
+            if not ranked_codes:
                 continue
-            if ratio < 1.0:
-                keep_n = max(1, int(len(ranked_codes) * ratio + 0.5))
-                ranked_codes = ranked_codes[:keep_n]
 
         if abc_filter and ranked_codes:
             ranked_codes = _apply_abc_filter(ranked_codes, day_df_map, result.triggers)
             if not ranked_codes:
                 continue
 
+        if int(top_n) > 0:
+            ranked_codes = ranked_codes[: int(top_n)]
+            if not ranked_codes:
+                continue
+
         # Only needed for string names
         name_score_map = _combine_trigger_scores(result.triggers)
+        for code, signal_type in confirmed_trigger_map.items():
+            name_score_map.setdefault(code, (confirmed_score_map.get(code, 0.0), f"{signal_type}(确认)"))
 
         signal_days += 1
         for code in ranked_codes:
@@ -891,10 +1162,19 @@ def run_backtest(
                 continue
             # 核心修正：实盘中信号出现在收盘后，最早只能在次日开盘买入
             # 停牌股可能延后成交，必须用 actual_entry_date 计算持有窗口
-            entry_close, actual_entry_date = _open_on_or_after(
-                full_df, entry_target_date, skip_limit_up=(board != "us")
+            entry_close, actual_entry_date, entry_price_source = _entry_on_or_after(
+                full_df,
+                code,
+                entry_target_date,
+                mode=entry_price_mode,
+                entry_time=entry_price_time,
+                fallback=entry_price_fallback,
+                intraday_cache=intraday_entry_cache,
+                skip_limit_up=(board != "us"),
             )
             if entry_close is None or entry_close <= 0 or actual_entry_date is None:
+                if entry_price_source == "tail_1455_missing_skip":
+                    entry_price_missing_skipped += 1
                 continue
 
             # 根据实际成交日推算退出锚点和市场窗口（停牌股的实际入场日可能晚于 entry_target_date）
@@ -913,9 +1193,11 @@ def run_backtest(
                     continue  # sltp/close_only 模式：剩余交易日不足以覆盖完整持有期
             actual_exit_anchor = trade_dates[actual_exit_idx]
 
+            exit_reason = "unknown"
             if exit_mode == "close_only":
                 # 兼容旧口径：持有 N 个市场交易日后按 anchor 日（或其后首个可得日）收盘离场。
                 exit_close, exit_date = _close_on_or_after(full_df, actual_exit_anchor)
+                exit_reason = "time_exit"
 
             elif exit_mode == "sltp":
                 # sltp 口径：T+1 合规，从入场次日起检查止盈止损。
@@ -977,16 +1259,19 @@ def run_backtest(
                         if kind == "sl" and low <= px:
                             exit_close = px if open_px >= px else open_px
                             exit_date = mkt_day
+                            exit_reason = "stop_loss"
                             hit = True
                             break
                         if kind == "trail" and low <= px:
                             exit_close = px if open_px >= px else open_px
                             exit_date = mkt_day
+                            exit_reason = "trailing_stop"
                             hit = True
                             break
                         if kind == "tp" and high >= px:
                             exit_close = px if open_px <= px else open_px
                             exit_date = mkt_day
+                            exit_reason = "take_profit"
                             hit = True
                             break
                     if hit:
@@ -1002,6 +1287,7 @@ def run_backtest(
                         actual_exit_anchor,
                         lower_exclusive=signal_date,
                     )
+                    exit_reason = "time_exit"
 
             elif exit_mode == "atr":
                 # ATR 模式：对齐实盘 step4_rebalancer 的 ATR 动态止损 + trailing。
@@ -1064,10 +1350,12 @@ def run_backtest(
                     if low <= effective_stop:
                         exit_close = effective_stop if open_px >= effective_stop else open_px
                         exit_date = mkt_day
+                        exit_reason = "atr_stop"
                         hit = True
                     elif trailing_price is not None and low <= trailing_price:
                         exit_close = trailing_price if open_px >= trailing_price else open_px
                         exit_date = mkt_day
+                        exit_reason = "trailing_stop"
                         hit = True
 
                     if hit:
@@ -1082,9 +1370,20 @@ def run_backtest(
                         actual_exit_anchor,
                         lower_exclusive=signal_date,
                     )
+                    exit_reason = "time_exit"
 
             if exit_close is None or exit_date is None:
                 continue
+            day_ohlc = ohlc_lookup_cache.get(code)
+            if day_ohlc is None:
+                day_ohlc = _build_daily_ohlc_lookup(full_df)
+                ohlc_lookup_cache[code] = day_ohlc
+            try:
+                actual_exit_idx_for_excursion = trade_dates.index(exit_date)
+            except ValueError:
+                actual_exit_idx_for_excursion = actual_exit_idx
+            excursion_window = trade_dates[actual_entry_idx + 1 : actual_exit_idx_for_excursion + 1]
+            mfe_pct, mae_pct = _calc_trade_excursion_pct(day_ohlc, excursion_window, entry_close)
             entry_exec = entry_close * (1.0 + buy_friction_pct / 100.0)
             exit_exec = exit_close * (1.0 - sell_friction_pct / 100.0)
             if entry_exec <= 0:
@@ -1106,6 +1405,11 @@ def run_backtest(
                     ret_pct=ret_pct,
                     track=track_map.get(code, ""),
                     regime=regime,
+                    entry_price_source=entry_price_source,
+                    entry_target_time=entry_price_time if entry_price_mode == "tail_1455" else "",
+                    exit_reason=exit_reason,
+                    mfe_pct=mfe_pct,
+                    mae_pct=mae_pct,
                 )
             )
 
@@ -1147,6 +1451,17 @@ def run_backtest(
         "pending_mode": pending_mode,
         "pending_merge_order": pending_merge_order,
         "pending_confirmed_total": pending_confirmed_total,
+        "entry_price_mode": entry_price_mode,
+        "entry_price_time": entry_price_time if entry_price_mode == "tail_1455" else "",
+        "entry_price_fallback": entry_price_fallback if entry_price_mode == "tail_1455" else "",
+        "entry_price_missing_skipped": entry_price_missing_skipped,
+        "entry_price_source_counts": _entry_price_source_counts(trades_df),
+        "cash_portfolio_enabled": bool(cash_portfolio),
+        "cash_portfolio_styles_requested": ",".join(portfolio_style_list),
+        "cash_portfolio_commission_rate": float(commission_rate),
+        "cash_portfolio_small_trade_threshold": float(small_trade_threshold),
+        "cash_portfolio_small_trade_fee": float(small_trade_fee),
+        "cash_portfolio_lot_size": int(lot_size),
         "metrics_engine": metrics_engine,
         "wbt_fee_rate": float(wbt_fee_rate),
         "wbt_n_jobs": int(wbt_n_jobs),
@@ -1247,6 +1562,32 @@ def run_backtest(
                 "wbt_error": "no trades" if metrics_engine in {"auto", "both", "wbt"} else "",
             }
         )
+    if cash_portfolio:
+        style_summaries: list[dict] = []
+        trades_by_style: dict[str, pd.DataFrame] = {}
+        nav_by_style: dict[str, pd.DataFrame] = {}
+        for style in portfolio_style_list:
+            cash_trades_df, cash_nav_df, cash_summary = simulate_cash_portfolio(
+                trades_df,
+                CashPortfolioConfig(
+                    initial_cash=initial_cash,
+                    max_positions=max_positions,
+                    commission_rate=commission_rate,
+                    small_trade_threshold=small_trade_threshold,
+                    small_trade_fee=small_trade_fee,
+                    lot_size=lot_size,
+                    portfolio_style=style,
+                ),
+                mark_price_fn=_cash_mark_price_fn(all_df_map, ohlc_lookup_cache),
+            )
+            style_summaries.append(cash_summary)
+            trades_by_style[style] = cash_trades_df
+            nav_by_style[style] = cash_nav_df
+        if style_summaries:
+            summary.update(style_summaries[0])
+        summary["cash_portfolio_style_summaries"] = style_summaries
+        summary["_cash_portfolio_trades_by_style"] = trades_by_style
+        summary["_cash_portfolio_nav_by_style"] = nav_by_style
     return trades_df, summary
 
 
@@ -1364,49 +1705,69 @@ def _calc_information_ratio(
     return float(ann_excess / ann_te)
 
 
+def _stats_for_trade_slice(df_slice: pd.DataFrame, hold_days: int = DEFAULT_HOLD_DAYS) -> dict:
+    ret = pd.to_numeric(df_slice.get("ret_pct"), errors="coerce").dropna()
+    n = len(ret)
+    if n == 0:
+        return {"trades": 0}
+    var95, cvar95 = _calc_cvar95_pct(ret)
+    exit_reason = df_slice.get("exit_reason", pd.Series(dtype=str)).astype(str)
+    stop_mask = exit_reason.isin({"stop_loss", "atr_stop"})
+    mfe = pd.to_numeric(df_slice.get("mfe_pct"), errors="coerce").dropna()
+    mae = pd.to_numeric(df_slice.get("mae_pct"), errors="coerce").dropna()
+    return {
+        "trades": n,
+        "win_rate_pct": float((ret > 0).mean() * 100.0),
+        "avg_ret_pct": float(ret.mean()),
+        "median_ret_pct": float(ret.median()),
+        "max_drawdown_pct": _calc_max_drawdown_pct(ret),
+        "sharpe_ratio": _calc_sharpe_ratio(ret, hold_days=hold_days),
+        "calmar_ratio": _calc_calmar_ratio(ret, hold_days=hold_days),
+        "var95_ret_pct": var95,
+        "cvar95_ret_pct": cvar95,
+        "max_consecutive_losses": _calc_max_consecutive_losses(ret),
+        "stop_exit_rate_pct": float(stop_mask.mean() * 100.0) if len(exit_reason) else None,
+        "avg_mfe_pct": float(mfe.mean()) if len(mfe) else None,
+        "avg_mae_pct": float(mae.mean()) if len(mae) else None,
+    }
+
+
+def _group_trade_stats(trades_df: pd.DataFrame, column: str, hold_days: int) -> dict[str, dict]:
+    if trades_df.empty or column not in trades_df.columns:
+        return {}
+    grouped: dict[str, dict] = {}
+    for value in sorted(trades_df[column].dropna().unique(), key=str):
+        key = str(value).strip() or "-"
+        mask = trades_df[column] == value
+        if mask.any():
+            grouped[key] = _stats_for_trade_slice(trades_df[mask], hold_days)
+    return grouped
+
+
 def _calc_stratified_stats(trades_df: pd.DataFrame, hold_days: int = DEFAULT_HOLD_DAYS) -> dict[str, dict]:
     """
-    按 track (Trend/Accum) 和 regime 分层统计。
-    返回 {"by_track": {"Trend": {...}, "Accum": {...}},
-           "by_regime": {"RISK_ON": {...}, "RISK_OFF": {...}, ...}}
+    按 track、regime、trigger、exit_reason 和 entry_price_source 分层统计。
     """
-    result: dict[str, dict] = {"by_track": {}, "by_regime": {}}
+    result: dict[str, dict] = {
+        "by_track": {},
+        "by_regime": {},
+        "by_trigger": {},
+        "by_exit_reason": {},
+        "by_entry_price_source": {},
+    }
     if trades_df.empty:
         return result
-
-    def _stats_for_slice(df_slice: pd.DataFrame) -> dict:
-        ret = pd.to_numeric(df_slice.get("ret_pct"), errors="coerce").dropna()
-        n = len(ret)
-        if n == 0:
-            return {"trades": 0}
-        var95, cvar95 = _calc_cvar95_pct(ret)
-        return {
-            "trades": n,
-            "win_rate_pct": float((ret > 0).mean() * 100.0),
-            "avg_ret_pct": float(ret.mean()),
-            "median_ret_pct": float(ret.median()),
-            "max_drawdown_pct": _calc_max_drawdown_pct(ret),
-            "sharpe_ratio": _calc_sharpe_ratio(ret, hold_days=hold_days),
-            "calmar_ratio": _calc_calmar_ratio(ret, hold_days=hold_days),
-            "var95_ret_pct": var95,
-            "cvar95_ret_pct": cvar95,
-            "max_consecutive_losses": _calc_max_consecutive_losses(ret),
-        }
 
     # by track
     for track_val in ["Trend", "Accum"]:
         mask = trades_df["track"] == track_val
         if mask.any():
-            result["by_track"][track_val] = _stats_for_slice(trades_df[mask])
+            result["by_track"][track_val] = _stats_for_trade_slice(trades_df[mask], hold_days)
 
-    # by regime
-    if "regime" in trades_df.columns:
-        for regime_val in trades_df["regime"].dropna().unique():
-            regime_str = str(regime_val).strip()
-            if regime_str:
-                mask = trades_df["regime"] == regime_str
-                if mask.any():
-                    result["by_regime"][regime_str] = _stats_for_slice(trades_df[mask])
+    result["by_regime"] = _group_trade_stats(trades_df, "regime", hold_days)
+    result["by_trigger"] = _group_trade_stats(trades_df, "trigger", hold_days)
+    result["by_exit_reason"] = _group_trade_stats(trades_df, "exit_reason", hold_days)
+    result["by_entry_price_source"] = _group_trade_stats(trades_df, "entry_price_source", hold_days)
 
     # cross: track × regime
     cross: dict[str, dict] = {}
@@ -1418,7 +1779,7 @@ def _calc_stratified_stats(trades_df: pd.DataFrame, hold_days: int = DEFAULT_HOL
             mask = (trades_df["track"] == track_val) & (trades_df["regime"] == regime_str)
             if mask.any():
                 key = f"{track_val}_{regime_str}"
-                cross[key] = _stats_for_slice(trades_df[mask])
+                cross[key] = _stats_for_trade_slice(trades_df[mask], hold_days)
     if cross:
         result["by_track_regime"] = cross
 
@@ -1669,6 +2030,106 @@ def _generate_strategy_advice(summary: dict) -> list[str]:
     return advice
 
 
+def _entry_price_note(summary: dict) -> str:
+    entry_mode = str(summary.get("entry_price_mode") or "open")
+    if entry_mode != "tail_1455":
+        return "- 入场口径：信号日收盘后出信号，T+1 开盘价买入（跳过一字涨停日）。"
+    counts = summary.get("entry_price_source_counts") or {}
+    parts = [f"{k}={v}" for k, v in sorted(counts.items())]
+    skipped = int(summary.get("entry_price_missing_skipped") or 0)
+    if skipped:
+        parts.append(f"missing_skip={skipped}")
+    source_text = "；实际来源：" + "，".join(parts) if parts else ""
+    fallback = str(summary.get("entry_price_fallback") or "close")
+    return f"- 入场口径：信号日收盘后出信号，T+1 14:55 分钟线价格买入（跳过一字涨停日，fallback={fallback}{source_text}）。"
+
+
+def _cash_style_summaries(summary: dict) -> list[dict]:
+    rows = summary.get("cash_portfolio_style_summaries")
+    if isinstance(rows, list) and rows:
+        return [r for r in rows if isinstance(r, dict)]
+    if summary.get("cash_portfolio_enabled"):
+        return [summary]
+    return []
+
+
+def _style_display(row: dict) -> str:
+    style = str(row.get("cash_portfolio_style") or "slot_equal_4")
+    return str(row.get("cash_portfolio_style_label") or STYLE_LABELS.get(style, style))
+
+
+def _build_cash_style_table(summary: dict) -> list[str]:
+    rows = _cash_style_summaries(summary)
+    if len(rows) <= 1:
+        return []
+    lines = [
+        "## 交易风格对比",
+        "",
+        "| 风格ID | 风格 | 最终现金 | 总收益 | 现金回撤 | 成交 | 胜率 | 平均盈利 | 平均亏损 | 加仓 | 换股 | 观察未确认 | 跳过 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in rows:
+        skipped = _cash_style_skipped(row)
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(row.get("cash_portfolio_style") or "-"),
+                    _style_display(row),
+                    _fmt_metric(row.get("cash_portfolio_final_cash"), 2),
+                    f"{_fmt_metric(row.get('cash_portfolio_total_return_pct'), 2)}%",
+                    f"{_fmt_metric(row.get('cash_portfolio_max_drawdown_pct'), 2)}%",
+                    _fmt_metric(row.get("cash_portfolio_trades"), 0),
+                    f"{_fmt_metric(row.get('cash_portfolio_win_rate_pct'), 2)}%",
+                    f"{_fmt_metric(row.get('cash_portfolio_avg_profit_pct'), 3)}%",
+                    f"{_fmt_metric(row.get('cash_portfolio_avg_loss_pct'), 3)}%",
+                    _fmt_metric(row.get("cash_portfolio_add_entries"), 0),
+                    _fmt_metric(row.get("cash_portfolio_swap_exits"), 0),
+                    _fmt_metric(row.get("cash_portfolio_unconfirmed"), 0),
+                    str(skipped),
+                ]
+            )
+            + " |"
+        )
+    return lines + [""]
+
+
+def _cash_style_skipped(row: dict) -> int:
+    keys = (
+        "cash_portfolio_skipped_full",
+        "cash_portfolio_skipped_cash",
+        "cash_portfolio_skipped_duplicate",
+        "cash_portfolio_skipped_weight_cap",
+        "cash_portfolio_skipped_not_stronger",
+    )
+    return sum(int(row.get(key) or 0) for key in keys)
+
+
+def _append_diagnostic_table(lines: list[str], title: str, groups: dict[str, dict], *, limit: int = 12) -> None:
+    if not groups:
+        return
+    ranked = sorted(groups.items(), key=lambda kv: (-int(kv[1].get("trades") or 0), kv[0]))[:limit]
+    lines.extend(["", f"## {title}", ""])
+    lines.append("| 分组 | 笔数 | 胜率(%) | 均收(%) | 止损率(%) | 平均MFE(%) | 平均MAE(%) |")
+    lines.append("|------|---:|---:|---:|---:|---:|---:|")
+    for key, stat in ranked:
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    key,
+                    _fmt_metric(stat.get("trades"), 0),
+                    _fmt_metric(stat.get("win_rate_pct"), 2),
+                    _fmt_metric(stat.get("avg_ret_pct"), 3),
+                    _fmt_metric(stat.get("stop_exit_rate_pct"), 2),
+                    _fmt_metric(stat.get("avg_mfe_pct"), 3),
+                    _fmt_metric(stat.get("avg_mae_pct"), 3),
+                ]
+            )
+            + " |"
+        )
+
+
 def _build_summary_md(summary: dict) -> str:
     use_current_meta = bool(summary.get("use_current_meta"))
     meta_mode = (
@@ -1676,10 +2137,22 @@ def _build_summary_md(summary: dict) -> str:
         if use_current_meta
         else "disabled_current_snapshot_filters (bias-reduced)"
     )
+    cost_note = (
+        "- 现金账户口径：买卖双边佣金率 "
+        f"{_fmt_metric(float(summary.get('cash_portfolio_commission_rate') or 0) * 10000, 2)} / 万，"
+        "单笔成交额低于 "
+        f"{_fmt_metric(summary.get('cash_portfolio_small_trade_threshold'), 2)} 元时收 "
+        f"{_fmt_metric(summary.get('cash_portfolio_small_trade_fee'), 2)} 元。"
+        if summary.get("cash_portfolio_enabled")
+        else "- 已纳入双边摩擦成本（各0.5%）；累计收益走单利（cumsum）口径，不放大噪声，便于策略横向比较。"
+    )
+    style_text = "、".join(
+        f"{_style_display(row)}({row.get('cash_portfolio_style')})" for row in _cash_style_summaries(summary)
+    )
     notes = [
         "- 该回测使用日线数据（qfq），含 T+1 与涨跌停成交约束（一字板不可成交）。",
-        "- 入场口径：信号日收盘后出信号，次日开盘价买入（跳过一字涨停日）。",
-        "- 已纳入双边摩擦成本（各0.5%）；累计收益走单利（cumsum）口径，不放大噪声，便于策略横向比较。",
+        _entry_price_note(summary),
+        cost_note,
         "- ⚠️ 仍存在幸存者偏差：股票池来自当前在市样本，未包含历史退市股票。",
     ]
     if use_current_meta:
@@ -1733,6 +2206,9 @@ def _build_summary_md(summary: dict) -> str:
         f"- 元数据口径: {meta_mode}",
         f"- 信号确认模式: {summary.get('pending_mode')}",
         f"- 大盘水温仓控: {'开启' if summary.get('regime_filter') else '关闭'}",
+        f"- 入场价格模式: {summary.get('entry_price_mode')}"
+        + (f" @ {summary.get('entry_price_time')}" if summary.get("entry_price_time") else ""),
+        f"- 交易风格: {style_text or '-'}",
         f"- 绩效引擎: {summary.get('metrics_engine', 'legacy')}"
         + (
             "（wbt 可用）"
@@ -1756,6 +2232,26 @@ def _build_summary_md(summary: dict) -> str:
         f"- 组合总收益: {_fmt_metric(summary.get('portfolio_total_ret_pct'), 2)}%",
         f"- 平均持仓数: {_fmt_metric(summary.get('portfolio_avg_positions'), 1)}",
         "",
+        *(
+            [
+                "## 真实现金账户模拟",
+                f"- 主风格: {_style_display(summary)} ({summary.get('cash_portfolio_style')})",
+                f"- 初始现金: {_fmt_metric(summary.get('cash_portfolio_initial_cash'), 2)}",
+                f"- 最多持仓: {_fmt_metric(summary.get('cash_portfolio_max_positions'), 0)}",
+                f"- 最终现金: {_fmt_metric(summary.get('cash_portfolio_final_cash'), 2)}",
+                f"- 总收益: {_fmt_metric(summary.get('cash_portfolio_total_return_pct'), 2)}%",
+                f"- 现金最大回撤: {_fmt_metric(summary.get('cash_portfolio_max_drawdown_pct'), 2)}%",
+                f"- 成交笔数: {_fmt_metric(summary.get('cash_portfolio_trades'), 0)}",
+                f"- 胜率: {_fmt_metric(summary.get('cash_portfolio_win_rate_pct'), 2)}%",
+                f"- 平均盈利: {_fmt_metric(summary.get('cash_portfolio_avg_profit_pct'), 3)}%",
+                f"- 平均亏损: {_fmt_metric(summary.get('cash_portfolio_avg_loss_pct'), 3)}%",
+                f"- 佣金合计: {_fmt_metric(summary.get('cash_portfolio_commission_total'), 2)}",
+                "",
+            ]
+            if summary.get("cash_portfolio_enabled")
+            else []
+        ),
+        *_build_cash_style_table(summary),
         *(
             [
                 "## wbt 权重回测辅助指标",
@@ -1822,6 +2318,10 @@ def _build_summary_md(summary: dict) -> str:
         ]:
             vals = [_fmt_metric(by_regime[rk].get(key), nd) for rk in regime_keys]
             lines.append(f"| {label} | " + " | ".join(vals) + " |")
+
+    _append_diagnostic_table(lines, "分层诊断：按触发信号", stratified.get("by_trigger", {}))
+    _append_diagnostic_table(lines, "分层诊断：按退出原因", stratified.get("by_exit_reason", {}))
+    _append_diagnostic_table(lines, "分层诊断：按入场价格来源", stratified.get("by_entry_price_source", {}))
 
     # 策略调整建议
     advice_items = _generate_strategy_advice(summary)
@@ -1964,7 +2464,7 @@ def main() -> int:
         "--regime-filter",
         action="store_true",
         default=False,
-        help="启用大盘水温仓位控制: CRASH 不开仓, RISK_ON/PANIC_REPAIR 半仓, NEUTRAL 全仓",
+        help="启用大盘水温仓位控制: CRASH/RISK_OFF 不开仓, BEAR_REBOUND 低仓, RISK_ON/NEUTRAL 半仓",
     )
     parser.add_argument(
         "--pending-mode",
@@ -2001,6 +2501,50 @@ def main() -> int:
         action="store_true",
         default=False,
         help="启用 ABC 起跳板过滤：仅保留满足 >=2 条件的候选（更严格的信号质量门槛）",
+    )
+    parser.add_argument(
+        "--entry-price-mode",
+        choices=["open", "tail_1455"],
+        default="open",
+        help="入场成交价: open=T+1开盘；tail_1455=T+1 14:55 分钟线价",
+    )
+    parser.add_argument(
+        "--entry-price-time",
+        default=DEFAULT_ENTRY_PRICE_TIME,
+        help=f"tail_1455 模式下的目标分钟时间 (default: {DEFAULT_ENTRY_PRICE_TIME})",
+    )
+    parser.add_argument(
+        "--entry-price-fallback",
+        choices=["close", "skip", "error"],
+        default=DEFAULT_ENTRY_PRICE_FALLBACK,
+        help="tail_1455 缺分钟线时的处理：close=日收盘回退，skip=跳过，error=失败",
+    )
+    parser.add_argument(
+        "--cash-portfolio",
+        action="store_true",
+        default=False,
+        help="启用真实现金账户模拟：初始现金、最多持仓、卖出后补位、100股一手",
+    )
+    parser.add_argument("--initial-cash", type=float, default=DEFAULT_CASH_PORTFOLIO_INITIAL_CASH)
+    parser.add_argument("--max-positions", type=int, default=DEFAULT_CASH_PORTFOLIO_MAX_POSITIONS)
+    parser.add_argument("--commission-rate", type=float, default=DEFAULT_CASH_PORTFOLIO_COMMISSION_RATE)
+    parser.add_argument(
+        "--small-trade-threshold",
+        type=float,
+        default=DEFAULT_CASH_PORTFOLIO_SMALL_TRADE_THRESHOLD,
+        help="现金账户手续费小额成交阈值；成交额低于该值时收 small-trade-fee",
+    )
+    parser.add_argument(
+        "--small-trade-fee",
+        type=float,
+        default=DEFAULT_CASH_PORTFOLIO_SMALL_TRADE_FEE,
+        help="现金账户小额成交固定手续费",
+    )
+    parser.add_argument("--lot-size", type=int, default=DEFAULT_CASH_PORTFOLIO_LOT_SIZE)
+    parser.add_argument(
+        "--portfolio-styles",
+        default=DEFAULT_CASH_PORTFOLIO_STYLES,
+        help="现金账户交易风格，逗号分隔；支持 slot_equal_4/probe_add/confirmation_only/trend_pyramid/concentrated_swap/all_core",
     )
     args = parser.parse_args()
 
@@ -2048,6 +2592,17 @@ def main() -> int:
                 wbt_fee_rate=args.wbt_fee_rate,
                 wbt_n_jobs=args.wbt_n_jobs,
                 abc_filter=args.abc_filter,
+                entry_price_mode=args.entry_price_mode,
+                entry_price_time=args.entry_price_time,
+                entry_price_fallback=args.entry_price_fallback,
+                cash_portfolio=args.cash_portfolio,
+                initial_cash=args.initial_cash,
+                max_positions=args.max_positions,
+                commission_rate=args.commission_rate,
+                small_trade_threshold=args.small_trade_threshold,
+                small_trade_fee=args.small_trade_fee,
+                lot_size=args.lot_size,
+                portfolio_styles=args.portfolio_styles,
             )
         except Exception as exc:
             last_error = exc
@@ -2062,6 +2617,8 @@ def main() -> int:
                     "median_ret_pct": None,
                     "max_drawdown_pct": None,
                     "sharpe_ratio": None,
+                    "cash_final": None,
+                    "cash_win_rate_pct": None,
                     "error": err_msg,
                 }
             )
@@ -2079,6 +2636,22 @@ def main() -> int:
             nav_path = out_dir / f"nav_{stamp}.csv"
             nav_df.to_csv(nav_path, index=False, encoding="utf-8-sig")
             logger.info("nav     -> %s", nav_path)
+
+        cash_trades_by_style = summary.pop("_cash_portfolio_trades_by_style", None)
+        if isinstance(cash_trades_by_style, dict):
+            for style, cash_trades_df in sorted(cash_trades_by_style.items()):
+                if cash_trades_df is not None and not cash_trades_df.empty:
+                    cash_trades_path = out_dir / f"cash_trades_{style}_{stamp}.csv"
+                    cash_trades_df.to_csv(cash_trades_path, index=False, encoding="utf-8-sig")
+                    logger.info("cash trades -> %s", cash_trades_path)
+
+        cash_nav_by_style = summary.pop("_cash_portfolio_nav_by_style", None)
+        if isinstance(cash_nav_by_style, dict):
+            for style, cash_nav_df in sorted(cash_nav_by_style.items()):
+                if cash_nav_df is not None and not cash_nav_df.empty:
+                    cash_nav_path = out_dir / f"cash_nav_{style}_{stamp}.csv"
+                    cash_nav_df.to_csv(cash_nav_path, index=False, encoding="utf-8-sig")
+                    logger.info("cash nav -> %s", cash_nav_path)
 
         wbt_weight_df = summary.pop("_wbt_weight_df", None)
         if wbt_weight_df is not None and not wbt_weight_df.empty:
@@ -2119,6 +2692,8 @@ def main() -> int:
                 "median_ret_pct": summary.get("median_ret_pct"),
                 "max_drawdown_pct": summary.get("max_drawdown_pct"),
                 "sharpe_ratio": summary.get("sharpe_ratio"),
+                "cash_final": summary.get("cash_portfolio_final_cash"),
+                "cash_win_rate_pct": summary.get("cash_portfolio_win_rate_pct"),
                 "error": "",
             }
         )
@@ -2141,8 +2716,8 @@ def main() -> int:
             f"- 持有周期: {', '.join(str(x['hold_days']) for x in suite_rows)}",
             f"- 成功周期数: {success_count}/{len(suite_rows)}",
             "",
-            "| 持有天数 | 成交笔数 | 胜率(%) | 平均收益(%) | 中位收益(%) | 最大回撤(%) | 夏普比 | 备注 |",
-            "|---:|---:|---:|---:|---:|---:|---:|---|",
+            "| 持有天数 | 成交笔数 | 胜率(%) | 平均收益(%) | 中位收益(%) | 最大回撤(%) | 夏普比 | 现金终值 | 现金胜率(%) | 备注 |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
         ]
         for row in suite_df.to_dict(orient="records"):
             md_lines.append(
@@ -2153,6 +2728,8 @@ def main() -> int:
                 f"{_fmt_metric(row.get('median_ret_pct'), 3)} | "
                 f"{_fmt_metric(row.get('max_drawdown_pct'), 3)} | "
                 f"{_fmt_metric(row.get('sharpe_ratio'), 3)} | "
+                f"{_fmt_metric(row.get('cash_final'), 2)} | "
+                f"{_fmt_metric(row.get('cash_win_rate_pct'), 2)} | "
                 f"{str(row.get('error', '') or '').replace('|', '/')} |"
             )
         suite_md.write_text("\n".join(md_lines) + "\n", encoding="utf-8")

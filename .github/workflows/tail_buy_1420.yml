@@ -1,8 +1,6 @@
 name: Tail Buy
 
 on:
-  # 不用 schedule：GitHub Actions 定时任务会排队，无法在 14:45 准时跑尾盘扫描。
-  # 由 Cursor Automation（cron 45 14 * * 1-5 北京时间）调用 scripts/trigger_tail_buy_workflow.py 触发。
   workflow_dispatch:
 
 concurrency:
@@ -14,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONUNBUFFERED: "1"
+      WYCKOFF_WRITE_CONTEXT: "server_job"
       TZ: Asia/Shanghai
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
@@ -46,8 +45,9 @@ jobs:
       TAIL_BUY_TICKFLOW_MAX_RETRIES: "1"
       TAIL_BUY_USE_BATCH_INTRADAY: "1"
       TAIL_BUY_INTRADAY_BATCH_SIZE: "200"
+      TAIL_BUY_CONFIRMED_ONLY_BUY: "1"
       TAIL_BUY_PORTFOLIO_ID: ${{ secrets.TAIL_BUY_PORTFOLIO_ID }}
-      TAIL_BUY_HOLDING_HARD_STOP_PCT: "6"
+      TAIL_BUY_HOLDING_HARD_STOP_PCT: "8"
 
     steps:
       - uses: actions/checkout@v4

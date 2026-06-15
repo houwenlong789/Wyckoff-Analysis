@@ -34,7 +34,7 @@
 
 ### 定时调度
 
-由 GitHub Actions 在工作日自动执行。交易日判定由 `utils/trading_clock.py` 负责。
+由 GitHub Actions 在北京时间周日到周四 17:17 自动执行；若次日不是 A 股交易日，`scripts/daily_job.py` 会在主流程前跳过。交易日判定由 `utils/trading_clock.py` 负责。
 
 ### 数据窗口
 
@@ -50,7 +50,7 @@ A 股主漏斗和 feedback 是错峰运行的反馈系统，不是同一任务�
 
 ```mermaid
 flowchart LR
-  A["18:25 漏斗<br/>发现 L4 信号"] --> B["AI 研报 + OMS<br/>形成推荐/观察"]
+  A["17:17 漏斗<br/>发现 L4 信号"] --> B["AI 研报 + OMS<br/>形成推荐/观察"]
   B --> C["写 signal_observations"]
   C --> D["23:30 feedback<br/>计算 outcomes"]
   D --> E["聚合 signal_health_daily"]
@@ -67,6 +67,14 @@ flowchart LR
 | `on` | 正式使用信号健康度权重和 registry 状态。 |
 
 Shadow 结果落在 `signal_policy_shadow_runs`，用于观察动态策略是否真的比静态配额更聪明。
+
+### 外部观察验证
+
+人工关注、社区反馈或其它系统给出的股票可以通过 `external_seeds` 加入观察池。它们不属于正式候选来源，不会进入 AI 推荐池，只记录在 `external_seed_observations`：
+
+- 通过 L1/L2：说明候选本身已经符合主路径。
+- L2 未过但 L4 确认：补写 `signal_observations`，`selection_mode=external_seed_shadow`，后续用 outcomes 验证。
+- 未确认：只进入 watch，有效期结束后由 maintenance 清理。
 
 ### 跨市场 universe
 

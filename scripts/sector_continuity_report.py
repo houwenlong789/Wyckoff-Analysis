@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -11,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from integrations.data_source import _CONCEPT_HEAT_HISTORY, fetch_concept_heat
 from integrations.supabase_concept_heat import load_concept_heat_history_from_supabase, upsert_concept_heat_history
+from utils.feishu import send_feishu_notification
+from utils.trading_clock import is_a_share_trading_day, resolve_end_calendar_day
 
 
 def _load_history() -> dict[str, dict]:
@@ -24,9 +27,17 @@ def _load_history() -> dict[str, dict]:
         return json.load(f)
 
 
-def _update_history_with_today(history: dict, heat: list[dict]) -> dict:
-    """将今日热度写入 history（不落盘，仅内存）。"""
-    today = date.today().isoformat()
+def _resolve_trade_date() -> date | None:
+    trade_date = resolve_end_calendar_day()
+    if is_a_share_trading_day(trade_date):
+        return trade_date
+    print(f"[sector_continuity] {trade_date.isoformat()} 非 A 股交易日，跳过概念热度写入与报告")
+    return None
+
+
+def _update_history_with_trade_date(history: dict, heat: list[dict], trade_date: date) -> dict:
+    """将目标交易日热度写入 history（不落盘，仅内存）。"""
+    today = trade_date.isoformat()
     top_items = sorted(heat, key=lambda x: x.get("net_inflow", 0), reverse=True)[:20]
     history[today] = {
         it["name"]: {"pct": it.get("pct", 0.0), "inflow": it.get("net_inflow", 0)} for it in top_items if it.get("name")
@@ -181,16 +192,30 @@ def _build_report(history: dict, heat_today: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _notify_report(report: str, trade_date: date) -> None:
+    webhook = os.getenv("FEISHU_WEBHOOK_URL", "").strip()
+    if not webhook:
+        print("[sector_continuity] FEISHU_WEBHOOK_URL 未配置，跳过飞书发送")
+        return
+    title = f"板块延续性报告 {trade_date.isoformat()}"
+    ok = send_feishu_notification(webhook, title, report)
+    print(f"[sector_continuity] 飞书发送{'成功' if ok else '失败'}")
+
+
 def main() -> None:
+    trade_date = _resolve_trade_date()
+    if trade_date is None:
+        return
+
     print("[sector_continuity] 加载概念热度...")
     heat = fetch_concept_heat()
     history = _load_history()
 
     if heat:
-        written = upsert_concept_heat_history(date.today().isoformat(), heat)
+        written = upsert_concept_heat_history(trade_date.isoformat(), heat)
         if written:
-            print(f"[sector_continuity] Supabase 写入今日概念热度 {written} 条")
-        history = _update_history_with_today(history, heat)
+            print(f"[sector_continuity] Supabase 写入 {trade_date.isoformat()} 概念热度 {written} 条")
+        history = _update_history_with_trade_date(history, heat, trade_date)
 
     if not history:
         print("❌ 无历史数据，请确保已运行过漏斗或手动积累 concept_heat_history.json")
@@ -204,6 +229,7 @@ def main() -> None:
     report_path = out_dir / "sector_continuity_report.md"
     report_path.write_text(report, encoding="utf-8")
     print(f"[sector_continuity] 报告已生成: {report_path}")
+    _notify_report(report, trade_date)
     print(report)
 
 

@@ -7,33 +7,13 @@ import logging
 import re
 from typing import Any
 
+from cli.model_metadata import UNKNOWN_MODEL_CONTEXT_WINDOW, infer_context_window
+
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# 模型 context window 映射（按前缀匹配，单位 token）
-# ---------------------------------------------------------------------------
-
-_MODEL_CONTEXT_WINDOWS: list[tuple[str, int]] = [
-    ("deepseek", 64_000),
-    ("gpt-4o", 128_000),
-    ("gpt-4", 128_000),
-    ("gpt-3.5", 16_000),
-    ("gemini-3", 128_000),
-    ("gemini-2", 1_000_000),
-    ("gemini", 128_000),
-    ("claude-opus", 200_000),
-    ("claude-sonnet", 200_000),
-    ("claude", 200_000),
-    ("minimax", 128_000),
-    ("kimi", 128_000),
-    ("qwen", 128_000),
-    ("longcat", 64_000),
-    ("mistral", 128_000),
-    ("step", 64_000),
-]
-
-_DEFAULT_CONTEXT_WINDOW = 64_000
-COMPACT_RATIO = 0.25
+COMPACT_RESERVE_RATIO = 0.25
+MIN_COMPACT_RESERVE_TOKENS = 16_384
+MAX_COMPACT_RESERVE_TOKENS = 32_768
 TAIL_KEEP = 4
 DEFAULT_RECENT_KEEP_TOKENS = 20_000
 MIN_RECENT_KEEP_TOKENS = 4_000
@@ -41,22 +21,34 @@ MIN_RECENT_KEEP_TOKENS = 4_000
 _CODE_RE = re.compile(r"\d{6}")
 
 
-def get_context_window(model_name: str) -> int:
-    lower = model_name.lower()
-    for prefix, window in _MODEL_CONTEXT_WINDOWS:
-        if prefix in lower:
-            return window
-    return _DEFAULT_CONTEXT_WINDOW
+def resolve_context_window(model_name: str = "", context_window: int | None = None) -> int:
+    try:
+        configured = int(context_window or 0)
+    except (TypeError, ValueError):
+        configured = 0
+    if configured > 0:
+        return configured
+    return infer_context_window(model_name) if model_name else UNKNOWN_MODEL_CONTEXT_WINDOW
 
 
-def get_compact_threshold(model_name: str) -> int:
-    return int(get_context_window(model_name) * COMPACT_RATIO)
+def get_compact_reserve_tokens(context_window: int) -> int:
+    """Return the safety budget kept free for prompts, tools, and output."""
+
+    window = max(context_window, 1)
+    ratio_reserve = int(window * COMPACT_RESERVE_RATIO)
+    clamped_reserve = max(MIN_COMPACT_RESERVE_TOKENS, min(ratio_reserve, MAX_COMPACT_RESERVE_TOKENS))
+    return min(clamped_reserve, window // 2)
 
 
-def get_recent_keep_tokens(model_name: str) -> int:
+def get_compact_threshold(model_name: str = "", context_window: int | None = None) -> int:
+    window = resolve_context_window(model_name, context_window)
+    return max(1, window - get_compact_reserve_tokens(window))
+
+
+def get_recent_keep_tokens(model_name: str = "", context_window: int | None = None) -> int:
     """Return the recent-context budget to keep after compaction."""
 
-    threshold = get_compact_threshold(model_name) if model_name else 12_000
+    threshold = get_compact_threshold(model_name, context_window)
     if threshold <= MIN_RECENT_KEEP_TOKENS * 2:
         return max(1_000, threshold // 2)
     return min(DEFAULT_RECENT_KEEP_TOKENS, max(MIN_RECENT_KEEP_TOKENS, threshold // 2))
@@ -418,16 +410,17 @@ def compact_messages(
     messages: list[dict[str, Any]],
     provider: Any,
     model_name: str = "",
+    context_window: int | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """检查并执行上下文压缩。
 
     Returns (messages, compacted) — 如果未压缩则原样返回。
     """
-    threshold = get_compact_threshold(model_name) if model_name else 12_000
+    threshold = get_compact_threshold(model_name, context_window)
     if len(messages) <= TAIL_KEEP + 2 or estimate_tokens(messages) <= threshold:
         return messages, False
 
-    tail_start = find_tail_start_by_token_budget(messages, get_recent_keep_tokens(model_name))
+    tail_start = find_tail_start_by_token_budget(messages, get_recent_keep_tokens(model_name, context_window))
     if tail_start <= 2:
         return messages, False
 
@@ -437,7 +430,9 @@ def compact_messages(
     # 压缩前先提取持久偏好到记忆
     flush_memory_before_compaction(head, provider)
 
-    head_text = serialize_messages_for_compaction(head)
+    head_for_summary = [dict(m) for m in head]
+    shrink_stale_tool_results(head_for_summary)
+    head_text = serialize_messages_for_compaction(head_for_summary)
 
     try:
         chunks = list(

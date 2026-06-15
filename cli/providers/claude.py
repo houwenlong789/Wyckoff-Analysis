@@ -48,9 +48,10 @@ class ClaudeProvider(LLMProvider):
             "model": self._model,
             "max_tokens": 8192,
             "messages": claude_messages,
+            "extra_headers": {"anthropic-beta": "prompt-caching-2024-07-31"},
         }
         if system_prompt:
-            kwargs["system"] = system_prompt
+            kwargs["system"] = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
         if claude_tools:
             kwargs["tools"] = claude_tools
 
@@ -70,9 +71,10 @@ class ClaudeProvider(LLMProvider):
             "model": self._model,
             "max_tokens": 8192,
             "messages": claude_messages,
+            "extra_headers": {"anthropic-beta": "prompt-caching-2024-07-31"},
         }
         if system_prompt:
-            kwargs["system"] = system_prompt
+            kwargs["system"] = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
         if claude_tools:
             kwargs["tools"] = claude_tools
 
@@ -136,19 +138,28 @@ class ClaudeProvider(LLMProvider):
             "cache_write_tokens": cache_write,
         }
 
-    def _build_messages(self, messages: list[dict]) -> list[dict]:
-        """将统一消息格式转为 Claude messages 格式。"""
+    def _build_messages(self, messages: list[dict], add_caching: bool = True) -> list[dict]:
+        """将统一消息格式转为 Claude messages 格式，并在最后一条消息上添加 prompt caching 断点。"""
         claude_msgs = []
-        for msg in messages:
+        for i, msg in enumerate(messages):
             role = msg["role"]
+            is_last = i == len(messages) - 1
 
             if role == "user":
-                claude_msgs.append({"role": "user", "content": msg["content"]})
+                if is_last and add_caching:
+                    claude_msgs.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": msg["content"], "cache_control": {"type": "ephemeral"}}
+                            ],
+                        }
+                    )
+                else:
+                    claude_msgs.append({"role": "user", "content": msg["content"]})
 
             elif role == "assistant":
                 content = []
-                # Anthropic thinking blocks must round-trip with their original signature.
-                # The runtime stores only display text, so replaying it would make tool loops 400.
                 if msg.get("content"):
                     content.append({"type": "text", "text": msg["content"]})
                 for tc in msg.get("tool_calls", []):
@@ -160,24 +171,24 @@ class ClaudeProvider(LLMProvider):
                             "input": tc["args"],
                         }
                     )
+                if is_last and add_caching and content:
+                    content[-1]["cache_control"] = {"type": "ephemeral"}
                 claude_msgs.append({"role": "assistant", "content": content})
 
             elif role == "tool":
                 result = msg["content"]
                 if not isinstance(result, str):
                     result = json.dumps(result, ensure_ascii=False)
-                claude_msgs.append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": msg.get("tool_call_id", ""),
-                                "content": result,
-                            }
-                        ],
-                    }
-                )
+
+                content_block: dict[str, Any] = {
+                    "type": "tool_result",
+                    "tool_use_id": msg.get("tool_call_id", ""),
+                    "content": result,
+                }
+                if is_last and add_caching:
+                    content_block["cache_control"] = {"type": "ephemeral"}
+
+                claude_msgs.append({"role": "user", "content": [content_block]})
 
         return claude_msgs
 

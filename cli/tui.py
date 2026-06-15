@@ -18,6 +18,7 @@ from typing import Any
 
 from rich.highlighter import Highlighter
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
@@ -117,8 +118,9 @@ _patch_driver_no_kitty()
 # ---------------------------------------------------------------------------
 # Widget
 # ---------------------------------------------------------------------------
-from cli.runtime import AgentCancelled, AgentRuntime
+from cli.runtime import AgentCancelled
 from cli.scratchpad import AgentScratchpad
+from cli.workflows.dispatch import build_turn_runtime
 from core.prompts import with_current_time
 
 
@@ -155,6 +157,41 @@ def _write_counted(log_widget, renderable) -> int:
     before = len(log_widget.lines)
     log_widget.write(renderable)
     return max(0, len(log_widget.lines) - before)
+
+
+def _replace_streamed_response(log_widget, strip_count: int, final_text: str) -> int:
+    _pop_lines(log_widget, strip_count)
+    return _write_counted(log_widget, Markdown(final_text))
+
+
+def _display_final_response(
+    log_widget,
+    final_text: str,
+    *,
+    streaming_started: bool,
+    stream_separator_strips: int,
+    stream_text_strips: int,
+    write,
+    call_from_thread,
+) -> bool:
+    if not final_text:
+        return False
+    if streaming_started:
+        strip_count = stream_separator_strips + stream_text_strips
+        call_from_thread(_replace_streamed_response, log_widget, strip_count, final_text)
+    else:
+        write(Text.from_markup("  [dim]───[/dim]"))
+        write(Markdown(final_text))
+    return True
+
+
+def _build_thinking_preview(text: str) -> Text | None:
+    preview = text.strip().replace("\n", " ")
+    if len(preview) > 80:
+        preview = preview[:80] + "…"
+    if not preview:
+        return None
+    return Text.from_markup(f"  [italic magenta]💭 {preview}[/italic magenta]  [dim]({len(text)} 字)[/dim]")
 
 
 class ChatLog(RichLog):
@@ -451,6 +488,84 @@ class ToolConfirmScreen(ModalScreen[dict]):
         self.dismiss({"action": "deny"})
 
 
+class AskUserScreen(ModalScreen[str]):
+    """向用户提问并等待选择或输入的交互弹窗。"""
+
+    DEFAULT_CSS = """
+    AskUserScreen {
+        align: center middle;
+    }
+    #ask-box {
+        width: 64;
+        max-height: 24;
+        background: $surface;
+        border: thick $accent;
+        padding: 1 2;
+    }
+    #ask-title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    #ask-question {
+        height: auto;
+        margin-bottom: 1;
+    }
+    #ask-options {
+        height: auto;
+        max-height: 8;
+        margin-bottom: 1;
+    }
+    #ask-input {
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", show=False)]
+
+    def __init__(
+        self,
+        question: str,
+        options: list[str] | None = None,
+        *,
+        allow_free_text: bool = True,
+        default_answer: str = "",
+    ):
+        super().__init__()
+        self.question = question
+        self.options = options or []
+        self.allow_free_text = allow_free_text or not self.options
+        self.default_answer = default_answer
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ask-box"):
+            yield Static("需要你确认/补充", id="ask-title")
+            yield Static(self.question, id="ask-question")
+            if self.options:
+                yield OptionList(
+                    *[Option(opt, id=f"opt_{i}") for i, opt in enumerate(self.options)],
+                    id="ask-options",
+                )
+            if self.allow_free_text:
+                yield Input(value=self.default_answer, placeholder=self._input_placeholder(), id="ask-input")
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        selected_option = event.option.prompt
+        self.dismiss(str(selected_option))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value or self.default_answer)
+
+    def action_cancel(self) -> None:
+        self.dismiss("已取消回答")
+
+    def _input_placeholder(self) -> str:
+        if self.options:
+            return "也可以在此输入自定义回答..."
+        if self.default_answer:
+            return "直接回车使用默认回答"
+        return "在此输入回答并按 Enter..."
+
+
 # ---------------------------------------------------------------------------
 # 错误友好化
 # ---------------------------------------------------------------------------
@@ -542,6 +657,7 @@ class WyckoffTUI(App):
         if self._tools:
             self._tools.set_background_manager(self._bg_manager, self._on_bg_complete)
             self._tools.set_confirm_callback(self._request_tool_confirm)
+            self._tools.set_ask_user_question_callback(self._request_user_question)
         # 交互式输入状态
         self._input_mode = _InputState.NONE
         self._input_buf: dict[str, str] = {}
@@ -628,6 +744,34 @@ class WyckoffTUI(App):
         event.wait(timeout=120)
         return result[0] or {"action": "deny"}
 
+    def _request_user_question(
+        self,
+        question: str,
+        options: list[str] | None = None,
+        allow_free_text: bool = True,
+        default_answer: str = "",
+    ) -> str:
+        """从 worker 线程调用，阻塞并向用户提问，返回用户的回答。"""
+        event = threading.Event()
+        result: list[str] = [""]
+
+        def _on_dismiss(answer: str) -> None:
+            result[0] = answer
+            event.set()
+
+        def _show() -> None:
+            screen = AskUserScreen(
+                question,
+                options,
+                allow_free_text=allow_free_text,
+                default_answer=default_answer,
+            )
+            self.push_screen(screen, _on_dismiss)
+
+        self.call_from_thread(_show)
+        event.wait(timeout=300)  # 等待最长 5 分钟
+        return result[0] or default_answer or "已超时未作答"
+
     # ----- 快捷键动作 -----
 
     def _save_memory_async(
@@ -710,6 +854,9 @@ class WyckoffTUI(App):
 
     def action_show_prompt_templates(self) -> None:
         self._show_prompt_templates()
+
+    def action_show_workflows(self) -> None:
+        self._show_workflows()
 
     def action_switch_theme(self) -> None:
         """打开主题切换器并保存选择。"""
@@ -833,6 +980,7 @@ class WyckoffTUI(App):
                     "  /token   — Token 用量\n"
                     "  /changelog— 版本更新日志\n"
                     "  /prompt  — Prompt 模板（list/show/<name>）\n"
+                    "  /workflow— 最近动态 workflow\n"
                     "  /schedule— 定时任务（list/add/rm/on/off）\n"
                     "  /resume  — 恢复历史对话\n"
                     "  /fork    — 分叉当前会话\n"
@@ -899,6 +1047,8 @@ class WyckoffTUI(App):
             self._show_changelog(log)
         elif cmd == "/prompt":
             self._handle_prompt_cmd(raw, log)
+        elif cmd in ("/workflow", "/wf"):
+            self._handle_workflow_cmd(raw, log)
         elif cmd == "/resume":
             parts = raw.strip().split(maxsplit=1)
             if len(parts) > 1:
@@ -965,6 +1115,39 @@ class WyckoffTUI(App):
         self._execute_skill(name)
 
     # ----- Prompt Templates -----
+
+    def _handle_workflow_cmd(self, raw: str, log) -> None:
+        parts = raw.strip().split(maxsplit=2)
+        if len(parts) >= 3 and parts[1] == "resume":
+            self._resume_workflow(parts[2].strip(), log)
+            return
+        self._show_workflows()
+
+    def _resume_workflow(self, run_id: str, log) -> None:
+        from cli.workflows.resume import build_resume_prompt
+        from cli.workflows.store import get_workflow_run
+
+        run = get_workflow_run(run_id)
+        if not run:
+            log.write(Text.from_markup(f"[red]未找到 workflow: {escape(run_id)}[/red]"))
+            return
+        self._send_message(build_resume_prompt(run))
+
+    def _show_workflows(self) -> None:
+        from cli.workflows.store import list_workflow_runs
+
+        log = self.query_one("#chat-log", ChatLog)
+        rows = list_workflow_runs(limit=8)
+        if not rows:
+            log.write(Text.from_markup("[dim]暂无 workflow 记录[/dim]"))
+            return
+        lines = ["\n[bold]最近 workflow[/bold]"]
+        for row in rows:
+            lines.append(
+                f"  [cyan]{row['run_id']}[/cyan] {row['status']} {row['label']} "
+                f"[dim]{str(row.get('user_text', ''))[:48]}[/dim]"
+            )
+        log.write(Text.from_markup("\n".join(lines)))
 
     def _show_prompt_templates(self) -> None:
         from cli.prompt_templates import load_prompt_templates
@@ -1144,14 +1327,9 @@ class WyckoffTUI(App):
             return
         default_cfg = next((c for c in configs if c["id"] == default_id), configs[0])
         if len(configs) == 1:
-            from cli._provider_factory import _create_provider
+            from cli._provider_factory import _create_provider, provider_config_kwargs
 
-            provider, err = _create_provider(
-                default_cfg["provider_name"],
-                default_cfg["api_key"],
-                default_cfg.get("model", ""),
-                default_cfg.get("base_url", ""),
-            )
+            provider, err = _create_provider(**provider_config_kwargs(default_cfg))
             if not err:
                 self._provider = provider
         else:
@@ -1602,6 +1780,8 @@ class WyckoffTUI(App):
         # 记录用户输入
         _turn_user_index, _user_text = self._prepare_turn_memory_context()
         _scratchpad = self._create_scratchpad(_user_text)
+        _workflow_run_id = ""
+        _workflow_name = ""
         _model_name = getattr(self._provider, "name", "") if self._provider else ""
         _provider_name = self._state.get("provider_name", "") if self._state else ""
         executed_tool_summaries: list[dict[str, object]] = []
@@ -1645,15 +1825,6 @@ class WyckoffTUI(App):
                 _stream_separator_strips = 0
                 _streaming_started = False
 
-        def _display_thinking(text: str) -> None:
-            preview = text.strip().replace("\n", " ")
-            if len(preview) > 80:
-                preview = preview[:80] + "…"
-            if preview:
-                _write(
-                    Text.from_markup(f"  [italic magenta]💭 {preview}[/italic magenta]  [dim]({len(text)} 字)[/dim]")
-                )
-
         def _display_tool_result(event: dict[str, Any]) -> None:
             name = event["name"]
             args = event.get("args", {})
@@ -1695,6 +1866,32 @@ class WyckoffTUI(App):
                     }
                 )
                 _write(Text.from_markup(f"  [green]✓ {display}[/green] [dim]{elapsed_s:.1f}s[/dim]"))
+            _scroll()
+
+        def _display_workflow_plan(event: dict[str, Any]) -> None:
+            nonlocal _workflow_run_id, _workflow_name
+            _workflow_run_id = str(event.get("run_id", ""))
+            _workflow_name = str(event.get("workflow", ""))
+            label = str(event.get("label") or _workflow_name)
+            steps = event.get("plan", {}).get("steps", [])
+            _write(
+                Text.from_markup(
+                    f"  [bold cyan]workflow[/bold cyan] [dim]{escape(label)} · {escape(_workflow_run_id)}[/dim]"
+                )
+            )
+            for idx, step in enumerate(steps, start=1):
+                title = escape(str(step.get("title", "")))
+                _write(Text.from_markup(f"    [dim]{idx}.[/dim] {title} [dim]pending[/dim]"))
+            _scroll()
+
+        def _display_workflow_step(event: dict[str, Any]) -> None:
+            step = event.get("step", {})
+            status = step.get("status", "")
+            mark = {"running": "→", "completed": "✓", "failed": "✗", "skipped": "·"}.get(status, "·")
+            color = {"running": "yellow", "completed": "green", "failed": "red", "skipped": "dim"}.get(status, "dim")
+            title = escape(str(step.get("title", "")))
+            summary = escape(str(step.get("summary", "")))
+            _write(Text.from_markup(f"    [{color}]{mark} {title}[/{color}] [dim]{summary}[/dim]"))
             _scroll()
 
         def _build_rounds_detail(rounds: int) -> list[dict[str, object]]:
@@ -1753,10 +1950,17 @@ class WyckoffTUI(App):
                     _scroll()
 
             self._tools._tool_context.on_progress = _on_sub_agent_progress
+            self._tools._tool_context.cancel_check = self._cancel_event.is_set
 
-            runtime = AgentRuntime(
-                self._provider, self._tools, scratchpad=_scratchpad, cancel_check=self._cancel_event.is_set
+            runtime, workflow_context = build_turn_runtime(
+                self._provider,
+                self._tools,
+                session_id=self._session_id,
+                user_text=_user_text,
+                scratchpad=_scratchpad,
+                cancel_check=self._cancel_event.is_set,
             )
+            _workflow_name = "" if workflow_context.is_general else workflow_context.name
             for event in runtime.run_stream(self._messages, with_current_time(self._system_prompt)):
                 if self._cancel_event.is_set():
                     _spinner_stop()
@@ -1773,9 +1977,38 @@ class WyckoffTUI(App):
                 round_number = int(event.get("round") or 0)
                 _ensure_round(round_number)
 
+                if event_type == "workflow_plan":
+                    _display_workflow_plan(event)
+                    continue
+
+                if event_type in {"workflow_step_start", "workflow_step_done"}:
+                    _display_workflow_step(event)
+                    continue
+
+                if event_type == "workflow_done":
+                    continue
+
                 if event_type == "compaction":
                     before, after = event["before_messages"], event["after_messages"]
-                    _write(Text.from_markup(f"  [dim]📦 上下文压缩（{before}→{after}条）[/dim]"))
+                    from rich.panel import Panel
+
+                    panel = Panel(
+                        Text.assemble(
+                            (" ⚡ 系统状态：上下文深度压缩中...\n\n", "bold yellow"),
+                            ("已自动提取持久偏好写入 ", "dim white"),
+                            ("SQLite 记忆库", "bold cyan"),
+                            ("；\n已将前序 ", "dim white"),
+                            (str(before), "bold red"),
+                            (" 条陈旧对话压缩为结构化摘要，仅保留最近 ", "dim white"),
+                            (str(after), "bold green"),
+                            (" 条消息以维持当前上下文连贯性。", "dim white"),
+                        ),
+                        border_style="yellow",
+                        title="[bold yellow] 📦 CONTEXT COMPACTION [/bold yellow]",
+                        title_align="left",
+                        padding=(1, 2),
+                    )
+                    _write(panel)
                     _scroll()
                     continue
 
@@ -1815,7 +2048,9 @@ class WyckoffTUI(App):
 
                 if event_type == "thinking":
                     _spinner_stop()
-                    _display_thinking(event.get("text", ""))
+                    preview = _build_thinking_preview(event.get("text", ""))
+                    if preview:
+                        _write(preview)
                     continue
                 if event_type == "model_start":
                     _spinner_start("思考中")
@@ -1855,11 +2090,18 @@ class WyckoffTUI(App):
                     final_elapsed = float(event.get("elapsed", time.monotonic() - t_start))
                     final_rounds = int(event.get("rounds", 0))
 
-                    if final_text:
-                        if not _streaming_started:
-                            _write(Text.from_markup("  [dim]───[/dim]"))
-                            _write(Markdown(final_text))
-                            _scroll()
+                    if _display_final_response(
+                        log,
+                        final_text,
+                        streaming_started=_streaming_started,
+                        stream_separator_strips=_stream_separator_strips,
+                        stream_text_strips=_stream_text_strips,
+                        write=_write,
+                        call_from_thread=self.call_from_thread,
+                    ):
+                        _stream_separator_strips = _stream_text_strips = 0
+                        _streaming_started = False
+                        _scroll()
 
                     total_input = final_usage.get("input_tokens", 0)
                     total_output = final_usage.get("output_tokens", 0)
@@ -1890,6 +2132,8 @@ class WyckoffTUI(App):
                         "system_prompt": self._system_prompt,
                         "tools": self._tools.schemas() if self._tools else [],
                         "scratchpad_path": str(_scratchpad.path) if _scratchpad else "",
+                        "workflow": _workflow_name,
+                        "workflow_run_id": _workflow_run_id,
                     }
                     _chatlog_save(
                         "assistant",
@@ -2002,10 +2246,24 @@ class WyckoffTUI(App):
                 Text.from_markup(f"  [green]✅ 后台任务完成：{display}[/green]"),
             )
 
-        summary = json.dumps(result, ensure_ascii=False, default=str)
-        if len(summary) > 3000:
-            summary = summary[:3000] + "..."
-        self._queue.append(f"[后台任务完成] {tool_name}: {summary}")
+        summary_str = json.dumps(result, ensure_ascii=False, default=str)
+        if len(summary_str) > 3000:
+            summary_str = summary_str[:3000] + "..."
+
+        notification = (
+            "[SYSTEM NOTIFICATION - NOT USER INPUT]\n"
+            "This is an automated background-task event, NOT a message from the user.\n"
+            "Do NOT interpret this as user acknowledgement, confirmation, or response to any pending question.\n\n"
+            "<system-reminder>\n"
+            "<task-notification>\n"
+            f"<task-id>{task_id}</task-id>\n"
+            f"<tool-name>{tool_name}</tool-name>\n"
+            f"<status>{'failed' if is_error else 'completed'}</status>\n"
+            f"<summary>{summary_str}</summary>\n"
+            "</task-notification>\n"
+            "</system-reminder>"
+        )
+        self._queue.append(notification)
         # 空闲时自动触发
         if not self._busy:
             self.call_from_thread(self._send_message, self._queue.popleft())

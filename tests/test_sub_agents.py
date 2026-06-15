@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from copy import deepcopy
 
 from cli.sub_agents import (
@@ -7,6 +8,8 @@ from cli.sub_agents import (
     RESEARCH_AGENT,
     TRADING_AGENT,
     SubAgentToolProxy,
+    _delegate_result_policy,
+    delegate_to_analysis,
     run_sub_agent,
 )
 from cli.tools import TOOL_SCHEMAS
@@ -50,6 +53,23 @@ class TestSubAgentToolProxy:
         assert proxy.concurrency_safe("analyze_stock")
         assert not proxy.concurrency_safe("portfolio")
 
+    def test_execute_tool_timeout_returns_error(self):
+        def slow_tool(_name, _args):
+            time.sleep(0.2)
+            return {"ok": True}
+
+        registry = StubToolRegistry(tool_results={"analyze_stock": slow_tool})
+        proxy = SubAgentToolProxy(
+            registry,
+            {"analyze_stock"},
+            tool_timeout_seconds=1,
+            deadline=time.monotonic() + 0.01,
+        )
+
+        result = proxy.execute("analyze_stock", {"code": "000001"})
+        assert "error" in result
+        assert "工具调用超时" in result["error"]
+
 
 # ---------------------------------------------------------------------------
 # SubAgent 定义一致性
@@ -61,6 +81,10 @@ def test_agent_tool_names_exist_in_schemas():
     for agent in (RESEARCH_AGENT, ANALYSIS_AGENT, TRADING_AGENT):
         missing = set(agent.tool_names) - schema_names
         assert not missing, f"{agent.name} references unknown tools: {missing}"
+
+
+def test_trading_agent_does_not_execute_portfolio_updates():
+    assert "update_portfolio" not in TRADING_AGENT.tool_names
 
 
 # ---------------------------------------------------------------------------
@@ -88,8 +112,15 @@ def test_run_sub_agent_basic():
     )
 
     assert result["agent"] == "research"
+    assert result["status"] == "completed"
     assert "大盘水温偏暖" in result["result"]
     assert result["usage"]["output_tokens"] == 15
+    assert result["rounds"] == 1
+    assert result["tool_calls"] == []
+    assert not result["context_truncated"]
+    assert not result["result_truncated"]
+    assert result["policy"]["next_action"] == "use_result"
+    assert result["policy"]["fallback_tools"] == []
 
 
 def test_run_sub_agent_with_tool_call():
@@ -120,5 +151,142 @@ def test_run_sub_agent_with_tool_call():
     )
 
     assert result["agent"] == "research"
+    assert result["status"] == "completed"
     assert "上证" in result["result"]
+    assert result["tool_calls"] == ["get_market_overview"]
     assert registry.calls[0]["name"] == "get_market_overview"
+
+
+def test_run_sub_agent_trims_large_context():
+    provider = ScriptedProvider([[{"type": "text_delta", "text": "收到"}]])
+    registry = StubToolRegistry()
+    small_context_agent = deepcopy(RESEARCH_AGENT)
+    object.__setattr__(small_context_agent, "context_budget_tokens", 80)
+    context = "最早唯一材料" + "早期材料" * 500 + "最新关键材料"
+
+    result = run_sub_agent(
+        small_context_agent,
+        task="整理材料",
+        context=context,
+        provider=provider,
+        registry=registry,
+    )
+
+    sent = provider.calls[0]["messages"][0]["content"]
+    assert result["context_truncated"]
+    assert "上下文已按预算裁剪" in sent
+    assert "最新关键材料" in sent
+    assert "最早唯一材料" not in sent
+
+
+def test_run_sub_agent_trims_large_result():
+    provider = ScriptedProvider([[{"type": "text_delta", "text": "A" * 200}]])
+    registry = StubToolRegistry()
+    small_result_agent = deepcopy(RESEARCH_AGENT)
+    object.__setattr__(small_result_agent, "result_budget_chars", 80)
+
+    result = run_sub_agent(
+        small_result_agent,
+        task="输出摘要",
+        context="",
+        provider=provider,
+        registry=registry,
+    )
+
+    assert result["status"] == "completed"
+    assert result["result_truncated"]
+    assert len(result["result"]) <= 80
+    assert "结果已按输出预算截断" in result["result"]
+
+
+def test_run_sub_agent_cancelled():
+    provider = ScriptedProvider(
+        [
+            [
+                {"type": "text_delta", "text": "开始分析"},
+                {"type": "usage", "input_tokens": 10, "output_tokens": 2},
+            ],
+        ]
+    )
+    registry = StubToolRegistry()
+
+    result = run_sub_agent(
+        RESEARCH_AGENT,
+        task="查看大盘水温",
+        context="",
+        provider=provider,
+        registry=registry,
+        cancel_check=lambda: True,
+    )
+
+    assert result["agent"] == "research"
+    assert result["status"] == "cancelled"
+    assert result["result"] == ""
+    assert "cancelled" in result["error"]
+    assert result["policy"]["next_action"] == "stop_and_report_cancelled"
+    assert result["policy"]["retryable"] is False
+
+
+def test_run_sub_agent_timeout():
+    def slow_round(_messages, _tools, _system_prompt):
+        time.sleep(1.2)
+        return [{"type": "text_delta", "text": "迟到的分析"}]
+
+    provider = ScriptedProvider([slow_round])
+    registry = StubToolRegistry()
+    expired_agent = deepcopy(RESEARCH_AGENT)
+    object.__setattr__(expired_agent, "timeout_seconds", 1)
+
+    result = run_sub_agent(
+        expired_agent,
+        task="查看大盘水温",
+        context="",
+        provider=provider,
+        registry=registry,
+    )
+
+    assert result["agent"] == "research"
+    assert result["status"] == "timeout"
+    assert "timeout" in result["error"]
+    assert result["policy"]["next_action"] == "fallback_to_direct_tools"
+    assert result["policy"]["retryable"] is True
+    assert "get_market_overview" in result["policy"]["fallback_tools"]
+
+
+def test_run_sub_agent_error_policy():
+    def failed_round(_messages, _tools, _system_prompt):
+        raise RuntimeError("provider failed")
+
+    provider = ScriptedProvider([failed_round])
+    registry = StubToolRegistry()
+
+    result = run_sub_agent(
+        ANALYSIS_AGENT,
+        task="诊断持仓",
+        context="",
+        provider=provider,
+        registry=registry,
+    )
+
+    assert result["agent"] == "analysis"
+    assert result["status"] == "error"
+    assert "provider failed" in result["error"]
+    assert result["policy"]["next_action"] == "fallback_to_direct_tools"
+    assert "analyze_stock" in result["policy"]["fallback_tools"]
+
+
+def test_empty_policy_uses_fallback_tools():
+    policy = _delegate_result_policy(TRADING_AGENT, "empty")
+
+    assert policy["next_action"] == "fallback_to_direct_tools"
+    assert policy["retryable"] is False
+    assert "generate_strategy_decision" in policy["fallback_tools"]
+
+
+def test_delegate_start_error_has_policy():
+    result = delegate_to_analysis("诊断持仓")
+
+    assert result["agent"] == "analysis"
+    assert result["status"] == "error"
+    assert "无法启动" in result["error"]
+    assert result["policy"]["next_action"] == "fallback_to_direct_tools"

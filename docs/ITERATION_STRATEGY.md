@@ -8,6 +8,8 @@
 ```mermaid
 flowchart LR
   A["漏斗发现信号"] --> B["signal_observations<br/>记录样本"]
+  X["外部观察名单"] --> B
+  X --> Y["external_seed_observations<br/>记录旁路观察"]
   B --> C["signal_feedback_job.py<br/>计算未来收益/回撤"]
   C --> D["signal_health_daily<br/>信号健康度"]
   D --> E["signal_registry<br/>生命周期状态"]
@@ -23,9 +25,11 @@ flowchart LR
 
 | 方向 | 目标 | 当前实现 | 状态 |
 |------|------|----------|------|
-| 方向一：信号衰减监控 | 追踪 SOS / Spring / LPS / EVR / Compression 的后续表现 | `signal_observations` 记录样本，`signal_outcomes` 计算收益 / 回撤，`signal_health_daily` 聚合健康度 | 已落地一期 |
+| 方向一：信号衰减监控 | 追踪 SOS / Spring / LPS / EVR / Compression 的后续表现 | `signal_observations` 记录样本和 price-action footprint，`signal_outcomes` 计算收益 / 回撤，`signal_health_daily` 聚合健康度 | 已落地一期 |
 | 方向二：多策略动态分配 | AI 候选配额从静态规则变为数据驱动 | `dynamic_policy.py` 根据信号权重调整 Trend / Accum 配额，支持 `off` / `shadow` / `on` | 已落地框架，待 shadow 复盘 |
 | 方向三：信号生命周期管理 | 新信号孵化、正式上线、观察、退役 | `signal_registry` 维护 `ACTIVE` / `WATCH` / `EXPERIMENTAL` / `RETIRED` | 已落地骨架，阈值待样本校准 |
+| 方向四：外部观察验证 | 验证人工/社区/其它系统关注的股票是否真有结构优势 | `external_seed_observations` 记录 L1/L2/L4 位置，L4 确认样本补写 `signal_observations` | 已落地 shadow 观察 |
+| 方向五：候选影子评分 | 验证“好候选”是否能被更稳定地识别 | `features_json.candidate_shadow_score` 合成漏斗优先级、量价痕迹、起跳板、尾盘确认、外部资金和风险扣分 | 已落地 shadow 特征，待 outcome 校准 |
 
 完整执行链路见 [`SIGNAL_FEEDBACK_LOOP.md`](SIGNAL_FEEDBACK_LOOP.md)。
 
@@ -49,6 +53,10 @@ flowchart TD
 - 按 `signal_type + regime + horizon_days` 聚合，同时生成 `ALL` regime 汇总。
 - 默认 registry 判断使用 10 日窗口。
 - 样本不足时不贸然退役，只降低权重或保持实验态。
+- `features_json.price_action_footprint` 记录承接、缩量、突破质量、派发压力和失败突破标签，用于把“主力痕迹”从主观描述变成可回测特征。
+- `features_json.intraday_tail_confirmation` 记录正式候选的尾盘 1m VWAP、尾段量能、聪明钱和尾盘确认分，用于验证日线候选是否被尾盘分钟线确认；当前只做复盘特征，不参与候选排序。
+- `features_json.source_context` 记录龙虎榜、融资融券、大宗交易和可选逐笔大单等外部资金佐证；当前只做解释和复盘特征，不参与候选排序。
+- `features_json.candidate_shadow_score` 记录候选影子评分，把上述证据汇总成 0-100 分和 S/A/B/C/D 评级；当前只做复盘特征，不参与候选排序。
 
 ## 方向二：多策略动态分配
 
@@ -75,6 +83,11 @@ Shadow 复盘重点看 `signal_policy_shadow_runs`：
 - `diff_removed`：动态策略移除的静态候选。
 - `signal_weights`：触发这次差异的信号权重。
 - `registry_snapshot` / `health_snapshot`：当时策略状态快照。
+
+外部观察复盘重点看 `external_seed_observations`：
+- `watch_status`：观察对象是被 L1 拒绝、已过 L2、L4 确认，还是只适合继续观察。
+- `l4_trigger_tags`：外部观察名单是否真的出现 Spring / SOS / LPS / EVR / Compression。
+- `expires_at`：观察有效期，过期后由 maintenance 清理。
 
 ## 方向三：信号生命周期管理
 

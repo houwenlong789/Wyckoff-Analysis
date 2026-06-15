@@ -1,7 +1,9 @@
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { Output } from 'ai'
 import type { generateText as GenerateTextFn } from 'ai'
-import { fetchValueSnapshotWithFetch, isCnSymbol, normalizeTickFlowSymbol, type ValueSnapshot } from './kline'
-import { buildValuePrompt, buildValueScore } from './value-analysis'
+import { z } from 'zod'
+import { fetchValueSnapshotWithFetch, isCnSymbol, normalizeTickFlowSymbol, normalizeTushareCode, type ValueSnapshot } from './agent-market'
+import { buildValuePrompt, buildValueScore } from './agent-value'
 
 export interface KlineRow {
   date: string
@@ -23,6 +25,34 @@ export interface LLMToolConfig {
   model: string
   base_url: string
 }
+
+export const ANALYZE_STOCK_OUTPUT_SCHEMA = z.object({
+  summary: z.string(),
+  phase: z.string(),
+  confidence: z.number().nullable(),
+  support: z.string().nullable(),
+  resistance: z.string().nullable(),
+  action: z.string(),
+  risk: z.string(),
+  markdown: z.string(),
+})
+
+export const STRATEGY_DECISION_OUTPUT_SCHEMA = z.object({
+  summary: z.string(),
+  market_regime: z.string(),
+  overall_position: z.string(),
+  risk: z.string(),
+  position_actions: z.array(z.object({
+    code: z.string(),
+    name: z.string().nullable(),
+    action: z.string(),
+    reason: z.string(),
+    risk: z.string(),
+  })),
+})
+
+export type AnalyzeStockResult = z.infer<typeof ANALYZE_STOCK_OUTPUT_SCHEMA>
+export type StrategyDecisionResult = z.infer<typeof STRATEGY_DECISION_OUTPUT_SCHEMA>
 
 export function buildKlineDigest(data: KlineRow[]): string {
   if (data.length === 0) return '无可用K线数据'
@@ -70,13 +100,6 @@ export async function fetchUserDataKeys(deps: ToolDeps, userId: string): Promise
 export async function fetchTickFlowKey(deps: ToolDeps, userId: string): Promise<string | null> {
   const keys = await fetchUserDataKeys(deps, userId)
   return keys.tickflow
-}
-
-function normalizeTushareCode(code: string): string {
-  const c = code.replace(/\.\w+$/, '')
-  if (c.startsWith('6')) return `${c}.SH`
-  if (c.startsWith('4') || c.startsWith('8') || c.startsWith('9')) return `${c}.BJ`
-  return `${c}.SZ`
 }
 
 async function tusharePost(deps: ToolDeps, token: string, api_name: string, params: Record<string, string>, fields: string) {
@@ -351,7 +374,7 @@ export async function execMarketOverview(deps: ToolDeps): Promise<string> {
   }
 
   const regimeMap: Record<string, string> = {
-    RISK_ON: '偏强', NEUTRAL: '中性', RISK_OFF: '偏弱', CRASH: '极弱', BLACK_SWAN: '恶劣',
+    RISK_ON: '偏强', BEAR_REBOUND: '反抽', NEUTRAL: '中性', RISK_OFF: '偏弱', CRASH: '极弱', BLACK_SWAN: '恶劣',
   }
   const regime = String(merged.benchmark_regime || 'NEUTRAL')
   const close = Number(merged.main_index_close || 0)
@@ -547,7 +570,18 @@ export interface ScreenResult {
   meta: { ai_count: number }
 }
 
-export async function execScreenStocks(deps: ToolDeps): Promise<string> {
+export const SCREEN_RESULT_OUTPUT_SCHEMA = z.object({
+  date: z.string(),
+  stocks: z.array(z.object({
+    code: z.string(),
+    name: z.string(),
+    funnel_score: z.number().nullable(),
+    change_pct: z.number().nullable(),
+  })),
+  meta: z.object({ ai_count: z.number() }),
+})
+
+export async function execScreenStocks(deps: ToolDeps): Promise<ScreenResult> {
   const { data } = await deps.supabase
     .from('recommendation_tracking')
     .select('code, name, recommend_date, funnel_score, change_pct, is_ai_recommended')
@@ -555,7 +589,7 @@ export async function execScreenStocks(deps: ToolDeps): Promise<string> {
     .order('recommend_date', { ascending: false })
     .limit(30)
 
-  if (!data || data.length === 0) return JSON.stringify({ date: '', stocks: [], meta: { ai_count: 0 } })
+  if (!data || data.length === 0) return { date: '', stocks: [], meta: { ai_count: 0 } }
 
   const latestDate = data[0]!.recommend_date
   const latest = data.filter(r => r.recommend_date === latestDate)
@@ -571,22 +605,22 @@ export async function execScreenStocks(deps: ToolDeps): Promise<string> {
     meta: { ai_count: latest.length },
   }
 
-  return JSON.stringify(result)
+  return result
 }
 
 export async function execAnalyzeStock(
   deps: ToolDeps, userId: string, _config: LLMToolConfig, model: unknown, code: string, name: string | null,
-): Promise<string> {
+): Promise<AnalyzeStockResult> {
   const keys = await fetchUserDataKeys(deps, userId)
   if (!isCnSymbol(code) && !keys.tickflow) {
-    return `无法获取 ${code} ${name || ''} 的K线数据。美股/港股诊断需要先在设置页配置 TickFlow API Key，并使用标准代码（如 AAPL.US / 00700.HK）。`
+    return buildAnalyzeError(code, name, `无法获取 ${code} ${name || ''} 的K线数据。美股/港股诊断需要先在设置页配置 TickFlow API Key，并使用标准代码（如 AAPL.US / 00700.HK）。`)
   }
   const [kline, valueSnapshot] = await Promise.all([
     fetchKlineForAgent(deps, code, keys, userId),
     fetchValueSnapshotForAgent(deps, code, keys).catch((): ValueSnapshot => ({ symbol: code, source: 'none', metrics: null, reason: 'not-found' })),
   ])
   if (kline.length === 0) {
-    return `无法获取 ${code} ${name || ''} 的K线数据。美股/港股请使用 TickFlow 标准代码（如 AAPL.US / 00700.HK）。推荐购买 TickFlow 获取实时行情：https://tickflow.org/auth/register?ref=5N4NKTCPL4`
+    return buildAnalyzeError(code, name, `无法获取 ${code} ${name || ''} 的K线数据。美股/港股请使用 TickFlow 标准代码（如 AAPL.US / 00700.HK）。推荐购买 TickFlow 获取实时行情：https://tickflow.org/auth/register?ref=5N4NKTCPL4`)
   }
 
   const digest = buildKlineDigest(kline)
@@ -602,11 +636,39 @@ export async function execAnalyzeStock(
 6. 主力行为判断（是否有吸筹/出货迹象）
 7. 操作建议与风险提示（含建议止损位）
 
-用 Markdown 格式输出，简洁专业。`,
+按结构化 schema 输出。markdown 字段保留一段简洁专业的 Markdown 诊断正文。`,
     prompt: `${valueDigest}\n\n${digest}`,
+    output: Output.object({ schema: ANALYZE_STOCK_OUTPUT_SCHEMA }),
   })
 
-  return result.text || '分析完成但无输出'
+  return normalizeAnalyzeOutput(result.output, result.text)
+}
+
+function buildAnalyzeError(code: string, name: string | null, message: string): AnalyzeStockResult {
+  return {
+    summary: message,
+    phase: '数据不足',
+    confidence: null,
+    support: null,
+    resistance: null,
+    action: '暂不判断',
+    risk: '数据源不可用，不能据此交易。',
+    markdown: `## ${code} ${name || ''}\n${message}`,
+  }
+}
+
+function normalizeAnalyzeOutput(output: AnalyzeStockResult | undefined, text: string): AnalyzeStockResult {
+  if (output) return output
+  return {
+    summary: text || '分析完成但无输出',
+    phase: '未结构化',
+    confidence: null,
+    support: null,
+    resistance: null,
+    action: '详见正文',
+    risk: '请结合实时行情与自身风险承受能力。',
+    markdown: text || '分析完成但无输出',
+  }
 }
 
 export async function execGenerateAiReport(
@@ -637,7 +699,7 @@ export async function execGenerateAiReport(
   return results.join('\n---\n\n')
 }
 
-export async function execStrategyDecision(deps: ToolDeps, userId: string, model: unknown): Promise<string> {
+export async function execStrategyDecision(deps: ToolDeps, userId: string, model: unknown): Promise<StrategyDecisionResult> {
   const portfolioId = `USER_LIVE:${userId}`
 
   const [posResult, signalResult] = await Promise.all([
@@ -648,7 +710,15 @@ export async function execStrategyDecision(deps: ToolDeps, userId: string, model
   const positions = posResult.data || []
   const signal = signalResult.data
 
-  if (positions.length === 0) return '当前无持仓，无法给出操作建议。建议先通过选股工具寻找标的。'
+  if (positions.length === 0) {
+    return {
+      summary: '当前无持仓，无法给出操作建议。建议先通过选股工具寻找标的。',
+      market_regime: signal?.benchmark_regime || '未知',
+      overall_position: '空仓',
+      risk: '没有持仓数据，不能生成个股级调仓建议。',
+      position_actions: [],
+    }
+  }
 
   const posInfo = positions.map(p =>
     `${p.code} ${p.name} | ${p.shares}股 成本¥${p.cost_price}${p.stop_loss ? ` 止损¥${p.stop_loss}` : ''}`
@@ -660,11 +730,18 @@ export async function execStrategyDecision(deps: ToolDeps, userId: string, model
 
   const result = await deps.generateText({
     model: model as Parameters<typeof GenerateTextFn>[0]['model'],
-    system: '你是威科夫大师。基于用户的持仓和当前市场环境，为每只持仓股给出操作建议（买入加仓/持有/减仓/卖出），并给出整体仓位管理建议。简洁明了，必须附带风险提示。',
+    system: '你是威科夫大师。基于用户的持仓和当前市场环境，为每只持仓股给出操作建议（买入加仓/持有/减仓/卖出），并给出整体仓位管理建议。按结构化 schema 输出，必须附带风险提示。',
     prompt: `当前持仓:\n${posInfo}\n\n市场环境:\n${marketInfo}`,
+    output: Output.object({ schema: STRATEGY_DECISION_OUTPUT_SCHEMA }),
   })
 
-  return result.text || '无法生成建议'
+  return result.output || {
+    summary: result.text || '无法生成建议',
+    market_regime: signal?.benchmark_regime || '未知',
+    overall_position: '详见摘要',
+    risk: '请结合实时行情与自身风险承受能力。',
+    position_actions: [],
+  }
 }
 
 

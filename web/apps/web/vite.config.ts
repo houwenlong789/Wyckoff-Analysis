@@ -1,9 +1,14 @@
+import { normalizeGeminiStream } from '../../packages/shared/src/gemini-sse-normalize'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import fs from 'node:fs/promises'
+import { Readable } from 'node:stream'
 import path from 'path'
 import type { Plugin } from 'vite'
+
+const GEMINI_ORIGIN = 'https://generativelanguage.googleapis.com'
+const SSE_CONTENT_RE = /\btext\/event-stream\b/i
 
 const MARKET_DATA_FILES = new Set([
   'stock_list_cache.json',
@@ -14,6 +19,8 @@ const MARKET_DATA_FILES = new Set([
 ])
 const REPO_DATA_DIR = path.resolve(__dirname, '../../..', 'data')
 const MARKET_UNIVERSE_DIR = path.join(REPO_DATA_DIR, 'market_universes')
+const BUILD_VERSION = process.env.CF_PAGES_COMMIT_SHA || process.env.VITE_APP_VERSION || `local-${new Date().toISOString()}`
+const BUILD_TIME = new Date().toISOString()
 
 function sourceForMarketDataFile(file: string): string {
   return file === 'stock_list_cache.json'
@@ -70,6 +77,14 @@ function llmProxyPlugin(): Plugin {
             res.setHeader(key, value)
           }
 
+          const contentType = response.headers.get('content-type') || ''
+          const proxyPath = (req.url || '').split('?')[0] || ''
+          const isGeminiChat = targetUrl.startsWith(GEMINI_ORIGIN) && proxyPath.endsWith('/chat/completions')
+          if (isGeminiChat && SSE_CONTENT_RE.test(contentType) && response.body) {
+            Readable.fromWeb(normalizeGeminiStream(response.body)).pipe(res)
+            return
+          }
+
           const responseBody = await response.arrayBuffer()
           res.end(Buffer.from(responseBody))
         } catch (err: unknown) {
@@ -117,8 +132,28 @@ function marketDataPlugin(): Plugin {
   }
 }
 
+function appVersionPlugin(): Plugin {
+  let outDir = path.resolve(__dirname, 'dist')
+  return {
+    name: 'app-version',
+    configResolved(config) {
+      outDir = path.resolve(config.root, config.build.outDir)
+    },
+    async writeBundle() {
+      await fs.mkdir(outDir, { recursive: true })
+      await fs.writeFile(
+        path.join(outDir, 'version.json'),
+        JSON.stringify({ version: BUILD_VERSION, buildTime: BUILD_TIME }, null, 2),
+      )
+    },
+  }
+}
+
 export default defineConfig({
-  plugins: [react(), tailwindcss(), llmProxyPlugin(), marketDataPlugin()],
+  plugins: [react(), tailwindcss(), llmProxyPlugin(), marketDataPlugin(), appVersionPlugin()],
+  define: {
+    __APP_VERSION__: JSON.stringify(BUILD_VERSION),
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),

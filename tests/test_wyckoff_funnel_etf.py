@@ -170,8 +170,26 @@ def test_split_selected_tracks_preserves_order_and_accum_only_hits():
         },
     )
 
-    assert trend == ["000001", "000003", "000004"]
+    assert trend == ["000001", "000003"]
+    assert accum == ["000002", "000004"]
+
+
+def test_full_formal_ai_selection_respects_hard_cap(monkeypatch):
+    monkeypatch.setattr(funnel, "FUNNEL_FULL_FORMAL_L4_MAX", 2)
+
+    selected, trend, accum, score_map, policy = funnel._full_formal_ai_selection(
+        ["000001", "000002", "000003"],
+        {"000001": 3.0, "000002": 2.0, "000003": 1.0},
+        {"000001": ["sos"], "000002": ["lps"], "000003": ["spring"]},
+    )
+
+    assert selected == ["000001", "000002"]
+    assert trend == ["000001"]
     assert accum == ["000002"]
+    assert score_map == {"000001": 3.0, "000002": 2.0}
+    assert policy["total_cap"] == 2
+    assert policy["formal_l4_total"] == 3
+    assert policy["formal_l4_cap"] == 2
 
 
 def test_merge_trigger_maps_keeps_bypass_l4_hits():
@@ -198,6 +216,7 @@ def test_promote_l2_bypass_for_ai_assigns_tracks_and_scores():
         {"000002": 4.0, "000003": 8.0},
         {"000002": ["lps"], "000003": ["evr"]},
         score_map,
+        enabled=True,
     )
 
     assert added == 2
@@ -231,7 +250,84 @@ def test_promote_l2_bypass_for_ai_respects_budget(monkeypatch):
         {"000001": 1.0, "000002": 3.0, "000003": 2.0},
         {"000001": ["evr"], "000002": ["evr"], "000003": ["evr"]},
         score_map,
+        enabled=True,
     )
 
     assert added == 2
     assert selected == ["000002", "000003"]
+
+
+def test_promote_l2_bypass_for_ai_respects_total_cap():
+    selected = ["000001"]
+    trend = ["000001"]
+    accum: list[str] = []
+    score_map: dict[str, float] = {}
+
+    added = funnel._promote_l2_bypass_for_ai(
+        selected,
+        trend,
+        accum,
+        ["000002", "000003"],
+        {"000002": 3.0, "000003": 2.0},
+        {"000002": ["evr"], "000003": ["evr"]},
+        score_map,
+        enabled=True,
+        total_cap=2,
+    )
+
+    assert added == 1
+    assert selected == ["000001", "000002"]
+
+
+def test_defensive_regime_forces_quota_selection(monkeypatch):
+    monkeypatch.setattr(funnel, "FUNNEL_DEFENSIVE_FORCE_QUOTA", True)
+
+    assert funnel._should_force_quota_selection("CRASH", True) is True
+    assert funnel._should_force_quota_selection("BEAR_REBOUND", True) is True
+    assert funnel._should_force_quota_selection("RISK_ON", True) is False
+
+
+def test_loss_guard_drops_low_lps_and_risk_on_pure_momentum():
+    selected = ["000001", "000002", "000003"]
+    trend = ["000002", "000003"]
+    accum = ["000001"]
+
+    kept, trend_kept, accum_kept, dropped = funnel._apply_loss_guard(
+        selected,
+        trend,
+        accum,
+        regime="RISK_ON",
+        code_to_trigger_keys={"000001": ["lps"], "000002": ["sos"], "000003": ["sos"]},
+        code_to_total_score={"000001": 0.4, "000002": 4.0, "000003": 4.0},
+        channel_map={"000002": "主升通道", "000003": "点火破局"},
+        df_map={},
+    )
+
+    assert kept == ["000003"]
+    assert trend_kept == ["000003"]
+    assert accum_kept == []
+    assert dropped == {"低分LPS": 1, "RISK_ON纯趋势追涨": 1}
+
+
+def test_loss_guard_keeps_neutral_point_ignition():
+    kept, trend_kept, _accum_kept, dropped = funnel._apply_loss_guard(
+        ["000001"],
+        ["000001"],
+        [],
+        regime="NEUTRAL",
+        code_to_trigger_keys={"000001": ["sos"]},
+        code_to_total_score={"000001": 4.0},
+        channel_map={"000001": "加速突破+点火破局"},
+        df_map={},
+    )
+
+    assert kept == ["000001"]
+    assert trend_kept == ["000001"]
+    assert dropped == {}
+
+
+def test_signal_report_fields_fallback_for_strategic_review():
+    fields = funnel._signal_report_fields("000001", {}, "Trend", "crash", 0.0)
+
+    assert fields["primary_signal"] == "strategic_review"
+    assert fields["signal_types"] == []

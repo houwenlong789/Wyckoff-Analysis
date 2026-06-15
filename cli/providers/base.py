@@ -21,6 +21,8 @@ class LLMProvider(ABC):
     - {"type": "usage", "input_tokens": N, "output_tokens": N}
     """
 
+    context_window: int | None = None
+
     @abstractmethod
     def chat(
         self,

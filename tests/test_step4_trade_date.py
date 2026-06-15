@@ -62,3 +62,23 @@ def test_existing_position_probe_is_treated_as_add_on_and_requires_profit():
     assert tickets[0].action == "HOLD"
     assert tickets[0].status == "APPROVED"
     assert "当前未浮盈" in tickets[0].reason
+
+
+def test_send_feishu_trade_ticket(monkeypatch):
+    captured: dict[str, str] = {}
+    monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://example.invalid/webhook")
+    monkeypatch.setattr(
+        step4,
+        "send_feishu_notification",
+        lambda webhook, title, content: (
+            captured.update({"webhook": webhook, "title": title, "content": content}) or True
+        ),
+    )
+
+    step4._send_feishu_trade_ticket("# ticket")
+
+    assert captured == {
+        "webhook": "https://example.invalid/webhook",
+        "title": "Alpha-OMS 交易执行工单",
+        "content": "# ticket",
+    }

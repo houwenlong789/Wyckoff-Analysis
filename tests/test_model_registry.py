@@ -30,6 +30,14 @@ def test_infer_model_info_exposes_context_and_reasoning():
     assert "medium" in info.thinking_levels
 
 
+def test_infer_minimax_m3_metadata():
+    info = infer_model_info({"provider_name": "minimax", "model": "MiniMax-M3"})
+
+    assert info.context_window == 1_000_000
+    assert info.supports_reasoning is True
+    assert info.thinking_levels == ("off", "adaptive")
+
+
 def test_estimate_cost_uses_configured_prices():
     info = infer_model_info(
         {

@@ -2,8 +2,8 @@ name: Wyckoff Funnel
 
 on:
   schedule:
-    # 北京时间周一到周五 18:25（UTC 10:25），A 股收盘后跑日频漏斗 + 主线雷达。
-    - cron: '25 10 * * 1-5'
+    # 北京时间周日到周四 17:17（UTC 9:17），为下一交易日做盘后准备。
+    - cron: '17 9 * * 0-4'
   workflow_dispatch:
     inputs:
       end_calendar_day:
@@ -20,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONUNBUFFERED: "1"
+      WYCKOFF_WRITE_CONTEXT: "server_job"
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
       TICKFLOW_API_KEY: ${{ secrets.TICKFLOW_API_KEY }}
@@ -72,24 +73,32 @@ jobs:
       SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
       RAG_SEMANTIC_VETO_ENABLED: ${{ vars.RAG_SEMANTIC_VETO_ENABLED || '1' }}
       RAG_SEMANTIC_PROVIDER: ${{ vars.RAG_SEMANTIC_PROVIDER || secrets.RAG_SEMANTIC_PROVIDER || 'efficiency' }}
-      # 实盘风控参数：锁死 -9% 止损 + 单票仓位上限
+      # 实盘风控参数：锁死 -8% 止损 + 单票仓位上限
       STEP4_BUY_HARD_STOP_ENABLED: "1"
-      STEP4_BUY_HARD_STOP_PCT: "9.0"
+      STEP4_BUY_HARD_STOP_PCT: "8.0"
       STEP4_BUY_STOP_MODE: "floor"
       STEP4_PROBE_BUDGET_LIMIT: "0.10"
-      STEP4_ATTACK_BUDGET_LIMIT: "0.20"
+      STEP4_ATTACK_BUDGET_LIMIT: "0.25"
       STEP4_BUY_BLOCK_REGIMES: "CRASH,BLACK_SWAN,RISK_OFF"
-      # AI 候选选择：正式 L4 全量进入 Step3，Trend/Accum 仅用于分轨研报。
-      FUNNEL_AI_SELECTION_MODE: "all_formal_l4"
+      STEP4_REQUIRE_CONFIRMED_BUY_CANDIDATE: "1"
+      # AI 候选选择：按可交易 L4 收口，避免裸 SOS/EVR 噪声直接进入执行链路。
+      FUNNEL_AI_SELECTION_MODE: ${{ vars.FUNNEL_AI_SELECTION_MODE || 'tradeable_l4' }}
       FUNNEL_AI_TOTAL_CAP: "8"
       # off=静态配额；shadow=旁路记录动态策略差异；on=正式启用动态配额。
-      FUNNEL_DYNAMIC_POLICY: ${{ vars.FUNNEL_DYNAMIC_POLICY || secrets.FUNNEL_DYNAMIC_POLICY || 'off' }}
+      FUNNEL_DYNAMIC_POLICY: ${{ vars.FUNNEL_DYNAMIC_POLICY || secrets.FUNNEL_DYNAMIC_POLICY || 'shadow' }}
+      FUNNEL_DYNAMIC_POLICY_HORIZON: "5"
+      FUNNEL_DEFENSIVE_FORCE_QUOTA: "1"
       FUNNEL_AI_RISK_ON_TREND: "3"
       FUNNEL_AI_RISK_ON_ACCUM: "5"
       FUNNEL_AI_RISK_OFF_TREND: "0"
       FUNNEL_AI_RISK_OFF_ACCUM: "0"
       FUNNEL_AI_NEUTRAL_TREND: "2"
       FUNNEL_AI_NEUTRAL_ACCUM: "3"
+      FUNNEL_AI_BEAR_REBOUND_TREND: "1"
+      FUNNEL_AI_BEAR_REBOUND_ACCUM: "2"
+      FUNNEL_L2_BYPASS_AI_ENABLED: "0"
+      FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP: "2"
+      FUNNEL_THEME_RADAR_PROMOTE_CAP: "2"
       DAILY_JOB_ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
       TZ: Asia/Shanghai
 

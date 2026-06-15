@@ -147,3 +147,19 @@ class TestLoopGuardRequiredArgs:
             required_args={"mode": "diagnose"},
         )
         assert missing_required_tool(exp, ["portfolio"]) is True
+
+
+class TestExecuteSkillTool:
+    def test_execute_skill_success(self):
+        from cli.tools import execute_skill
+
+        res = execute_skill("screen", "main")
+        assert res["status"] == "success"
+        assert res["skill"] == "screen"
+        assert 'screen_stocks(board="main")' in res["instructions"]
+
+    def test_execute_skill_not_found(self):
+        from cli.tools import execute_skill
+
+        res = execute_skill("nonexistent_skill")
+        assert "error" in res

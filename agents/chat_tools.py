@@ -1460,7 +1460,14 @@ def generate_strategy_decision(tool_context: ToolContext) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def query_history(source: str, status: str = "all", run_date: str = "", decision: str = "", limit: int = 20) -> dict:
+def query_history(
+    source: str,
+    status: str = "all",
+    run_date: str = "",
+    decision: str = "",
+    limit: int = 20,
+    tool_context: ToolContext = None,
+) -> dict:
     """查询历史记录：形态复盘、信号确认池或尾盘买入记录。
 
     Args:
@@ -1475,16 +1482,16 @@ def query_history(source: str, status: str = "all", run_date: str = "", decision
     """
     source = (source or "").strip().lower()
     if source == "recommendation":
-        return _query_recommendation(limit)
+        return _query_recommendation(limit, tool_context)
     elif source == "signal":
-        return _query_signal(status, limit)
+        return _query_signal(status, limit, tool_context)
     elif source == "tail_buy":
-        return _query_tail_buy(run_date, decision, limit)
+        return _query_tail_buy(run_date, decision, limit, tool_context)
     else:
         return {"error": f"不支持的 source：{source}，请用 'recommendation'、'signal' 或 'tail_buy'"}
 
 
-def _query_recommendation(limit: int) -> dict:
+def _query_recommendation(limit: int, tool_context: ToolContext | None = None) -> dict:
     try:
         limit = min(max(limit, 1), 50)
         records = []
@@ -1497,7 +1504,7 @@ def _query_recommendation(limit: int) -> dict:
         if not records:
             from integrations.supabase_recommendation import load_recommendation_tracking
 
-            records = load_recommendation_tracking(limit=limit)
+            records = load_recommendation_tracking(limit=limit, client=_get_user_client(tool_context))
             if records:
                 try:
                     from integrations.local_db import save_recommendations
@@ -1527,7 +1534,7 @@ def _query_recommendation(limit: int) -> dict:
         return {"error": str(e)}
 
 
-def _query_signal(status: str, limit: int) -> dict:
+def _query_signal(status: str, limit: int, tool_context: ToolContext | None = None) -> dict:
     try:
         limit = min(max(limit, 1), 100)
         rows: list[dict] = []
@@ -1540,11 +1547,9 @@ def _query_signal(status: str, limit: int) -> dict:
             logger.warning("failed to load signals from local DB", exc_info=True)
         if not rows:
             from core.constants import TABLE_SIGNAL_PENDING
-            from integrations.supabase_base import create_admin_client, is_admin_configured
+            from integrations.supabase_base import create_read_client
 
-            if not is_admin_configured():
-                return {"error": "本地无缓存且 Supabase 未配置"}
-            client = create_admin_client()
+            client = _get_user_client(tool_context) or create_read_client()
             query = client.table(TABLE_SIGNAL_PENDING).select("*")
             if status in ("pending", "confirmed", "expired"):
                 query = query.eq("status", status)
@@ -1930,7 +1935,12 @@ def update_portfolio(
         return {"error": str(e)}
 
 
-def _query_tail_buy(run_date: str, decision: str, limit: int) -> dict:
+def _query_tail_buy(
+    run_date: str,
+    decision: str,
+    limit: int,
+    tool_context: ToolContext | None = None,
+) -> dict:
     try:
         limit = min(max(int(limit), 1), 200)
         from integrations.local_db import load_tail_buy_history
@@ -1943,7 +1953,11 @@ def _query_tail_buy(run_date: str, decision: str, limit: int) -> dict:
         if not records:
             from integrations.supabase_tail_buy import load_tail_buy_from_supabase
 
-            sb_rows = load_tail_buy_from_supabase(limit=limit)
+            sb_rows = load_tail_buy_from_supabase(
+                limit=limit,
+                user_id=_get_user_id(tool_context),
+                client=_get_user_client(tool_context),
+            )
             if sb_rows:
                 from integrations.local_db import save_tail_buy_results
 
@@ -2002,10 +2016,10 @@ def run_backtest(
     start: str = "",
     end: str = "",
     hold_days: int = 10,
-    top_n: int = 3,
+    top_n: int = 4,
     board: str = "main_chinext",
-    stop_loss_pct: float = -7.0,
-    take_profit_pct: float = 18.0,
+    stop_loss_pct: float = -8.0,
+    take_profit_pct: float = 0.0,
     tool_context: ToolContext = None,
 ) -> dict:
     """回测威科夫五层漏斗策略的历史表现。耗时较长（3-10分钟），会在后台执行。
@@ -2017,10 +2031,10 @@ def run_backtest(
         start: 开始日期（YYYY-MM-DD），默认 6 个月前
         end: 结束日期（YYYY-MM-DD），默认昨天
         hold_days: 最大持仓天数（5/10/15/30），默认 10
-        top_n: 每日最大候选数（0=不限），默认 3
+        top_n: 每日最大候选数（0=不限），默认 4
         board: 股票池 'main_chinext'/'main'/'chinext'/'all'
-        stop_loss_pct: 止损百分比（负数），默认 -7.0
-        take_profit_pct: 止盈百分比，默认 18.0
+        stop_loss_pct: 止损百分比（负数），默认 -8.0
+        take_profit_pct: 止盈百分比，默认 0.0
 
     Returns:
         回测结果摘要：胜率、Sharpe、最大回撤、交易笔数等。
@@ -2052,6 +2066,10 @@ def run_backtest(
             exit_mode="sltp",
             stop_loss_pct=stop_loss_pct,
             take_profit_pct=take_profit_pct,
+            cash_portfolio=True,
+            initial_cash=100_000.0,
+            max_positions=4,
+            portfolio_styles="confirmation_only",
         )
 
         return {
@@ -2070,6 +2088,11 @@ def run_backtest(
             "portfolio_total_ret_pct": summary.get("portfolio_total_ret_pct"),
             "portfolio_ann_ret_pct": summary.get("portfolio_ann_ret_pct"),
             "max_consecutive_losses": summary.get("max_consecutive_losses"),
+            "cash_final": summary.get("cash_portfolio_final_cash"),
+            "cash_return_pct": summary.get("cash_portfolio_total_return_pct"),
+            "cash_max_drawdown_pct": summary.get("cash_portfolio_max_drawdown_pct"),
+            "cash_trades": summary.get("cash_portfolio_trades"),
+            "cash_style": summary.get("cash_portfolio_style"),
         }
     except Exception as e:
         logger.exception("run_backtest error")
