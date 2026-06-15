@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -222,6 +223,10 @@ def _call_openai_compatible(
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        # 强制要求 JSON 响应：部分 OpenAI 兼容代理（如 wl.thlws.com）会
+        # 把非流式请求错误地以 text/event-stream 返回并在末尾追加
+        # `data: [DONE]`，导致 resp.json() 抛 JSONDecodeError。
+        "Accept": "application/json",
     }
     max_tokens = int(max_output_tokens) if max_output_tokens is not None else 8192
     payload = {
@@ -232,11 +237,21 @@ def _call_openai_compatible(
         ],
         "max_tokens": max(256, max_tokens),
         "temperature": 0.4,
+        "stream": False,
     }
     resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
     if resp.status_code != 200:
         raise RuntimeError(f"OpenAI 兼容接口 HTTP {resp.status_code}: {resp.text[:500]}")
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError as e:
+        # 兜底：万一代理仍误返 SSE 格式，剥掉末尾的 data: [DONE] 再解析
+        body = resp.text
+        if body.rstrip().endswith("data: [DONE]"):
+            body = body.rstrip()[: -len("data: [DONE]")].rstrip()
+            data = json.loads(body)
+        else:
+            raise RuntimeError(f"OpenAI 兼容接口响应非 JSON: {e}; body[:300]={resp.text[:300]!r}") from e
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError("OpenAI 兼容接口返回无 choices")
