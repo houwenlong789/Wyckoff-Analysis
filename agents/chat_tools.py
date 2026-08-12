@@ -1309,7 +1309,7 @@ def screen_stocks(board: str = "all", tool_context: ToolContext = None) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def generate_ai_report(stock_codes: list[str], tool_context: ToolContext) -> dict:
+def generate_ai_report(stock_codes: list[str], tool_context: ToolContext = None) -> dict:
     """对指定股票列表生成威科夫三阵营 AI 深度研报。
 
     使用 LLM 对股票进行威科夫供需分析，将股票分为三个阵营：
@@ -1373,7 +1373,7 @@ def generate_ai_report(stock_codes: list[str], tool_context: ToolContext) -> dic
 # ---------------------------------------------------------------------------
 
 
-def generate_strategy_decision(tool_context: ToolContext) -> dict:
+def generate_strategy_decision(tool_context: ToolContext = None) -> dict:
     """生成持仓去留决策和新标的买入策略（需要先运行筛选和研报）。
 
     使用威科夫方法论，综合审视当前持仓和外部候选，给出：
