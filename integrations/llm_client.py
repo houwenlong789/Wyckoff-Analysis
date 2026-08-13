@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -345,7 +346,37 @@ def _openai_compatible_attempt(
     resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
     if resp.status_code != 200:
         raise RuntimeError(f"OpenAI 兼容接口 HTTP {resp.status_code}: {resp.text[:500]}")
-    data = resp.json()
+    # 优先走标准 JSON 解析；部分 OpenAI 兼容代理（如本地 127.0.0.1:20128）
+    # 会把非流式请求误以 text/event-stream 返回并在合法 JSON body 末尾追加
+    # `data: [DONE]`，导致 resp.json() 抛 JSONDecodeError，此时降级到 SSE 解析。
+    try:
+        data = resp.json()
+    except ValueError:
+        body = (resp.text or "").strip()
+        data = {}
+        if "\n" in body:
+            for line in body.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped == "data: [DONE]":
+                    continue
+                if stripped.startswith("data:"):
+                    payload_str = stripped[5:].strip()
+                    if payload_str and payload_str != "[DONE]":
+                        data = json.loads(payload_str)
+                        break
+        else:
+            # 单行拼接：按 "data:" 分段，丢弃末尾的 [DONE]
+            for chunk in body.split("data:"):
+                chunk = chunk.strip()
+                if not chunk or chunk == "[DONE]":
+                    continue
+                if chunk.endswith("data: [DONE]"):
+                    chunk = chunk[: -len("data: [DONE]")].strip()
+                try:
+                    data = json.loads(chunk)
+                    break
+                except json.JSONDecodeError:
+                    continue
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError("OpenAI 兼容接口返回无 choices")
