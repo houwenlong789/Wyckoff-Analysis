@@ -1,0 +1,12 @@
+node_modules/
+.vercel/
+dist/
+.wrangler/
+.dev.vars
+.env
+.env.local
+*.log
+.turbo/
+.vite/
+playwright-report/
+test-results/

@@ -1,9 +1,6 @@
 name: Backtest Grid
 
 on:
-  schedule:
-    # 每月 1 号和 15 号 UTC 20:00（北京时间次日 04:00）自动回测
-    - cron: "0 20 1,15 * *"
   workflow_dispatch:
     inputs:
       period:
@@ -12,6 +9,7 @@ on:
         type: choice
         options:
           - "all_defined"
+          - "recent_2m"
           - "recent_6m"
           - "bull_2020"
           - "bear_2022"
@@ -25,28 +23,72 @@ on:
         description: "自定义结束日期 (YYYY-MM-DD)，仅 period=custom 时生效"
         required: false
         default: ""
+      entry_price_mode:
+        description: "入场成交价：open=T+1开盘（当前默认）；close=T+1收盘；tail_1455=T+1 14:55分钟线价"
+        required: true
+        type: choice
+        options:
+          - "open"
+          - "close"
+          - "tail_1455"
+        default: "open"
+      pending_mode:
+        description: "信号确认口径：only=仅跨日确认后信号，与实盘 Step4 confirmed 一致（默认）；both=额外纳入未确认延迟信号；off=跳过确认，当日信号次日直接开盘价买入（仅研究对照，不代表实盘表现）"
+        required: true
+        type: choice
+        options:
+          - "only"
+          - "both"
+          - "off"
+        default: "only"
+      execution_regime_gate:
+        description: "新开仓水温闸门：live=实盘一致；off=研究对照；neutral_only=仅中性"
+        required: true
+        type: choice
+        options:
+          - "live"
+          - "off"
+          - "neutral_only"
+        default: "live"
+      hypothesis_id:
+        description: "可选：关联本次回测证据的研究假设 ID（hyp_*）"
+        required: false
+        default: ""
+      run_strategy_compare:
+        description: "复跑已完成的 A/M/P 仓位消融（默认关闭，仅用于手动复现历史证据）"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: backtest-grid-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   BT_START: ${{ inputs.start }}
   BT_END: ${{ inputs.end }}
-  BT_TOP_N: "4"
-  BT_BOARD: "main_chinext"
+  BT_TOP_N: "1"
+  BT_BOARD: "all"
   BT_SAMPLE_SIZE: "0"
   BT_TRADING_DAYS: "320"
-  BT_ENTRY_PRICE_MODE: "open"
+  BT_ENTRY_PRICE_MODE: ${{ inputs.entry_price_mode || 'open' }}
+  BT_PENDING_MODE: ${{ inputs.pending_mode || 'only' }}
+  BT_EXECUTION_REGIME_GATE: ${{ inputs.execution_regime_gate || 'live' }}
   BT_INITIAL_CASH: "100000"
   BT_MAX_POSITIONS: "4"
-  BT_PORTFOLIO_STYLES: "all_core"
+  # confirmed-only 下 confirmation_only 与 slot_equal_4 等价，默认网格不重复计算。
+  BT_PORTFOLIO_STYLES: "slot_equal_4,probe_add,trend_pyramid,concentrated_swap"
   BT_COMMISSION_RATE: "0.0002"
-  BT_SMALL_TRADE_THRESHOLD: "10000"
-  BT_SMALL_TRADE_FEE: "5"
+  BT_MIN_COMMISSION: "5"
+  BT_STAMP_DUTY_RATE: "0.0005"
+  BT_TRANSFER_FEE_RATE: "0.00001"
+  # off=静态策略；shadow=应用归因调权做回测验证；on=仅正式批准后进入正式调权。
+  FUNNEL_DYNAMIC_POLICY: ${{ vars.FUNNEL_DYNAMIC_POLICY || secrets.FUNNEL_DYNAMIC_POLICY || 'shadow' }}
+  FUNNEL_DYNAMIC_POLICY_HORIZON: "5"
+  STRATEGY_ATTRIBUTION_MAX_AGE_DAYS: "7"
 
 jobs:
   # ────────────────────────────────────────────────
@@ -58,8 +100,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
-        period_key: [recent_6m, bull_2020, bear_2022]
+        period_key: [recent_2m, recent_6m, bull_2020, bear_2022, sideways_2023, volatile_2024]
     env:
       PYTHONUNBUFFERED: "1"
       TICKFLOW_API_KEY: ${{ secrets.TICKFLOW_API_KEY }}
@@ -70,11 +113,12 @@ jobs:
     steps:
       - name: Resolve period dates
         id: period
+        env:
+          INPUT_PERIOD: ${{ inputs.period || 'recent_6m' }}
         run: |
-          INPUT_PERIOD="${{ inputs.period || 'recent_6m' }}"
           MATRIX_PERIOD="${{ matrix.period_key }}"
           ACTIVE="false"
-          if [ "$INPUT_PERIOD" = "all_defined" ] || [ "$INPUT_PERIOD" = "$MATRIX_PERIOD" ]; then
+          if { [ "$INPUT_PERIOD" = "all_defined" ] && [ "$MATRIX_PERIOD" != "recent_2m" ]; } || [ "$INPUT_PERIOD" = "$MATRIX_PERIOD" ]; then
             ACTIVE="true"
           elif [ "$INPUT_PERIOD" = "custom" ] && [ "$MATRIX_PERIOD" = "recent_6m" ]; then
             ACTIVE="true"
@@ -93,12 +137,21 @@ jobs:
           fi
           echo "BT_PERIOD_KEY=${PERIOD}" >> "$GITHUB_ENV"
           echo "period_key=${PERIOD}" >> "$GITHUB_OUTPUT"
-          if [ "$PERIOD" = "bull_2020" ]; then
+          if [ "$PERIOD" = "recent_2m" ]; then
+            echo "BT_END=$(TZ=Asia/Shanghai date -d '-1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
+            echo "BT_START=$(TZ=Asia/Shanghai date -d '-2 months -1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "bull_2020" ]; then
             echo "BT_START=2020-07-01" >> "$GITHUB_ENV"
             echo "BT_END=2021-02-18" >> "$GITHUB_ENV"
           elif [ "$PERIOD" = "bear_2022" ]; then
             echo "BT_START=2021-12-13" >> "$GITHUB_ENV"
             echo "BT_END=2022-10-31" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "sideways_2023" ]; then
+            echo "BT_START=2023-01-03" >> "$GITHUB_ENV"
+            echo "BT_END=2023-12-29" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "volatile_2024" ]; then
+            echo "BT_START=2024-01-02" >> "$GITHUB_ENV"
+            echo "BT_END=2024-12-31" >> "$GITHUB_ENV"
           elif [ "$PERIOD" = "custom" ]; then
             if [ -z "$BT_END" ]; then
               echo "BT_END=$(TZ=Asia/Shanghai date -d '-1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
@@ -150,21 +203,35 @@ jobs:
           retention-days: 3
 
   # ────────────────────────────────────────────────
-  # Phase 2: 12 个并行 job 读快照做回测（无需网络拉取）
-  # 维度: hold_days × stop_loss；每个 job 内部循环 TP=0/18（生产对齐默认关闭 trailing）
+  # Phase 2: 并行 job 读快照做回测（无需网络拉取）
+  # 每个时期只生成一次信号台账，再复用到全部退出参数格，避免重复运行全市场漏斗。
   # ────────────────────────────────────────────────
   grid:
-    name: Grid ${{ matrix.period_key }} h${{ matrix.hold_days }} sl${{ matrix.stop_loss }}
+    name: Grid ${{ matrix.period_key }} shared signals
     runs-on: ubuntu-latest
     needs: fetch
     strategy:
       fail-fast: false
-      max-parallel: 24
+      # 六个周期各自独立、互不依赖，全部并行即可。此前 max-parallel: 4 会让
+      # all_defined 分两轮执行，墙钟时间接近翻倍。
+      max-parallel: 6
       matrix:
-        period_key: [recent_6m, bull_2020, bear_2022]
-        hold_days: [10, 15]
-        stop_loss: [-7, -8]
-        trailing_stop: [0]
+        include:
+          - period_key: recent_2m
+            grid_cells: "5:0:0:0,10:0:0:0,10:-7:0:0,15:-8:18:0,20:-8:0:-5"
+          - period_key: recent_6m
+            grid_cells: "5:0:0:0,10:0:0:0,10:-7:0:0,10:-8:0:0,15:-7:0:0,15:-8:0:0,10:-8:0:-8,10:-8:0:-8:5,10:-8:0:-8:7"
+          - period_key: bull_2020
+            grid_cells: "5:0:0:0,10:0:0:0,10:-7:0:0,10:-8:0:0,15:-7:0:0,15:-8:0:0,10:-8:0:-8,10:-8:0:-8:5,10:-8:0:-8:7"
+          - period_key: bear_2022
+            grid_cells: "5:0:0:0,10:0:0:0,10:-7:0:0,10:-8:0:0,15:-7:0:0,15:-8:0:0,10:-8:0:-8,10:-8:0:-8:5,10:-8:0:-8:7"
+          # 2026-08-08 补齐：这两个周期此前只有 fetch 快照、grid 矩阵无对应条目，
+          # 导致 all_defined 实际只跑 4 个周期，parameter_stability 因覆盖不足
+          # 反复判 review。补上后震荡市与高波动市才纳入跨周期稳健性判定。
+          - period_key: sideways_2023
+            grid_cells: "5:0:0:0,10:0:0:0,10:-7:0:0,10:-8:0:0,15:-7:0:0,15:-8:0:0,10:-8:0:-8,10:-8:0:-8:5,10:-8:0:-8:7"
+          - period_key: volatile_2024
+            grid_cells: "5:0:0:0,10:0:0:0,10:-7:0:0,10:-8:0:0,15:-7:0:0,15:-8:0:0,10:-8:0:-8,10:-8:0:-8:5,10:-8:0:-8:7"
     env:
       PYTHONUNBUFFERED: "1"
       TZ: Asia/Shanghai
@@ -172,23 +239,26 @@ jobs:
       TICKFLOW_BASE_URL: ${{ secrets.TICKFLOW_BASE_URL }}
       FUNNEL_AI_SELECTION_MODE: "tradeable_l4"
       FUNNEL_AI_TOTAL_CAP: "8"
-      FUNNEL_AI_RISK_ON_TREND: "3"
-      FUNNEL_AI_RISK_ON_ACCUM: "5"
-      FUNNEL_AI_BEAR_REBOUND_TREND: "1"
-      FUNNEL_AI_BEAR_REBOUND_ACCUM: "2"
+      FUNNEL_AI_MAX_PER_SECTOR: "2"
+      FUNNEL_AI_RISK_ON_TREND: "5"
+      FUNNEL_AI_RISK_ON_ACCUM: "1"
+      FUNNEL_LOSS_GUARD_RISK_ON_PRE5_RET: "35.0"
+      FUNNEL_AI_BEAR_REBOUND_TREND: "0"
+      FUNNEL_AI_BEAR_REBOUND_ACCUM: "0"
       FUNNEL_AI_RISK_OFF_TREND: "0"
       FUNNEL_AI_RISK_OFF_ACCUM: "0"
-      FUNNEL_AI_NEUTRAL_TREND: "2"
-      FUNNEL_AI_NEUTRAL_ACCUM: "3"
+      FUNNEL_AI_NEUTRAL_TREND: "5"
+      FUNNEL_AI_NEUTRAL_ACCUM: "1"
 
     steps:
       - name: Resolve period dates
         id: period
+        env:
+          INPUT_PERIOD: ${{ inputs.period || 'recent_6m' }}
         run: |
-          INPUT_PERIOD="${{ inputs.period || 'recent_6m' }}"
           MATRIX_PERIOD="${{ matrix.period_key }}"
           ACTIVE="false"
-          if [ "$INPUT_PERIOD" = "all_defined" ] || [ "$INPUT_PERIOD" = "$MATRIX_PERIOD" ]; then
+          if { [ "$INPUT_PERIOD" = "all_defined" ] && [ "$MATRIX_PERIOD" != "recent_2m" ]; } || [ "$INPUT_PERIOD" = "$MATRIX_PERIOD" ]; then
             ACTIVE="true"
           elif [ "$INPUT_PERIOD" = "custom" ] && [ "$MATRIX_PERIOD" = "recent_6m" ]; then
             ACTIVE="true"
@@ -207,12 +277,173 @@ jobs:
           fi
           echo "BT_PERIOD_KEY=${PERIOD}" >> "$GITHUB_ENV"
           echo "period_key=${PERIOD}" >> "$GITHUB_OUTPUT"
-          if [ "$PERIOD" = "bull_2020" ]; then
+          if [ "$PERIOD" = "recent_2m" ]; then
+            echo "BT_END=$(TZ=Asia/Shanghai date -d '-1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
+            echo "BT_START=$(TZ=Asia/Shanghai date -d '-2 months -1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "bull_2020" ]; then
             echo "BT_START=2020-07-01" >> "$GITHUB_ENV"
             echo "BT_END=2021-02-18" >> "$GITHUB_ENV"
           elif [ "$PERIOD" = "bear_2022" ]; then
             echo "BT_START=2021-12-13" >> "$GITHUB_ENV"
             echo "BT_END=2022-10-31" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "sideways_2023" ]; then
+            echo "BT_START=2023-01-03" >> "$GITHUB_ENV"
+            echo "BT_END=2023-12-29" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "volatile_2024" ]; then
+            echo "BT_START=2024-01-02" >> "$GITHUB_ENV"
+            echo "BT_END=2024-12-31" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "custom" ]; then
+            if [ -z "$BT_END" ]; then
+              echo "BT_END=$(TZ=Asia/Shanghai date -d '-1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
+            fi
+            if [ -z "$BT_START" ]; then
+              echo "BT_START=$(TZ=Asia/Shanghai date -d '-6 months -1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
+            fi
+          elif [ "$PERIOD" = "recent_6m" ]; then
+            echo "BT_END=$(TZ=Asia/Shanghai date -d '-1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
+            echo "BT_START=$(TZ=Asia/Shanghai date -d '-6 months -1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
+          else
+            # 显式失败而非静默兜底：此前 sideways_2023/volatile_2024 在本 job 缺少
+            # 日期分支，落到"近 6 个月"默认值，于是拿 2026 的日期去查 2023 的快照，
+            # 报"回测区间交易日过少(0)"且看不出原因。矩阵新增周期必须同步这里。
+            echo "::error::未知周期 ${PERIOD}：grid job 缺少日期分支，请同步补充"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.period.outputs.active == 'true'
+
+      - name: Set up Python
+        if: steps.period.outputs.active == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        if: steps.period.outputs.active == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[wbt]"
+
+      - name: Download snapshot
+        if: steps.period.outputs.active == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: backtest-snapshot-${{ steps.period.outputs.period_key }}
+          path: snapshot_data/
+
+      - name: Run grid backtest cell
+        if: steps.period.outputs.active == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          GRID_CELLS="${{ matrix.grid_cells }}"
+          OUT_ROOT="analysis/backtest_grid_actions/${BT_PERIOD_KEY}"
+          echo "OUT_ROOT=${OUT_ROOT}" >> "${GITHUB_ENV}"
+          mkdir -p "${OUT_ROOT}"
+          echo "[grid] period=${BT_PERIOD_KEY} cells=${GRID_CELLS}"
+          # 实盘漏斗不做大盘水温比例截断；回测保持同口径，避免额外砍掉候选。
+          python -u -m scripts.backtest_runner \
+            --start "${BT_START}" \
+            --end "${BT_END}" \
+            --hold-days 10 \
+            --top-n "${BT_TOP_N}" \
+            --board "${BT_BOARD}" \
+            --sample-size "${BT_SAMPLE_SIZE}" \
+            --trading-days "${BT_TRADING_DAYS}" \
+            --abc-filter \
+            --entry-price-mode "${BT_ENTRY_PRICE_MODE}" \
+            --cash-portfolio \
+            --initial-cash "${BT_INITIAL_CASH}" \
+            --max-positions "${BT_MAX_POSITIONS}" \
+            --portfolio-styles "${BT_PORTFOLIO_STYLES}" \
+            --commission-rate "${BT_COMMISSION_RATE}" \
+            --min-commission "${BT_MIN_COMMISSION}" \
+            --stamp-duty-rate "${BT_STAMP_DUTY_RATE}" \
+            --transfer-fee-rate "${BT_TRANSFER_FEE_RATE}" \
+            --exit-mode sltp \
+            --stop-loss 0 \
+            --take-profit 0 \
+            --sltp-priority stop_first \
+            --pending-mode "${BT_PENDING_MODE}" \
+            --execution-regime-gate "${BT_EXECUTION_REGIME_GATE}" \
+            --pending-merge-order confirmed_first \
+            --trailing-stop 0 \
+            --metrics-engine auto \
+            --wbt-n-jobs 2 \
+            --snapshot-dir snapshot_data \
+            --allow-static-meta \
+            --grid-cells "${GRID_CELLS}" \
+            --grid-prefix "backtest-grid-${BT_PERIOD_KEY}" \
+            --output-dir "${OUT_ROOT}" \
+            | tee "${OUT_ROOT}/run.log"
+
+      - name: Upload artifacts
+        if: always() && steps.period.outputs.active == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-grid-${{ steps.period.outputs.period_key }}-${{ github.run_number }}
+          path: ${{ env.OUT_ROOT }}/**
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ────────────────────────────────────────────────
+  # Phase 2b: 固定退出参数，共享信号台账验证 A/M/P 仓位权重
+  # ────────────────────────────────────────────────
+  strategy_compare:
+    name: Strategy ${{ matrix.period_key }} / ${{ matrix.variant_set }}
+    if: ${{ inputs.run_strategy_compare }}
+    runs-on: ubuntu-latest
+    needs: fetch
+    env:
+      FUNNEL_DYNAMIC_POLICY: "off"
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        period_key: [recent_2m, recent_6m, bull_2020, bear_2022, sideways_2023, volatile_2024]
+        # amp  = A,M,P 共享一次信号台账（三者只改入场仓位权重，故可复用）
+        # calib = 仅变体 I（calibrate_confirmed_score），必须独立算台账
+        variant_set: [amp, calib]
+    steps:
+      - name: Resolve period dates
+        id: period
+        env:
+          INPUT_PERIOD: ${{ inputs.period || 'recent_6m' }}
+        run: |
+          MATRIX_PERIOD="${{ matrix.period_key }}"
+          ACTIVE="false"
+          if { [ "$INPUT_PERIOD" = "all_defined" ] && [ "$MATRIX_PERIOD" != "recent_2m" ]; } || [ "$INPUT_PERIOD" = "$MATRIX_PERIOD" ]; then
+            ACTIVE="true"
+          elif [ "$INPUT_PERIOD" = "custom" ] && [ "$MATRIX_PERIOD" = "recent_6m" ]; then
+            ACTIVE="true"
+          fi
+          echo "active=${ACTIVE}" >> "$GITHUB_OUTPUT"
+          if [ "$ACTIVE" != "true" ]; then
+            exit 0
+          fi
+          PERIOD="$MATRIX_PERIOD"
+          if [ "$INPUT_PERIOD" = "custom" ]; then
+            PERIOD="custom"
+          fi
+          echo "BT_PERIOD_KEY=${PERIOD}" >> "$GITHUB_ENV"
+          echo "period_key=${PERIOD}" >> "$GITHUB_OUTPUT"
+          if [ "$PERIOD" = "recent_2m" ]; then
+            echo "BT_END=$(TZ=Asia/Shanghai date -d '-1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
+            echo "BT_START=$(TZ=Asia/Shanghai date -d '-2 months -1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "bull_2020" ]; then
+            echo "BT_START=2020-07-01" >> "$GITHUB_ENV"
+            echo "BT_END=2021-02-18" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "bear_2022" ]; then
+            echo "BT_START=2021-12-13" >> "$GITHUB_ENV"
+            echo "BT_END=2022-10-31" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "sideways_2023" ]; then
+            echo "BT_START=2023-01-03" >> "$GITHUB_ENV"
+            echo "BT_END=2023-12-29" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "volatile_2024" ]; then
+            echo "BT_START=2024-01-02" >> "$GITHUB_ENV"
+            echo "BT_END=2024-12-31" >> "$GITHUB_ENV"
           elif [ "$PERIOD" = "custom" ]; then
             if [ -z "$BT_END" ]; then
               echo "BT_END=$(TZ=Asia/Shanghai date -d '-1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
@@ -248,83 +479,99 @@ jobs:
           name: backtest-snapshot-${{ steps.period.outputs.period_key }}
           path: snapshot_data/
 
-      - name: Run grid backtest cell
+      - name: Resolve strategy variant args
+        if: steps.period.outputs.active == 'true'
+        env:
+          VARIANT_SET: ${{ matrix.variant_set }}
+        run: |
+          if [ "$VARIANT_SET" = "calib" ]; then
+            echo "STRATEGY_VARIANT_ARGS=--strategy-variant I" >> "$GITHUB_ENV"
+          else
+            echo "STRATEGY_VARIANT_ARGS=--strategy-variants A,M,P --strategy-prefix backtest-strategy-${BT_PERIOD_KEY}" >> "$GITHUB_ENV"
+          fi
+
+      # --strategy-variants（复数）会复用一次信号台账，因此只能放"仅改入场仓位
+      # 权重"的变体（A/M/P）。变体 I 启用 calibrate_confirmed_score，改的是确认分、
+      # 会改变台账本身，塞进复数参数会被 backtest.py 的护栏拒绝
+      # （「复用信号台账的策略组只能改变入场仓位权重」）。故 I 走 --strategy-variant
+      # （单数）单独算一次台账，与 amp 组分属不同 matrix 分片，产物也分开命名。
+      # A 组基线在 amp 分片里，故 A vs I 的差值即校准的净效应。
+      #
+      # 注意：shell 续行(\)之间不能插注释，否则命令被截断、后续参数全部丢失
+      # （2026-08-09 曾因此丢掉 --snapshot-dir，回测转为实时拉数据而被限流）。
+      - name: Run strategy ablation cell
         if: steps.period.outputs.active == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          HOLD="${{ matrix.hold_days }}"
-          STOP="${{ matrix.stop_loss }}"
-          TRAIL="${{ matrix.trailing_stop }}"
-          STOP_TAG="${STOP#-}"
-          TRAIL_TAG="${TRAIL#-}"
-          OUT_ROOT="analysis/backtest_grid_actions/${BT_PERIOD_KEY}/h${HOLD}_sl${STOP_TAG}_tr${TRAIL_TAG}"
-          echo "OUT_ROOT=${OUT_ROOT}" >> "${GITHUB_ENV}"
-          mkdir -p "${OUT_ROOT}"
+          OUT_DIR="analysis/backtest_strategy_actions"
+          echo "OUT_DIR=${OUT_DIR}" >> "$GITHUB_ENV"
+          mkdir -p "$OUT_DIR"
+          python -u -m scripts.backtest_runner \
+            --start "$BT_START" \
+            --end "$BT_END" \
+            --hold-days 15 \
+            --top-n "$BT_TOP_N" \
+            --board "$BT_BOARD" \
+            --sample-size "$BT_SAMPLE_SIZE" \
+            --trading-days "$BT_TRADING_DAYS" \
+            $STRATEGY_VARIANT_ARGS \
+            --abc-filter \
+            --entry-price-mode "$BT_ENTRY_PRICE_MODE" \
+            --cash-portfolio \
+            --initial-cash "$BT_INITIAL_CASH" \
+            --max-positions "$BT_MAX_POSITIONS" \
+            --portfolio-styles slot_equal_4 \
+            --commission-rate "$BT_COMMISSION_RATE" \
+            --min-commission "$BT_MIN_COMMISSION" \
+            --stamp-duty-rate "$BT_STAMP_DUTY_RATE" \
+            --transfer-fee-rate "$BT_TRANSFER_FEE_RATE" \
+            --exit-mode sltp \
+            --stop-loss -8 \
+            --take-profit 18 \
+            --sltp-priority stop_first \
+            --pending-mode "$BT_PENDING_MODE" \
+            --execution-regime-gate "$BT_EXECUTION_REGIME_GATE" \
+            --pending-merge-order confirmed_first \
+            --trailing-stop 0 \
+            --metrics-engine auto \
+            --wbt-n-jobs 2 \
+            --snapshot-dir snapshot_data \
+            --allow-static-meta \
+            --output-dir "$OUT_DIR" \
+            | tee "$OUT_DIR/run.log"
 
-          for TP in 0 18; do
-            OUT_DIR="${OUT_ROOT}/backtest-grid-${BT_PERIOD_KEY}-h${HOLD}-sl${STOP_TAG}-tp${TP}-tr${TRAIL_TAG}"
-            mkdir -p "${OUT_DIR}"
-            echo "[grid] period=${BT_PERIOD_KEY} hold=${HOLD} stop=${STOP} tp=${TP} trail=${TRAIL}"
-            python -u -m scripts.backtest_runner \
-              --start "${BT_START}" \
-              --end "${BT_END}" \
-              --hold-days "${HOLD}" \
-              --top-n "${BT_TOP_N}" \
-              --board "${BT_BOARD}" \
-              --sample-size "${BT_SAMPLE_SIZE}" \
-              --trading-days "${BT_TRADING_DAYS}" \
-              --use-current-meta \
-              --regime-filter \
-              --abc-filter \
-              --entry-price-mode "${BT_ENTRY_PRICE_MODE}" \
-              --cash-portfolio \
-              --initial-cash "${BT_INITIAL_CASH}" \
-              --max-positions "${BT_MAX_POSITIONS}" \
-              --portfolio-styles "${BT_PORTFOLIO_STYLES}" \
-              --commission-rate "${BT_COMMISSION_RATE}" \
-              --small-trade-threshold "${BT_SMALL_TRADE_THRESHOLD}" \
-              --small-trade-fee "${BT_SMALL_TRADE_FEE}" \
-              --exit-mode sltp \
-              --stop-loss "${STOP}" \
-              --take-profit "${TP}" \
-              --sltp-priority stop_first \
-              --pending-mode both \
-              --pending-merge-order funnel_first \
-              --trailing-stop "${TRAIL}" \
-              --metrics-engine auto \
-              --wbt-n-jobs 2 \
-              --snapshot-dir snapshot_data \
-              --output-dir "${OUT_DIR}" \
-              | tee "${OUT_DIR}/run.log"
-          done
-
-      - name: Upload artifacts
+      - name: Upload strategy artifact
         if: always() && steps.period.outputs.active == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: backtest-grid-${{ steps.period.outputs.period_key }}-h${{ matrix.hold_days }}-sl${{ matrix.stop_loss }}-tr${{ matrix.trailing_stop }}-${{ github.run_number }}
-          path: ${{ env.OUT_ROOT }}/**
-          retention-days: 7
-          if-no-files-found: warn
+          name: backtest-strategy-${{ steps.period.outputs.period_key }}-${{ matrix.variant_set }}-${{ github.run_number }}
+          path: ${{ env.OUT_DIR }}/**
+          retention-days: 30
+          if-no-files-found: error
 
   # ────────────────────────────────────────────────
   # Phase 3: 汇总 + 飞书通知
   # ────────────────────────────────────────────────
   notify:
     runs-on: ubuntu-latest
-    needs: grid
+    needs: [grid, strategy_compare]
     if: always()
     env:
       FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
     steps:
       - name: Resolve period dates
+        env:
+          PERIOD: ${{ inputs.period || 'recent_6m' }}
         run: |
-          PERIOD="${{ inputs.period || 'recent_6m' }}"
           if [ "$PERIOD" = "all_defined" ]; then
-            echo "BT_PERIOD_LABEL=recent_6m,bull_2020,bear_2022" >> "$GITHUB_ENV"
+            echo "BT_PERIOD_LABEL=recent_6m,bull_2020,bear_2022,sideways_2023,volatile_2024" >> "$GITHUB_ENV"
             echo "BT_START=multi" >> "$GITHUB_ENV"
             echo "BT_END=multi" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "recent_2m" ]; then
+            echo "BT_PERIOD_LABEL=recent_2m" >> "$GITHUB_ENV"
+            echo "BT_END=$(TZ=Asia/Shanghai date -d '-1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
+            echo "BT_START=$(TZ=Asia/Shanghai date -d '-2 months -1 day' +%Y-%m-%d)" >> "$GITHUB_ENV"
           elif [ "$PERIOD" = "bull_2020" ]; then
             echo "BT_PERIOD_LABEL=bull_2020" >> "$GITHUB_ENV"
             echo "BT_START=2020-07-01" >> "$GITHUB_ENV"
@@ -333,6 +580,14 @@ jobs:
             echo "BT_PERIOD_LABEL=bear_2022" >> "$GITHUB_ENV"
             echo "BT_START=2021-12-13" >> "$GITHUB_ENV"
             echo "BT_END=2022-10-31" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "sideways_2023" ]; then
+            echo "BT_PERIOD_LABEL=sideways_2023" >> "$GITHUB_ENV"
+            echo "BT_START=2023-01-03" >> "$GITHUB_ENV"
+            echo "BT_END=2023-12-29" >> "$GITHUB_ENV"
+          elif [ "$PERIOD" = "volatile_2024" ]; then
+            echo "BT_PERIOD_LABEL=volatile_2024" >> "$GITHUB_ENV"
+            echo "BT_START=2024-01-02" >> "$GITHUB_ENV"
+            echo "BT_END=2024-12-31" >> "$GITHUB_ENV"
           elif [ "$PERIOD" = "custom" ]; then
             echo "BT_PERIOD_LABEL=custom" >> "$GITHUB_ENV"
             if [ -z "$BT_END" ]; then
@@ -360,35 +615,75 @@ jobs:
           path: artifacts/
           pattern: backtest-grid-*
 
+      - name: Download strategy comparison artifacts
+        if: ${{ inputs.run_strategy_compare }}
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          pattern: backtest-strategy-*
+
       - name: Install dependencies
-        run: pip install requests
+        run: python -m pip install requests python-dotenv pandas
 
       - name: Update market backtest report
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HYPOTHESIS_ID: ${{ inputs.hypothesis_id || '' }}
         run: |
           python3 scripts/update_backtest_market_report.py \
             --artifacts-dir artifacts \
             --output docs/BACKTEST_MARKET_REPORT.md \
+            --confirmation-output backtest_confirmation.json \
+            --hypothesis-id "$HYPOTHESIS_ID" \
+            --evidence-output research_evidence.json \
+            --stability-output parameter_stability.json \
+            --stability-evidence-output stability_evidence.json \
+            --walk-forward-output walk_forward_validation.json \
             --run-url "$RUN_URL" \
             --generated-at "$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S Asia/Shanghai')"
 
+      - name: Build strategy comparison report
+        if: ${{ inputs.run_strategy_compare }}
+        env:
+          INPUT_PERIOD: ${{ inputs.period || 'recent_6m' }}
+        run: |
+          EXTRA_ARGS=()
+          if [ "$INPUT_PERIOD" = "all_defined" ]; then
+            EXTRA_ARGS+=(--require-complete)
+          fi
+          python3 scripts/build_backtest_strategy_comparison.py \
+            --artifacts-dir artifacts \
+            --markdown-output strategy_ablation_report.md \
+            --json-output strategy_ablation_report.json \
+            "${EXTRA_ARGS[@]}"
+
       - name: Upload market backtest report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: backtest-market-report-${{ github.run_number }}
-          path: docs/BACKTEST_MARKET_REPORT.md
+          path: |
+            docs/BACKTEST_MARKET_REPORT.md
+            backtest_confirmation.json
+            research_evidence.json
+            parameter_stability.json
+            stability_evidence.json
+            walk_forward_validation.json
+            strategy_ablation_report.md
+            strategy_ablation_report.json
           retention-days: 30
           if-no-files-found: error
 
       - name: Aggregate and notify
         shell: bash
         env:
-          BT_TOP_N: "4"
+          BT_TOP_N: "1"
+          BT_ENTRY_PRICE_MODE: ${{ inputs.entry_price_mode || 'open' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           python3 -u - <<'PYEOF'
-          import os, glob, json, re, requests
+          import csv, os, glob, json, re, requests
+          from core.backtest_grid_ranking import rank_robust_params, robust_label as shared_robust_label, weak_period_guardrails
 
           webhook = os.environ.get('FEISHU_WEBHOOK_URL', '').strip()
           if not webhook:
@@ -444,7 +739,7 @@ jobs:
               return parts if len(parts) == 2 else ['', '']
 
           def parse_period(dirname, start, end):
-              m = re.search(r'backtest-grid-(recent_6m|bull_2020|bear_2022|custom)-h', dirname)
+              m = re.search(r'backtest-grid-(recent_2m|recent_6m|bull_2020|bear_2022|custom)-h', dirname)
               if m:
                   return m.group(1)
               if start == '2020-07-01' and end == '2021-02-18':
@@ -485,12 +780,13 @@ jobs:
               return []
 
           period_names = {
+              'recent_2m': '最近2月',
               'recent_6m': '最近6月',
               'bull_2020': '牛市',
               'bear_2022': '熊市',
               'custom': '自定义',
           }
-          period_order = {'recent_6m': 0, 'bull_2020': 1, 'bear_2022': 2, 'custom': 3}
+          period_order = {'recent_2m': 0, 'recent_6m': 1, 'bull_2020': 2, 'bear_2022': 3, 'custom': 4}
           style_names = {
               'slot_equal_4': '等额四仓',
               'probe_add': '观察补仓',
@@ -512,6 +808,67 @@ jobs:
           def style_sort_key(style):
               return (style_order.get(style, 99), style)
 
+          def strategy_policy_summary(rows):
+              policies = sorted({str(c.get('strategy_policy') or '').strip() for c in rows if str(c.get('strategy_policy') or '').strip()})
+              if not policies:
+                  return '未写入'
+              if len(policies) == 1:
+                  return policies[0]
+              suffix = f'；等{len(policies)}项' if len(policies) > 3 else ''
+              return '多口径: ' + '；'.join(policies[:3]) + suffix
+
+          def find_cash_trades_path(summary_path, style):
+              base_dir = os.path.dirname(summary_path)
+              matches = sorted(glob.glob(os.path.join(base_dir, f'cash_trades_{style}_*.csv')))
+              return matches[0] if matches else ''
+
+          def read_cash_trades(path):
+              if not path or not os.path.exists(path):
+                  return []
+              with open(path, newline='', encoding='utf-8-sig') as f:
+                  return list(csv.DictReader(f))
+
+          def fmt_trade_price(raw):
+              value = parse_num(raw)
+              return f'{value:.2f}' if value is not None else '-'
+
+          def fmt_trade_pct(raw):
+              value = parse_num(raw)
+              return f'{value:+.1f}%' if value is not None else '-'
+
+          def trade_line(idx, row):
+              entry_date = str(row.get('entry_date') or row.get('signal_date') or '')[5:]
+              exit_date = str(row.get('exit_date') or '')[5:]
+              code = str(row.get('code') or '-')
+              name = str(row.get('name') or '')[:6]
+              trigger = str(row.get('trigger') or '-').replace('、', '+')
+              reason = str(row.get('exit_reason') or '-')
+              shares = parse_num(row.get('shares')) or 0
+              return (
+                  f'{idx}. {entry_date}->{exit_date} {code} {name} '
+                  f'{fmt_trade_pct(row.get("ret_pct"))} {fmt_trade_price(row.get("entry_price"))}'
+                  f'→{fmt_trade_price(row.get("exit_price"))} {int(shares)}股 {trigger}/{reason}'
+              )
+
+          def split_text_cards(title, lines, template, max_bytes=85000):
+              cards = []
+              current = []
+              for line in lines:
+                  candidate = current + [line]
+                  candidate_elements = [{'tag': 'div', 'text': {'tag': 'lark_md', 'content': title + '\n' + '\n'.join(candidate)}}]
+                  if current and payload_size(card_payload('📊 Backtest Grid 交易记录', template, candidate_elements)) > max_bytes:
+                      cards.append(current)
+                      current = [line]
+                  else:
+                      current = candidate
+              if current:
+                  cards.append(current)
+              total = len(cards)
+              return [
+                  [{'tag': 'div', 'text': {'tag': 'lark_md', 'content': f'{title} {idx}/{total}\n' + '\n'.join(batch)}}]
+                  for idx, batch in enumerate(cards, 1)
+              ]
+
           cells = []
           for sf in summaries:
               dirname = os.path.basename(os.path.dirname(sf))
@@ -525,6 +882,7 @@ jobs:
                   content = f.read()
               start, end = parse_range(content)
               base_cell = {
+                  'summary_path': sf,
                   'period': parse_period(dirname, start, end),
                   'start': start,
                   'end': end,
@@ -539,6 +897,7 @@ jobs:
                   'trades': extract(content, '成交样本'),
                   'calmar': extract(content, '卡玛比'),
                   'cash_initial': extract_exact(content, '初始现金'),
+                  'strategy_policy': extract_text(content, '策略治理调权'),
               }
               style_rows = parse_style_rows(content) or [{
                   '风格ID': 'slot_equal_4',
@@ -555,6 +914,7 @@ jobs:
                   cell.update({
                       'style': style,
                       'style_label': style_label(style, style_row.get('风格', '')),
+                      'cash_trades_path': find_cash_trades_path(sf, style),
                       'cash_final': parse_num(style_row.get('最终现金')),
                       'cash_return': parse_num(style_row.get('总收益')),
                       'cash_mdd': parse_num(style_row.get('现金回撤')),
@@ -565,6 +925,14 @@ jobs:
 
           def fmt(v, spec):
               return format(v, spec) if v is not None else '-'
+
+          def sl_label(v):
+              value = int(v or 0)
+              return '无SL' if value == 0 else f'SL-{value}%'
+
+          def sl_axis_label(v):
+              value = int(v or 0)
+              return '无SL' if value == 0 else f'-{value}%'
 
           def sharp_flag(v):
               if v is None:
@@ -606,32 +974,72 @@ jobs:
           def rank_value(c):
               return c.get('cash_return') if c.get('cash_return') is not None else c.get('sharpe')
 
+          def fixed_hold_baseline_lines(valid_cells, period_keys):
+              baseline = [
+                  c for c in valid_cells
+                  if c.get('hold') in {5, 10}
+                  and int(c.get('sl') or 0) == 0
+                  and int(c.get('tp') or 0) == 0
+                  and int(c.get('tr') or 0) == 0
+                  and rank_value(c) is not None
+              ]
+              if not baseline:
+                  return []
+              periods_for_baseline = period_keys or sorted(
+                  {c.get('period', '') for c in baseline if c.get('period')},
+                  key=period_sort_key,
+              )
+              lines = ['**固定持有旁路基准（无SL/无TP/无Trail）**']
+              for period in periods_for_baseline:
+                  for hold in (5, 10):
+                      subset = [c for c in baseline if c.get('period') == period and c.get('hold') == hold]
+                      if not subset:
+                          continue
+                      best_cell = max(subset, key=rank_value)
+                      lines.append(
+                          f'- {period_label(period)} {hold}天: '
+                          f'{style_label(best_cell.get("style", ""), best_cell.get("style_label", ""))}，'
+                          f'现金收益 {fmt(best_cell.get("cash_return"), "+.2f")}%，'
+                          f'现金回撤 {fmt(best_cell.get("cash_mdd") if best_cell.get("cash_mdd") is not None else best_cell.get("mdd"), ".1f")}%，'
+                          f'夏普 {fmt(best_cell.get("sharpe"), ".3f")}'
+                      )
+              return lines if len(lines) > 1 else []
+
           def robust_key(c):
               return (c.get('style', ''), c.get('hold'), c.get('sl'), c.get('tp'), c.get('tr'))
 
           def robust_representative(group):
+              recent_2m = [c for c in group if c.get('period') == 'recent_2m']
+              if recent_2m:
+                  return max(recent_2m, key=rank_value)
               recent = [c for c in group if c.get('period') == 'recent_6m']
               return max(recent or group, key=rank_value)
 
           def robust_scores(cells_for_rank):
-              groups = {}
-              for c in cells_for_rank:
-                  groups.setdefault(robust_key(c), []).append(c)
-              out = []
-              for group in groups.values():
-                  by_period = {}
-                  for c in group:
-                      p = c.get('period') or '-'
-                      if p not in by_period or rank_value(c) > rank_value(by_period[p]):
-                          by_period[p] = c
-                  values = [rank_value(c) for c in by_period.values() if rank_value(c) is not None]
-                  if not values:
-                      continue
-                  recent = rank_value(by_period['recent_6m']) if 'recent_6m' in by_period else 0.0
-                  positive = sum(1 for v in values if v > 0)
-                  score = min(values) + sum(values) / len(values) * 0.35 + recent * 0.2 + positive * 4.0
-                  out.append({'cell': robust_representative(group), 'score': score, 'values': values, 'positive': positive})
-              return sorted(out, key=lambda x: x['score'], reverse=True)
+              return rank_robust_params(
+                  cells_for_rank,
+                  key_fn=robust_key,
+                  period_fn=lambda c: c.get('period') or '-',
+                  value_fn=rank_value,
+                  representative_fn=robust_representative,
+              )
+
+          def robust_label(rb):
+              return shared_robust_label(rb)
+
+          def period_guardrail_lines(valid_cells, period_keys):
+              known = set(period_keys)
+              guards = weak_period_guardrails(
+                  valid_cells,
+                  period_fn=lambda c: c.get('period') or '-',
+                  value_fn=rank_value,
+              )
+              lines = [
+                  f'- ⚠️ {period_label(g.period_key)}全部组合非正，最优 {fmt(g.best_value, "+.2f")}%，建议该周期默认空仓/影子观察。'
+                  for g in guards
+                  if g.period_key in known
+              ]
+              return lines
 
           def card_payload(title, template, card_elements):
               return {
@@ -664,7 +1072,7 @@ jobs:
               mark = '🏆 ' if is_best else ''
               tp_s = f'TP{c["tp"]}%' if c['tp'] else '无TP'
               tr_s = f'Trail-{c["tr"]}%' if c['tr'] else '无Trail'
-              combo = f'{style_label(c.get("style", ""), c.get("style_label", ""))} / {c["hold"]}天 / SL-{c["sl"]}% / {tp_s} / {tr_s}'
+              combo = f'{style_label(c.get("style", ""), c.get("style_label", ""))} / {c["hold"]}天 / {sl_label(c["sl"])} / {tp_s} / {tr_s}'
               if len(periods) > 1:
                   combo = f'{period_label(c.get("period", ""))} · {combo}'
               return (
@@ -706,10 +1114,14 @@ jobs:
 
           elements = []
           ranking_cards = []
+          trade_cards = []
           run_url = os.environ.get('RUN_URL', '')
           bt_start = os.environ.get('BT_START', '?')
           bt_end = os.environ.get('BT_END', '?')
           bt_topn = os.environ.get('BT_TOP_N', '?')
+          bt_entry_mode = os.environ.get('BT_ENTRY_PRICE_MODE', 'close')
+          entry_mode_labels = {'open': 'T+1开盘价', 'close': 'T+1收盘价', 'tail_1455': 'T+1 14:55价'}
+          entry_mode_text = entry_mode_labels.get(bt_entry_mode, bt_entry_mode)
           periods = sorted(set(c.get('period', '') for c in cells if c.get('period')), key=period_sort_key)
           styles = sorted(set(c.get('style', '') for c in cells if c.get('style')), key=style_sort_key)
           param_shapes = sorted(set((c.get('hold'), c.get('sl'), c.get('tp'), c.get('tr')) for c in cells))
@@ -739,7 +1151,7 @@ jobs:
               unit_text = '共 0 单元'
 
           elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
-              'content': f'**周期** {period_text}  ·  **风格** {style_text}  ·  **区间** {range_text}  ·  **TopN** {bt_topn}  ·  **{unit_text}**\n[查看详情]({run_url})'}})
+              'content': f'**周期** {period_text}  ·  **风格** {style_text}  ·  **区间** {range_text}  ·  **TopN** {bt_topn}  ·  **入场价** {entry_mode_text}  ·  **{unit_text}**\n[查看详情]({run_url})'}})
 
           best = None
           if not cells:
@@ -751,7 +1163,7 @@ jobs:
                   elements.append({'tag': 'div', 'text': {'tag': 'lark_md', 'content': '⚠️ 结果文件存在，但未解析到有效现金收益或夏普指标'}})
               else:
                   robust_ranked = robust_scores(valid) if len(periods) > 1 else []
-                  best = robust_ranked[0]['cell'] if robust_ranked else max(valid, key=rank_value)
+                  best = robust_ranked[0].best_cell if robust_ranked else max(valid, key=rank_value)
                   ranked = sorted(valid, key=rank_value, reverse=True)
                   pos_cnt = sum(1 for c in valid if (rank_value(c) or 0) > 0)
                   neg_cnt = sum(1 for c in valid if (rank_value(c) or 0) <= 0)
@@ -762,9 +1174,9 @@ jobs:
                   best_period = f'（{period_label(best.get("period", ""))}）' if len(periods) > 1 else ''
                   tp_str = f'TP{best["tp"]}%' if best['tp'] else '无止盈'
                   tr_str = f'移动止盈-{best["tr"]}%' if best['tr'] else '无移动止盈'
-                  best_label = '稳健参数（跨周期惩罚）' if robust_ranked else '最优参数（按现金收益）'
+                  best_label = robust_label(robust_ranked[0]) if robust_ranked else '最优参数（按现金收益）'
                   elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
-                      'content': f'{tag} **{best_label}{best_period}**: {style_label(best.get("style", ""), best.get("style_label", ""))} / 持有{best["hold"]}天 / SL-{best["sl"]}% / {tp_str} / {tr_str}'}})
+                      'content': f'{tag} **{best_label}{best_period}**: {style_label(best.get("style", ""), best.get("style_label", ""))} / 持有{best["hold"]}天 / {sl_label(best["sl"])} / {tp_str} / {tr_str}'}})
 
                   cols = [
                       ('**现金收益**', f'{fmt(best.get("cash_return"), "+.2f")}%'),
@@ -785,10 +1197,28 @@ jobs:
                       'content': f'**策略体检**: {risk_comment(best)}  ·  正现金收益组合 {pos_cnt} / 非正现金收益组合 {neg_cnt}'}})
                   elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
                       'content': f'**逐笔辅助指标**: 夏普 {sharp_flag(best.get("sharpe"))} {fmt(best.get("sharpe"), ".3f")}，胜率 {fmt(best.get("win"), ".1f")}%，均收 {fmt(best.get("avg"), "+.2f")}%'}})
+                  elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
+                      'content': f'**策略治理调权**: {strategy_policy_summary(valid)}'}})
                   if robust_ranked:
                       rb = robust_ranked[0]
                       elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
-                          'content': f'**跨周期稳健性**: 正收益周期 {rb["positive"]}/{len(rb["values"])}，最差周期 {fmt(min(rb["values"]), "+.2f")}%，稳健分 {fmt(rb["score"], ".2f")}'}})
+                          'content': f'**跨周期稳健性**: 正收益周期 {rb.positive_periods}/{len(rb.values)}，最差周期 {fmt(min(rb.values), "+.2f")}%，稳健分 {fmt(rb.score, ".2f")}'}})
+                      guardrails = period_guardrail_lines(valid, periods)
+                      if guardrails:
+                          elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
+                              'content': '**周期风控提示**\n' + '\n'.join(guardrails)}})
+
+                  best_trade_rows = read_cash_trades(best.get('cash_trades_path'))
+                  if best_trade_rows:
+                      best_trade_rows = sorted(
+                          best_trade_rows,
+                          key=lambda row: (str(row.get('entry_date') or ''), str(row.get('code') or '')),
+                      )
+                      trade_lines = [trade_line(idx, row) for idx, row in enumerate(best_trade_rows, 1)]
+                      title = f'**最优组合完整交易记录**（{len(best_trade_rows)}笔 · {style_label(best.get("style", ""), best.get("style_label", ""))}）'
+                      trade_cards = split_text_cards(title, trade_lines, 'blue')
+                      elements.append({'tag': 'div', 'text': {'tag': 'lark_md',
+                          'content': f'**交易记录**: 最优组合 {len(best_trade_rows)} 笔，已拆成 {len(trade_cards)} 张高密明细卡发送。'}})
 
                   if len(periods) > 1:
                       elements.append({'tag': 'hr'})
@@ -801,7 +1231,7 @@ jobs:
                           tp_s = f'TP{b["tp"]}%' if b['tp'] else '无TP'
                           tr_s = f'Trail-{b["tr"]}%' if b['tr'] else '无Trail'
                           lines.append(
-                              f'- {period_label(period)}: {style_label(b.get("style", ""), b.get("style_label", ""))} / {b["hold"]}天 / SL-{b["sl"]}% / {tp_s} / {tr_s}，'
+                              f'- {period_label(period)}: {style_label(b.get("style", ""), b.get("style_label", ""))} / {b["hold"]}天 / {sl_label(b["sl"])} / {tp_s} / {tr_s}，'
                               f'现金收益 {fmt(b.get("cash_return"), "+.2f")}%，夏普 {fmt(b.get("sharpe"), ".3f")}'
                           )
                       elements.append({'tag': 'div', 'text': {'tag': 'lark_md', 'content': '\n'.join(lines)}})
@@ -817,10 +1247,15 @@ jobs:
                           tp_s = f'TP{b["tp"]}%' if b['tp'] else '无TP'
                           tr_s = f'Trail-{b["tr"]}%' if b['tr'] else '无Trail'
                           lines.append(
-                              f'- {style_label(style, b.get("style_label", ""))}: {period_label(b.get("period", ""))} / {b["hold"]}天 / SL-{b["sl"]}% / {tp_s} / {tr_s}，'
+                              f'- {style_label(style, b.get("style_label", ""))}: {period_label(b.get("period", ""))} / {b["hold"]}天 / {sl_label(b["sl"])} / {tp_s} / {tr_s}，'
                               f'现金收益 {fmt(b.get("cash_return"), "+.2f")}%'
                           )
                       elements.append({'tag': 'div', 'text': {'tag': 'lark_md', 'content': '\n'.join(lines)}})
+
+                  baseline_lines = fixed_hold_baseline_lines(valid, periods)
+                  if baseline_lines:
+                      elements.append({'tag': 'hr'})
+                      elements.append({'tag': 'div', 'text': {'tag': 'lark_md', 'content': '\n'.join(baseline_lines)}})
 
                   # 参数梯队完整排名拆成后续轻量卡片，避免飞书 100KB 单卡上限。
                   elements.append({'tag': 'hr'})
@@ -846,7 +1281,7 @@ jobs:
                           {'tag': 'div', 'text': {'tag': 'lark_md', 'content': '**持有\\\\SL**'}}]}]
                       for s in sls:
                           hdr_cols.append({'tag': 'column', 'width': 'weighted', 'weight': 1, 'elements': [
-                              {'tag': 'div', 'text': {'tag': 'lark_md', 'content': f'**-{s}%**'}}]})
+                              {'tag': 'div', 'text': {'tag': 'lark_md', 'content': f'**{sl_axis_label(s)}**'}}]})
                       elements.append({'tag': 'column_set', 'flex_mode': 'stretch',
                           'background_style': 'grey', 'columns': hdr_cols})
                       # Data rows
@@ -864,6 +1299,8 @@ jobs:
 
           template = 'blue' if (best and (rank_value(best) or 0) > 0) else 'orange' if cells else 'red'
           ok = post_card('📊 Backtest Grid 回测完成', template, elements)
+          for idx, card_elements in enumerate(trade_cards, 1):
+              ok = post_card(f'📊 Backtest Grid 最优交易记录 {idx}/{len(trade_cards)}', 'blue', card_elements) and ok
           for idx, card_elements in enumerate(ranking_cards, 1):
               ok = post_card(f'📊 Backtest Grid 参数梯队 {idx}/{len(ranking_cards)}', 'blue', card_elements) and ok
           if not ok:

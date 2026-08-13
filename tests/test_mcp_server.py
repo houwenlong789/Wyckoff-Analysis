@@ -29,14 +29,12 @@ def import_mcp_server(monkeypatch):
     return importlib.import_module("mcp_server")
 
 
-def test_run_funnel_simulation_maps_main_chinext_and_restores_env(monkeypatch):
+def test_run_funnel_simulation_maps_main_chinext_without_mutating_env(monkeypatch):
     mcp_server = import_mcp_server(monkeypatch)
-    captured_env = {}
+    captured_kwargs = {}
 
     def fake_run(*args, **kwargs):
-        captured_env["mode"] = os.environ.get("FUNNEL_POOL_MODE")
-        captured_env["board"] = os.environ.get("FUNNEL_POOL_BOARD")
-        captured_env["executor"] = os.environ.get("FUNNEL_EXECUTOR_MODE")
+        captured_kwargs.update(kwargs)
         return (
             True,
             [{"code": "000001"}],
@@ -47,18 +45,82 @@ def test_run_funnel_simulation_maps_main_chinext_and_restores_env(monkeypatch):
             },
         )
 
-    fake_funnel = ModuleType("scripts.wyckoff_funnel")
+    fake_funnel = ModuleType("workflows.wyckoff_funnel")
     fake_funnel.run = fake_run
-    monkeypatch.setitem(sys.modules, "scripts.wyckoff_funnel", fake_funnel)
+    monkeypatch.setitem(sys.modules, "workflows.wyckoff_funnel", fake_funnel)
     monkeypatch.setenv("FUNNEL_POOL_MODE", "manual")
     monkeypatch.setenv("FUNNEL_POOL_BOARD", "chinext")
     monkeypatch.setenv("FUNNEL_EXECUTOR_MODE", "process")
 
-    result = mcp_server.run_funnel_simulation(board="main_chinext")
+    result = mcp_server.run_funnel_simulation(board="main_chinext", limit=12)
 
     assert result["success"] is True
-    assert captured_env == {"mode": "board", "board": "all", "executor": "thread"}
+    assert captured_kwargs["pool_board"] == "main_chinext_star"
+    assert captured_kwargs["pool_limit_count"] == 12
+    assert captured_kwargs["executor_mode"] == "thread"
     assert result["details"] == {"metrics": {"layer1": 1}}
     assert os.environ["FUNNEL_POOL_MODE"] == "manual"
     assert os.environ["FUNNEL_POOL_BOARD"] == "chinext"
     assert os.environ["FUNNEL_EXECUTOR_MODE"] == "process"
+
+
+def test_run_funnel_simulation_rejects_invalid_limit_before_pipeline(monkeypatch):
+    mcp_server = import_mcp_server(monkeypatch)
+    called = False
+
+    def fake_run(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return True, [], {}, {}
+
+    fake_funnel = ModuleType("workflows.wyckoff_funnel")
+    fake_funnel.run = fake_run
+    monkeypatch.setitem(sys.modules, "workflows.wyckoff_funnel", fake_funnel)
+
+    result = mcp_server.run_funnel_simulation(limit=3001)
+
+    assert "limit 最大支持 3000" in result["error"]
+    assert called is False
+
+
+def test_query_history_supports_attribution_source(monkeypatch):
+    mcp_server = import_mcp_server(monkeypatch)
+    captured = {}
+
+    def fake_query_history(**kwargs):
+        captured.update(kwargs)
+        return {
+            "latest_operator_summary": "下一步=继续观察；作用范围=漏斗shadow",
+            "latest_execution_state": {"scope": "funnel_shadow"},
+        }
+
+    monkeypatch.setattr(mcp_server, "_query_history", fake_query_history)
+
+    result = mcp_server.query_history(source="attribution", limit=1)
+
+    assert captured["source"] == "attribution"
+    assert captured["limit"] == 1
+    assert "作用范围=漏斗shadow" in result["latest_operator_summary"]
+    assert result["latest_execution_state"]["scope"] == "funnel_shadow"
+
+
+def test_research_hypothesis_maps_mcp_arguments(monkeypatch):
+    mcp_server = import_mcp_server(monkeypatch)
+    captured = {}
+
+    def fake_research_hypothesis(**kwargs):
+        captured.update(kwargs)
+        return {"status": "created", "hypothesis": {"hypothesis_id": "hyp_1"}}
+
+    monkeypatch.setattr(mcp_server, "_research_hypothesis", fake_research_hypothesis)
+
+    result = mcp_server.research_hypothesis(
+        action="create",
+        title="Spring 样本外",
+        thesis="Spring 在风险开启期具有正收益",
+        invalidation_criteria="十日均值收益为负",
+    )
+
+    assert result["hypothesis"]["hypothesis_id"] == "hyp_1"
+    assert captured["title"] == "Spring 样本外"
+    assert captured["invalidation_criteria"] == "十日均值收益为负"

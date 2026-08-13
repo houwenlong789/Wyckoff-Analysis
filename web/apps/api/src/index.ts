@@ -1,39 +1,22 @@
-import { Hono } from 'hono'
-import { cors } from 'hono/cors'
-import { chatRoutes } from './routes/chat'
+import { agentRunRoutes } from './routes/agent-runs'
+import { createApiApp } from './app'
 import { portfolioRoutes } from './routes/portfolio'
 import { settingsRoutes } from './routes/settings'
+import { workerChatRoutes } from './routes/worker-chat'
+import { handleAgentRunQueue } from './services/agent-run-queue'
+import type { AgentRunMessage } from './services/agent-run'
+import type { Env } from './app'
 
-export type Env = {
-  SUPABASE_URL?: string
-  SUPABASE_ANON_KEY?: string
-  SUPABASE_SERVICE_ROLE_KEY?: string
-  VITE_SUPABASE_URL?: string
-  VITE_SUPABASE_ANON_KEY?: string
-  TICKFLOW_API_BASE?: string
-  CHAT_DAILY_LIMIT_PER_USER?: string
-  CHAT_MIN_INTERVAL_MS?: string
-  CHAT_TOOL_APPROVAL_SECRET?: string
-}
+export type { Env } from './app'
+export { AgentRunNotifier } from './durable/agent-run-notifier'
 
-const app = new Hono<{ Bindings: Env }>()
-
-app.use('*', cors({
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:5175',
-    'http://127.0.0.1:5173',
-    'http://127.0.0.1:5175',
-    'https://wyckoff-analysis.pages.dev',
-    'https://wyckoff.pages.dev',
-  ],
-  credentials: true,
-}))
-
-app.get('/api/health', (c) => c.json({ status: 'ok' }))
-
-app.route('/api/chat', chatRoutes)
+export const app = createApiApp()
+app.route('/api/chat', workerChatRoutes)
+app.route('/api/agent-runs', agentRunRoutes)
 app.route('/api/portfolio', portfolioRoutes)
 app.route('/api/settings', settingsRoutes)
 
-export default app
+export default {
+  fetch: app.fetch,
+  queue: (batch, env) => handleAgentRunQueue(batch, env),
+} satisfies ExportedHandler<Env, AgentRunMessage>

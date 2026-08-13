@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import queue
 import re
+import threading
+from pathlib import Path
 from typing import Any
 
+from cli.context_archive import create_context_archive
 from cli.model_metadata import UNKNOWN_MODEL_CONTEXT_WINDOW, infer_context_window
 
 logger = logging.getLogger(__name__)
@@ -17,8 +21,24 @@ MAX_COMPACT_RESERVE_TOKENS = 32_768
 TAIL_KEEP = 4
 DEFAULT_RECENT_KEEP_TOKENS = 20_000
 MIN_RECENT_KEEP_TOKENS = 4_000
+COMPACTION_STREAM_TIMEOUT = 30.0
 
 _CODE_RE = re.compile(r"\d{6}")
+_FILE_RE = re.compile(r"(?:[\w.-]+/)+[\w.-]+")
+_IMPORTANT_TERMS = (
+    "失败",
+    "报错",
+    "止损",
+    "止盈",
+    "持仓",
+    "建仓",
+    "提交",
+    "回测",
+    "supabase",
+    "sqlite",
+    "todo",
+    "error",
+)
 
 
 def resolve_context_window(model_name: str = "", context_window: int | None = None) -> int:
@@ -59,15 +79,47 @@ def get_recent_keep_tokens(model_name: str = "", context_window: int | None = No
 # ---------------------------------------------------------------------------
 
 
+def estimate_text_tokens(text: str) -> int:
+    """字符级 token 估算，对 CJK 取保守（偏大）值。
+
+    实测 poolside/laguna-xs-2.1 上原式 ``max(len//2, utf8_len//3)`` 的估算/实际比：
+    纯中文 0.79x、中英混合 0.86x、JSON 0.97x、纯英文 2.87x。英文侧高估无害（只是
+    压缩早触发），但**中文侧低估会让超限兜底放过真正超窗的请求**——实测一份估算
+    228,014 的纯中文历史实际是 274,938 tokens，直接被网关 400 拒绝。
+
+    因此 CJK 字符按每字 1.3 token 计（覆盖实测最差 0.79x ≈ 1.27 倍缺口），
+    其余字符沿用 utf8/3 与 len/2 的较大值。
+    """
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if _is_cjk(ch))
+    rest = text if cjk == 0 else "".join(ch for ch in text if not _is_cjk(ch))
+    rest_tokens = max(len(rest) // 2, len(rest.encode("utf-8")) // 3)
+    return int(cjk * _CJK_TOKENS_PER_CHAR) + rest_tokens
+
+
+def _is_cjk(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0x4E00 <= code <= 0x9FFF  # CJK 统一汉字
+        or 0x3400 <= code <= 0x4DBF  # 扩展 A
+        or 0xF900 <= code <= 0xFAFF  # 兼容汉字
+        or 0x3000 <= code <= 0x303F  # CJK 标点
+        or 0xFF00 <= code <= 0xFFEF  # 全角字符
+        or 0x3040 <= code <= 0x30FF  # 日文假名
+        or 0xAC00 <= code <= 0xD7AF  # 韩文音节
+    )
+
+
 def estimate_tokens(messages: list[dict[str, Any]]) -> int:
     total = 0
     for m in messages:
         content = m.get("content", "")
         if isinstance(content, str):
-            total += max(len(content) // 2, len(content.encode("utf-8")) // 3)
+            total += estimate_text_tokens(content)
         for tc in m.get("tool_calls", []):
             args_str = json.dumps(tc.get("args", {}), ensure_ascii=False)
-            total += len(args_str) // 3
+            total += estimate_text_tokens(args_str)
     return total
 
 
@@ -110,6 +162,10 @@ def _summarize_tool_result(name: str, content: str, max_len: int = 400) -> str:
             "health",
             "positions",
             "message",
+            "data_status",
+            "grade",
+            "action",
+            "score",
         ):
             if key in data:
                 kept[key] = data[key]
@@ -156,6 +212,8 @@ def _summarize_tool_result(name: str, content: str, max_len: int = 400) -> str:
 
 
 SHRINK_THRESHOLD = 800
+MIN_SUMMARY_CHARS = 20
+_CJK_TOKENS_PER_CHAR = 1.3
 
 
 def shrink_stale_tool_results(messages: list[dict[str, Any]]) -> int:
@@ -206,6 +264,133 @@ def serialize_messages_for_compaction(messages: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def score_message_importance(message: dict[str, Any], index: int, total: int) -> float:
+    content = str(message.get("content", "") or "")
+    role = str(message.get("role", ""))
+    score = index / max(total, 1)
+    if role == "user":
+        score += 3.0
+    if role == "tool":
+        score += 1.0
+    if message.get("tool_calls"):
+        score += 1.5
+    if _CODE_RE.search(content):
+        score += 2.0
+    if _FILE_RE.search(content):
+        score += 1.5
+    if any(term in content.lower() for term in _IMPORTANT_TERMS):
+        score += 2.0
+    return score
+
+
+def select_anchor_messages(messages: list[dict[str, Any]], *, max_items: int = 6) -> list[dict[str, Any]]:
+    scored = [
+        (score_message_importance(message, idx, len(messages)), idx, message)
+        for idx, message in enumerate(messages)
+        if str(message.get("content", "") or "").strip()
+    ]
+    top = sorted(scored, key=lambda item: item[0], reverse=True)[:max_items]
+    anchors: list[dict[str, Any]] = []
+    for _score, idx, message in sorted(top, key=lambda item: item[1]):
+        content = str(message.get("content", "") or "").strip()
+        anchors.append({"index": idx, "role": message.get("role", ""), "content": content[:220]})
+    return anchors
+
+
+def _format_compacted_summary(summary: str, archive_meta: dict[str, Any] | None, anchors: list[dict[str, Any]]) -> str:
+    lines = ["[对话摘要]", summary.strip()]
+    if anchors:
+        lines.append("\n[动态保留片段]")
+        for item in anchors[:6]:
+            lines.append(f"- #{item['index']} {item['role']}: {item['content']}")
+    if archive_meta:
+        ref = archive_meta.get("archive_ref", "")
+        codes = ", ".join((archive_meta.get("codes") or [])[:8])
+        lines.append("\n[可恢复归档]")
+        lines.append(f"- {ref}")
+        if codes:
+            lines.append(f"- 涉及标的：{codes}")
+    return "\n".join(lines)
+
+
+def _compact_return(messages, compacted: bool, metadata: dict[str, Any] | None, include_metadata: bool):
+    if include_metadata:
+        return messages, compacted, metadata
+    return messages, compacted
+
+
+def _build_summary_input(head: list[dict[str, Any]]) -> str:
+    head_for_summary = [dict(m) for m in head]
+    shrink_stale_tool_results(head_for_summary)
+    return serialize_messages_for_compaction(head_for_summary)
+
+
+def _iter_stream_with_timeout(stream, timeout: float | None = None):
+    timeout = COMPACTION_STREAM_TIMEOUT if timeout is None else timeout
+    q: queue.Queue = queue.Queue()
+    sentinel = object()
+    exception_marker = object()
+
+    def _producer() -> None:
+        try:
+            for chunk in stream:
+                q.put(chunk)
+            q.put(sentinel)
+        except BaseException as exc:
+            q.put((exception_marker, exc))
+
+    thread = threading.Thread(target=_producer, daemon=True)
+    thread.start()
+
+    while True:
+        try:
+            item = q.get(timeout=timeout)
+        except queue.Empty as exc:
+            if hasattr(stream, "close"):
+                try:
+                    stream.close()
+                except Exception:
+                    logger.debug("compaction stream close failed after timeout", exc_info=True)
+            raise TimeoutError(f"compaction stream idle timeout after {timeout:.0f}s") from exc
+        if item is sentinel:
+            return
+        if isinstance(item, tuple) and len(item) == 2 and item[0] is exception_marker:
+            raise item[1]
+        yield item
+
+
+def _collect_stream_text(provider: Any, messages: list[dict[str, Any]], system_prompt: str) -> str:
+    stream = provider.chat_stream(messages, [], system_prompt)
+    chunks = _iter_stream_with_timeout(stream)
+    return "".join(c.get("text", "") for c in chunks if c.get("type") == "text_delta")
+
+
+def _run_compaction_summary(provider: Any, head_text: str) -> str:
+    return _collect_stream_text(provider, [{"role": "user", "content": head_text}], COMPACTION_PROMPT)
+
+
+def _create_archive_safely(
+    head: list[dict[str, Any]],
+    summary: str,
+    session_id: str,
+    archive_dir: str | Path | None,
+    tail_start: int,
+    anchors: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    try:
+        return create_context_archive(
+            head,
+            summary,
+            session_id=session_id,
+            archive_dir=archive_dir,
+            tail_start=tail_start,
+            anchors=anchors,
+        )
+    except Exception:
+        logger.debug("context archive write failed", exc_info=True)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Memory Flush — 压缩前提取持久事实
 # ---------------------------------------------------------------------------
@@ -244,14 +429,7 @@ def flush_memory_before_compaction(
 
     text = "\n".join(lines[-20:])
     try:
-        chunks = list(
-            provider.chat_stream(
-                [{"role": "user", "content": text}],
-                [],
-                _FLUSH_PROMPT,
-            )
-        )
-        result = "".join(c.get("text", "") for c in chunks if c.get("type") == "text_delta")
+        result = _collect_stream_text(provider, [{"role": "user", "content": text}], _FLUSH_PROMPT)
         if not result or "无" in result.strip()[:5]:
             return
 
@@ -411,45 +589,97 @@ def compact_messages(
     provider: Any,
     model_name: str = "",
     context_window: int | None = None,
-) -> tuple[list[dict[str, Any]], bool]:
+    *,
+    session_id: str = "",
+    archive_dir: str | Path | None = None,
+    include_metadata: bool = False,
+) -> tuple[list[dict[str, Any]], bool] | tuple[list[dict[str, Any]], bool, dict[str, Any] | None]:
     """检查并执行上下文压缩。
 
     Returns (messages, compacted) — 如果未压缩则原样返回。
     """
     threshold = get_compact_threshold(model_name, context_window)
     if len(messages) <= TAIL_KEEP + 2 or estimate_tokens(messages) <= threshold:
-        return messages, False
+        return _compact_return(messages, False, None, include_metadata)
 
     tail_start = find_tail_start_by_token_budget(messages, get_recent_keep_tokens(model_name, context_window))
     if tail_start <= 2:
-        return messages, False
+        return _compact_return(messages, False, None, include_metadata)
 
     head = messages[:tail_start]
     tail = messages[tail_start:]
+    anchors = select_anchor_messages(head)
 
-    # 压缩前先提取持久偏好到记忆
     flush_memory_before_compaction(head, provider)
-
-    head_for_summary = [dict(m) for m in head]
-    shrink_stale_tool_results(head_for_summary)
-    head_text = serialize_messages_for_compaction(head_for_summary)
+    head_text = _build_summary_input(head)
 
     try:
-        chunks = list(
-            provider.chat_stream(
-                [{"role": "user", "content": head_text}],
-                [],
-                COMPACTION_PROMPT,
-            )
-        )
-        summary = "".join(c.get("text", "") for c in chunks if c.get("type") == "text_delta")
-        if summary and len(summary) >= 20:
-            compacted = [
-                {"role": "user", "content": f"[对话摘要]\n{summary}"},
-                {"role": "assistant", "content": "好的，我已了解之前的对话上下文，请继续。"},
-            ] + tail
-            return compacted, True
+        summary = _run_compaction_summary(provider, head_text)
     except Exception:
-        logger.debug("compaction LLM call failed", exc_info=True)
+        # 压缩失败是静默劣化：上下文继续增长直到被网关拒绝，所以必须可见。
+        logger.warning(
+            "上下文压缩失败：摘要请求异常，历史保持 %d 条（约 %d tokens）未压缩",
+            len(messages),
+            estimate_tokens(messages),
+            exc_info=True,
+        )
+        return _compact_return(messages, False, None, include_metadata)
 
-    return messages, False
+    if not summary or len(summary) < MIN_SUMMARY_CHARS:
+        logger.warning(
+            "上下文压缩失败：摘要仅 %d 字符（低于 %d 的下限），历史保持 %d 条（约 %d tokens）未压缩",
+            len(summary or ""),
+            MIN_SUMMARY_CHARS,
+            len(messages),
+            estimate_tokens(messages),
+        )
+        return _compact_return(messages, False, None, include_metadata)
+
+    archive_meta = _create_archive_safely(head, summary, session_id, archive_dir, tail_start, anchors)
+    compacted = [
+        {"role": "user", "content": _format_compacted_summary(summary, archive_meta, anchors)},
+        {"role": "assistant", "content": "好的，我已了解之前的对话上下文，请继续。"},
+    ] + tail
+    return _compact_return(compacted, True, archive_meta, include_metadata)
+
+
+def enforce_context_limit(
+    messages: list[dict[str, Any]],
+    model_name: str = "",
+    context_window: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """压缩之后仍超窗口时，硬丢弃最旧消息，返回 (messages, drop_info)。
+
+    压缩不保证一定生效：摘要请求可能失败、tail 本身就可能超过窗口。此时把包原样
+    发出去只会被网关以 400 拒绝，用户看到的是一次失败的对话而非降级的对话。宁可
+    丢最旧的上下文也要让请求成立。
+
+    只丢头部、保留尾部，且不在 tool 结果上切断——孤立的 tool result 缺少配对的
+    assistant tool_calls，多数 provider 会直接报错。
+    """
+    limit = get_compact_threshold(model_name, context_window)
+    if estimate_tokens(messages) <= limit:
+        return messages, None
+
+    before_messages = len(messages)
+    before_tokens = estimate_tokens(messages)
+    kept = list(messages)
+    while len(kept) > 2 and estimate_tokens(kept) > limit:
+        kept = kept[1:]
+        while kept and kept[0].get("role") == "tool":
+            kept = kept[1:]
+    if not kept:
+        kept = messages[-1:]
+    info = {
+        "dropped_messages": before_messages - len(kept),
+        "before_tokens": before_tokens,
+        "after_tokens": estimate_tokens(kept),
+        "limit": limit,
+    }
+    logger.warning(
+        "上下文仍超出上限：压缩后约 %d tokens > %d，已硬丢弃最旧 %d 条消息",
+        before_tokens,
+        limit,
+        info["dropped_messages"],
+    )
+    return kept, info

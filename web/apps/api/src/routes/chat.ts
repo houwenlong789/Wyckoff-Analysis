@@ -1,5 +1,3 @@
-import { createAnthropic } from '@ai-sdk/anthropic'
-import { createOpenAI } from '@ai-sdk/openai'
 import { createClient } from '@supabase/supabase-js'
 import {
   ANALYZE_STOCK_OUTPUT_SCHEMA,
@@ -11,87 +9,108 @@ import {
   execIntradayAnalysis,
   execMarketHistory,
   execMarketOverview,
+  execQueryAttribution,
   execQueryRecommendations,
-  execQueryTailBuy,
   execScreenStocks,
   execSearchStock,
   execStrategyDecision,
   execViewPortfolio,
+  fetchMarketWatchSnapshot,
+  formatMarketWatchContext,
+  selectMarketWatchCodes,
+  ALLOWED_PROXY_TARGET_ORIGINS,
   normalizeGeminiStream,
+  removeSupersededToolApprovals,
+  sanitizeMessagesForChatTransport,
+  PROVIDER_BASE_URLS,
+  PROVIDER_DEFAULT_MODELS,
+  isSafeProviderBaseUrl,
+  isAllowedModelBaseUrl,
+  buildLlmUsageMetrics,
+  createModelGenerationClock,
   type LLMToolConfig,
+  type Provider,
   type ToolDeps,
+  type MarketWatchSnapshot,
 } from '@wyckoff/shared'
-import { consumeStream, convertToModelMessages, generateText, stepCountIs, streamText, tool, type UIMessage } from 'ai'
+import { consumeStream, convertToModelMessages, createUIMessageStream, createUIMessageStreamResponse, generateText, stepCountIs, streamText, tool, type ToolSet, type UIMessage, type UIMessageChunk } from 'ai'
 import { Hono } from 'hono'
 import { z } from 'zod'
-import type { Env } from '../index'
+import type { Env } from '../app'
 import { authMiddleware, type AuthContext } from '../middleware/auth'
+import { chatRateLimitMiddleware } from '../middleware/rate-limit'
+import {
+  CHAT_CONTINUATION_PROMPT,
+  CHAT_MAX_AUTO_CONTINUATIONS,
+  CHAT_MAX_OUTPUT_TOKENS,
+  CHAT_MAX_STEPS,
+  CHAT_MAX_TOTAL_STEPS,
+  continuationLimitMessage,
+  decideAgentLoop,
+} from '../services/chat-agent-loop'
+import { resolveChatLanguageModel } from '../services/chat-language-model'
+import { appendMarketWatchModelMessage, buildStableChatSystemPrompt } from '../services/chat-prompt-prefix'
 
 type ChatBindings = { Bindings: Env; Variables: { auth: AuthContext } }
 
-export const chatRoutes = new Hono<ChatBindings>()
+export type SandboxToolsBuilder = (env: Env, userId: string, accessToken: string, requestId: string) => Promise<ToolSet>
 
-chatRoutes.use('*', authMiddleware)
+export function createChatRoutes(sandboxToolsBuilder: SandboxToolsBuilder = async () => ({})) {
+  const chatRoutes = new Hono<ChatBindings>()
+  chatRoutes.use('*', authMiddleware)
 
-chatRoutes.get('/config', async (c) => {
-  const auth = c.get('auth')
-  const supabase = createUserSupabase(c.env, auth.accessToken)
-  const config = await loadLLMConfig(supabase, auth.userId)
-  return c.json({ configured: Boolean(config), model: config?.model || null })
-})
-
-chatRoutes.post('/', async (c) => {
-  const auth = c.get('auth')
-  const limited = checkRateLimit(c.env, auth.userId)
-  if (!limited.ok) return c.json({ error: limited.message }, 429)
-
-  const body = await c.req.json<ChatRequestBody>().catch(() => null)
-  const messages = body?.messages
-  if (!Array.isArray(messages) || messages.length === 0) return c.json({ error: 'Missing messages' }, 400)
-  if (estimateMessagesSize(messages) > 60_000) return c.json({ error: '本轮上下文过长，请开启新对话或缩短问题。' }, 413)
-
-  const supabase = createUserSupabase(c.env, auth.accessToken)
-  const config = await loadLLMConfig(supabase, auth.userId)
-  if (!config) return c.json({ error: '请先在设置页配置 LLM API Key' }, 400)
-
-  const provider = createProvider(config)
-  const tools = buildTools(createToolDeps(supabase), auth.userId, config, provider.chat(config.model))
-  const modelMessages = await convertToModelMessages(messages.slice(-40), {
-    tools,
-    ignoreIncompleteToolCalls: true,
-  })
-  const result = streamText({
-    model: provider.chat(config.model),
-    system: WYCKOFF_CHAT_SYSTEM_PROMPT,
-    messages: modelMessages,
-    tools,
-    stopWhen: stepCountIs(10),
-    abortSignal: c.req.raw.signal,
-    experimental_toolApprovalSecret: c.env.CHAT_TOOL_APPROVAL_SECRET || c.env.SUPABASE_SERVICE_ROLE_KEY,
+  chatRoutes.get('/config', async (c) => {
+    const auth = c.get('auth')
+    const supabase = createUserSupabase(c.env, auth.accessToken)
+    const config = await loadLLMConfig(supabase, auth.userId)
+    return c.json({ configured: Boolean(config), model: config?.model || null })
   })
 
-  return result.toUIMessageStreamResponse({
-    consumeSseStream: consumeStream,
-    onError: normalizeStreamError,
+  chatRoutes.post('/', chatRateLimitMiddleware, async (c) => {
+    const auth = c.get('auth')
+    const body = await c.req.json<ChatRequestBody>().catch(() => null)
+    const messages = body?.messages
+    if (!Array.isArray(messages) || messages.length === 0) return c.json({ error: 'Missing messages' }, 400)
+    if (estimateMessagesSize(messages) > 60_000) return c.json({ error: '本轮上下文过长，请开启新对话或缩短问题。' }, 413)
+
+    const supabase = createUserSupabase(c.env, auth.accessToken)
+    const configs = await loadLLMConfigs(supabase, auth.userId)
+    if (configs.length === 0) return c.json({ error: '请先在设置页配置 LLM API Key' }, 400)
+    const runId = crypto.randomUUID()
+    const sandboxTools = await sandboxToolsBuilder(c.env, auth.userId, auth.accessToken, c.get('requestId'))
+
+    const stream = createUIMessageStream({
+      execute: ({ writer }) => runChatWithResilience({
+        writer,
+        configs,
+        deps: createToolDeps(supabase),
+        userId: auth.userId,
+        accessToken: auth.accessToken,
+        messages,
+        signal: c.req.raw.signal,
+        env: c.env,
+        requestId: c.get('requestId'),
+        runId,
+        sequence: 0,
+        sandboxTools,
+        watchlist: sanitizeWatchlist(body?.watchlist),
+        marketWatchCache: body?.marketWatch,
+      }),
+      onError: normalizeStreamError,
+    })
+    return createUIMessageStreamResponse({ stream, consumeSseStream: consumeStream })
   })
-})
+  return chatRoutes
+}
 
-type ChatRequestBody = { messages?: UIMessage[] }
-type ChatRateState = { day: string; count: number; lastAt: number }
-type ChatRateResult = { ok: true } | { ok: false; message: string }
+export const chatRoutes = createChatRoutes()
 
-const rateStates = new Map<string, ChatRateState>()
-const ALLOWED_URL_RE = /^https?:\/\//i
-const ALLOWED_TARGET_ORIGINS = new Set([
-  'https://www.1route.dev',
-  'https://api.openai.com',
-  'https://generativelanguage.googleapis.com',
-  'https://api.deepseek.com',
-  'https://api.anthropic.com',
-  'https://token-plan-sgp.xiaomimimo.com',
-  'https://api.tickflow.org',
-  'https://api.tushare.pro',
-])
+type ChatRequestBody = { messages?: UIMessage[]; watchlist?: unknown; marketWatch?: unknown }
+type WatchlistRequestItem = { code: string; name: string }
+
+const ALLOWED_TARGET_ORIGINS: Set<string> = new Set(ALLOWED_PROXY_TARGET_ORIGINS)
+const ONE_ROUTE_ORIGINS = new Set(['https://api.1route.dev', 'https://www.1route.dev'])
+
 
 const WYCKOFF_CHAT_SYSTEM_PROMPT = `# 角色设定
 
@@ -105,31 +124,42 @@ const WYCKOFF_CHAT_SYSTEM_PROMPT = `# 角色设定
 2. 并行调用优先：需要同时获取多只股票、大盘与持仓数据时，优先并行调用工具。
 3. 调仓两步走：涉及调仓时，先调用 plan_portfolio_update 展示方案；execute_portfolio_update 会在协议层要求用户确认。
 4. 风险声明：涉及具体操作建议时，附带风险提示。
-5. 技术面为主：价值面只用于质量、风险、置信度和仓位校准，不能替代 K 线事实。`
+5. 技术面为主：价值面只用于质量、风险、置信度和仓位校准，不能替代 K 线事实。
+6. 策略归因问题必须调用 query_attribution，先确认返回结果是否来自远端表或提示本地 --no-write 报告，再优先读取 operator_summary / latest_operator_summary 作为运营结论，然后读取 latest_policy_display、latest_execution_summary、promotion_checklist 和 latest_operations 后判断信号升降权、是否能晋级 dynamic=on，以及 shadow 新增/移除样本；raw next_action/promotion_status 只作追证据，不直接复述给用户。
+7. 只有用户明确要求进行 Python 计算、回测或统计时，才可调用 run_python_research。先说明计算目的；该工具必须等待用户确认，脚本只处理已知、有限的数据，不能把猜测当作数据来源。`
 
-function checkRateLimit(env: Env, userId: string): ChatRateResult {
-  const limit = parsePositiveInt(env.CHAT_DAILY_LIMIT_PER_USER, 80)
-  const minInterval = parsePositiveInt(env.CHAT_MIN_INTERVAL_MS, 2500)
-  const now = Date.now()
-  const day = new Date(now).toISOString().slice(0, 10)
-  const state = rateStates.get(userId)
-  const current = state?.day === day ? state : { day, count: 0, lastAt: 0 }
-  if (now - current.lastAt < minInterval) return { ok: false, message: '请求太频繁，请稍后再试。' }
-  if (current.count >= limit) return { ok: false, message: '今日读盘室免费额度已用完，请明天再试。' }
-  rateStates.set(userId, { day, count: current.count + 1, lastAt: now })
-  return { ok: true }
-}
+const WEB_SEARCH_GUIDANCE = `# 联网搜索
 
-function parsePositiveInt(raw: string | undefined, fallback: number): number {
-  const value = Number(raw)
-  return Number.isFinite(value) && value > 0 ? Math.trunc(value) : fallback
-}
+公开网页信息、未上市/IPO、舆情、公告或本地库查不到时，优先调用 web_search 做服务端联网检索。
+行情、持仓、形态复盘和归因仍必须用对应本地工具，不得用网页搜索替代 K 线事实。
+搜索结果仅当轮有效；跨轮追问时如需最新网页证据应再次搜索。`
 
 function estimateMessagesSize(messages: UIMessage[]): number {
   return messages.reduce((total, message) => total + JSON.stringify(message).length, 0)
 }
 
-function createUserSupabase(env: Env, accessToken: string): ToolDeps['supabase'] {
+function sanitizeWatchlist(value: unknown): WatchlistRequestItem[] {
+  if (!Array.isArray(value)) return []
+  const items = value.flatMap((item): WatchlistRequestItem[] => {
+    if (typeof item === 'string') {
+      const code = item.trim().toUpperCase()
+      return code.length > 0 && code.length <= 24 ? [{ code, name: '' }] : []
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const record = item as Record<string, unknown>
+    const code = typeof record.code === 'string' ? record.code.trim().toUpperCase() : ''
+    const name = typeof record.name === 'string' ? record.name.trim().slice(0, 80) : ''
+    return code.length > 0 && code.length <= 24 ? [{ code, name }] : []
+  })
+  const seen = new Set<string>()
+  return items.filter((item) => {
+    if (seen.has(item.code)) return false
+    seen.add(item.code)
+    return true
+  }).slice(0, 18)
+}
+
+export function createUserSupabase(env: Env, accessToken: string): ToolDeps['supabase'] {
   return createClient(getEnvValue(env, 'SUPABASE_URL'), getEnvValue(env, 'SUPABASE_ANON_KEY'), {
     global: { headers: { Authorization: `Bearer ${accessToken}` } },
   })
@@ -141,23 +171,28 @@ function getEnvValue(env: Env, key: 'SUPABASE_URL' | 'SUPABASE_ANON_KEY'): strin
   return value
 }
 
-function createToolDeps(supabase: ToolDeps['supabase']): ToolDeps {
-  return { supabase, fetch: createToolFetch(), generateText }
+// Prefer an independent key. During rollout, a one-way domain-separated digest keeps the
+// service-role value itself out of the wider approval-token trust boundary.
+export async function getToolApprovalSecret(env: Env): Promise<string> {
+  const secret = env.CHAT_TOOL_APPROVAL_SECRET
+  if (secret) return secret
+  const serviceRole = env.SUPABASE_SERVICE_ROLE_KEY
+  if (!serviceRole) throw new Error('Missing CHAT_TOOL_APPROVAL_SECRET')
+  const bytes = new TextEncoder().encode(`wyckoff-chat-tool-approval\0${serviceRole}`)
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
-function createProvider(config: LLMToolConfig & { protocol?: 'openai' | 'anthropic' }) {
-  const fetch = createProviderFetch()
-  if (config.protocol === 'anthropic') {
-    return createAnthropic({ apiKey: config.api_key, baseURL: config.base_url, fetch })
-  }
-  return createOpenAI({ apiKey: config.api_key, baseURL: config.base_url, fetch })
+function createToolDeps(supabase: ToolDeps['supabase']): ToolDeps {
+  return { supabase, fetch: createToolFetch(), generateText }
 }
 
 function createProviderFetch(): typeof globalThis.fetch {
   return async (input, init) => {
     const requestUrl = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     const patchedBody = isOneRouteChatCompletion(requestUrl) ? patchOneRouteBody(init?.body) : init?.body
-    const response = await globalThis.fetch(input, { ...init, body: patchedBody })
+    const response = await globalThis.fetch(input, { ...init, body: patchedBody, redirect: 'manual' })
+    if (response.status >= 300 && response.status < 400) throw new Error('Model provider redirects are not allowed')
     if (isGeminiChatCompletion(requestUrl) && isSseResponse(response) && response.body) {
       return new Response(normalizeGeminiStream(response.body), {
         status: response.status,
@@ -181,26 +216,40 @@ function createToolFetch(): typeof globalThis.fetch {
   }
 }
 
-async function loadLLMConfig(supabase: ToolDeps['supabase'], userId: string): Promise<(LLMToolConfig & { protocol?: 'openai' | 'anthropic' }) | null> {
+type ChatModelConfig = LLMToolConfig & { protocol?: 'openai' | 'anthropic'; provider: string }
+
+async function loadLLMConfig(supabase: ToolDeps['supabase'], userId: string): Promise<ChatModelConfig | null> {
+  return (await loadLLMConfigs(supabase, userId))[0] || null
+}
+
+async function loadLLMConfigs(supabase: ToolDeps['supabase'], userId: string): Promise<ChatModelConfig[]> {
   const { data } = await supabase
     .from('user_settings')
     .select('chat_provider, gemini_api_key, gemini_model, gemini_base_url, openai_api_key, openai_model, openai_base_url, deepseek_api_key, deepseek_model, deepseek_base_url, anthropic_api_key, anthropic_model, anthropic_base_url, custom_providers')
     .eq('user_id', userId)
     .single()
-  if (!data) return null
-  return configForProvider(data as UserSettingsRow)
+  if (!data) return []
+  const settings = data as UserSettingsRow
+  const activeProvider = String(settings.chat_provider || '1route')
+  const custom = parseCustomProviders(settings.custom_providers)
+  const providers = Array.from(new Set([activeProvider, 'openai', 'deepseek', 'gemini', 'anthropic', ...Object.keys(custom)]))
+  return providers
+    .filter((provider) => !['zhipu', 'minimax', 'qwen', 'volcengine'].includes(provider))
+    .flatMap((provider) => {
+      const config = configForProvider(settings, provider)
+      return config ? [{ ...config, provider }] : []
+    })
 }
 
 type UserSettingsRow = Record<string, string | Record<string, unknown> | null>
 
-function configForProvider(data: UserSettingsRow): (LLMToolConfig & { protocol?: 'openai' | 'anthropic' }) | null {
-  const provider = String(data.chat_provider || '1route')
+function configForProvider(data: UserSettingsRow, provider = String(data.chat_provider || '1route')): (LLMToolConfig & { protocol?: 'openai' | 'anthropic' }) | null {
   if (['zhipu', 'minimax', 'qwen', 'volcengine'].includes(provider)) return null
-  if (provider === 'gemini') return knownProviderConfig(data, 'gemini', 'https://generativelanguage.googleapis.com/v1beta/openai', 'gemini-2.0-flash')
-  if (provider === 'openai') return knownProviderConfig(data, 'openai', 'https://api.openai.com/v1', 'gpt-4o')
-  if (provider === 'deepseek') return knownProviderConfig(data, 'deepseek', 'https://api.deepseek.com/v1', 'deepseek-chat')
+  if (provider === 'gemini') return knownProviderConfig(data, 'gemini', 'https://generativelanguage.googleapis.com/v1beta/openai', PROVIDER_DEFAULT_MODELS.gemini)
+  if (provider === 'openai') return knownProviderConfig(data, 'openai', PROVIDER_BASE_URLS.openai, PROVIDER_DEFAULT_MODELS.openai)
+  if (provider === 'deepseek') return knownProviderConfig(data, 'deepseek', PROVIDER_BASE_URLS.deepseek, PROVIDER_DEFAULT_MODELS.deepseek)
   if (provider === 'anthropic') {
-    const config = knownProviderConfig(data, 'anthropic', 'https://api.anthropic.com', 'claude-sonnet-4-20250514')
+    const config = knownProviderConfig(data, 'anthropic', 'https://api.anthropic.com', PROVIDER_DEFAULT_MODELS.anthropic)
     return config ? { ...config, protocol: 'anthropic' } : null
   }
   return customProviderConfig(data, provider)
@@ -210,16 +259,24 @@ function knownProviderConfig(data: UserSettingsRow, provider: string, fallbackBa
   const api_key = String(data[`${provider}_api_key`] || '')
   const model = String(data[`${provider}_model`] || fallbackModel)
   const base_url = String(data[`${provider}_base_url`] || fallbackBaseUrl)
-  return api_key && model ? { api_key, model, base_url } : null
+  return api_key && model && isSafeProviderBaseUrl(base_url) && isAllowedModelBaseUrl(base_url) ? { api_key, model, base_url } : null
 }
 
 function customProviderConfig(data: UserSettingsRow, provider: string): LLMToolConfig | null {
   const custom = parseCustomProviders(data.custom_providers)
   const info = custom[provider] || {}
   const api_key = info.apikey || info.api_key || ''
-  const model = info.model || ''
-  const base_url = info.baseurl || info.base_url || ''
-  return api_key && model && ALLOWED_URL_RE.test(base_url) ? { api_key, model, base_url } : null
+  const model = info.model || defaultModelForProvider(provider)
+  const base_url = info.baseurl || info.base_url || defaultBaseUrlForProvider(provider)
+  return api_key && model && isSafeProviderBaseUrl(base_url) && isAllowedModelBaseUrl(base_url) ? { api_key, model, base_url } : null
+}
+
+function defaultModelForProvider(provider: string): string {
+  return PROVIDER_DEFAULT_MODELS[provider as Provider] || ''
+}
+
+function defaultBaseUrlForProvider(provider: string): string {
+  return PROVIDER_BASE_URLS[provider as Provider] || ''
 }
 
 function parseCustomProviders(raw: unknown): Record<string, Record<string, string>> {
@@ -233,12 +290,356 @@ function parseCustomProviders(raw: unknown): Record<string, Record<string, strin
   }
 }
 
-function buildTools(deps: ToolDeps, userId: string, config: LLMToolConfig, model: unknown) {
+function buildTools(
+  args: Pick<ChatResilienceArgs, 'deps' | 'userId' | 'sandboxTools'>,
+  config: LLMToolConfig,
+  model: unknown,
+  providerTools: ToolSet = {},
+): ToolSet {
   return {
-    ...buildReadTools(deps, userId, model),
-    ...buildPortfolioTools(deps, userId),
-    ...buildAnalysisTools(deps, userId, config, model),
+    ...buildReadTools(args.deps, args.userId, model),
+    ...buildPortfolioTools(args.deps, args.userId),
+    ...buildAnalysisTools(args.deps, args.userId, config, model),
+    ...args.sandboxTools,
+    ...providerTools,
   }
+}
+
+interface ChatResilienceArgs {
+  writer: { write: (chunk: never) => void }
+  configs: ChatModelConfig[]
+  deps: ToolDeps
+  userId: string
+  accessToken: string
+  messages: UIMessage[]
+  signal: AbortSignal
+  env: Env
+  requestId: string
+  runId: string
+  sequence: number
+  sandboxTools: ToolSet
+  watchlist: WatchlistRequestItem[]
+  marketWatchCache: unknown
+}
+
+async function runChatWithResilience(args: ChatResilienceArgs): Promise<void> {
+  const selectedCodes = selectMarketWatchCodes(args.watchlist, recentUserQuery(args.messages))
+  const marketWatch = await fetchMarketWatchSnapshot(args.deps, args.userId, selectedCodes, args.marketWatchCache)
+  if (marketWatch.state !== 'empty') writeMarketWatchStatus(args.writer, marketWatch)
+  const marketWatchContext = formatMarketWatchContext(marketWatch)
+  let lastError: unknown = new Error('没有可用的模型配置')
+  for (let index = 0; index < args.configs.length; index += 1) {
+    const config = args.configs[index]
+    if (!config) continue
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        await runChatAttempt(args, config, marketWatchContext)
+        return
+      } catch (error) {
+        lastError = error
+        const started = Boolean((error as { outputStarted?: boolean }).outputStarted)
+        const retryable = isRetryableModelError(error)
+        const nextConfig = args.configs[index + 1]
+        const canRetry = !started && retryable && attempt < 2
+        const canFallback = !started && retryable && !canRetry && Boolean(nextConfig)
+        if (args.signal.aborted || started || (!canRetry && !canFallback)) throw error
+        writeModelStatus(args.writer, canRetry ? {
+          phase: 'retrying', model: config.model, attempt,
+        } : {
+          phase: 'fallback', model: config.model, attempt, nextModel: nextConfig?.model,
+        })
+        await waitForRetry(attempt, args.signal)
+        if (canFallback) break
+      }
+    }
+  }
+  throw lastError
+}
+
+function recentUserQuery(messages: UIMessage[]): string {
+  return messages
+    .filter((message) => message.role === 'user')
+    .slice(-3)
+    .map((message) => JSON.stringify(message))
+    .join('\n')
+}
+
+async function runChatSegment(
+  args: ChatResilienceArgs,
+  system: string,
+  modelMessages: any[],
+  tools: any,
+  maxSteps: number,
+  segmentIndex: number,
+  resolved: ReturnType<typeof resolveChatLanguageModel>,
+) {
+  const result = streamText({
+    model: resolved.model,
+    system,
+    messages: modelMessages,
+    tools,
+    maxOutputTokens: CHAT_MAX_OUTPUT_TOKENS,
+    stopWhen: stepCountIs(maxSteps),
+    abortSignal: args.signal,
+    experimental_toolApprovalSecret: await getToolApprovalSecret(args.env),
+    providerOptions: {
+      openai: {
+        parallelToolCalls: false,
+        // DeepSeek Responses is stateless; avoid item_reference round-trips for web_search.
+        ...(resolved.transport === 'responses' ? { store: false } : {}),
+      },
+    },
+  })
+
+  const pending: UIMessageChunk[] = []
+  const openToolCalls = new Set<string>()
+  let hasToolApproval = false
+  let hasIncompleteToolCall = false
+  let outputStarted = false
+  const streamStartedAt = Date.now()
+  const generationClock = createModelGenerationClock(streamStartedAt)
+
+  for await (const chunk of result.toUIMessageStream({
+    onError: (error) => { throw error },
+    sendStart: segmentIndex === 0,
+    sendFinish: false,
+  })) {
+    if (chunk.type === 'error') throw new Error(chunk.errorText)
+    if (chunk.type === 'tool-input-start') openToolCalls.add(chunk.toolCallId)
+    if (chunk.type === 'tool-input-available' || chunk.type === 'tool-input-error') openToolCalls.delete(chunk.toolCallId)
+    if (chunk.type === 'tool-input-error') hasIncompleteToolCall = true
+    if (chunk.type === 'tool-approval-request') hasToolApproval = true
+    generationClock.onChunkType(chunk.type)
+    writeChunkRunEvent(args, chunk)
+    pending.push(chunk)
+    if (isVisibleChatChunk(chunk)) {
+      outputStarted = true
+      flushChunks(args.writer, pending)
+    }
+  }
+  flushChunks(args.writer, pending)
+  hasIncompleteToolCall ||= openToolCalls.size > 0
+
+  const [finishReason, steps, response, totalUsage] = await Promise.all([
+    result.finishReason,
+    result.steps,
+    result.response,
+    result.totalUsage,
+  ])
+  writeLlmUsage(args.writer, totalUsage, generationClock.finalize(), segmentIndex)
+
+  return {
+    finishReason,
+    steps,
+    responseMessages: response.messages,
+    hasToolApproval,
+    hasIncompleteToolCall,
+    outputStarted,
+  }
+}
+
+
+function writeLlmUsage(
+  writer: ChatResilienceArgs['writer'],
+  totalUsage: {
+    inputTokens?: number | undefined
+    outputTokens?: number | undefined
+    cachedInputTokens?: number | undefined
+    inputTokenDetails?: {
+      cacheReadTokens?: number | undefined
+      cacheWriteTokens?: number | undefined
+    }
+  } | undefined,
+  generationMs: number,
+  segmentIndex: number,
+): void {
+  const inputTokens = totalUsage?.inputTokens ?? 0
+  const outputTokens = totalUsage?.outputTokens ?? 0
+  const cacheReadTokens = totalUsage?.inputTokenDetails?.cacheReadTokens
+    ?? totalUsage?.cachedInputTokens
+    ?? 0
+  const cacheWriteTokens = totalUsage?.inputTokenDetails?.cacheWriteTokens ?? 0
+  const cacheReported = totalUsage != null && (
+    totalUsage.inputTokenDetails?.cacheReadTokens != null
+    || totalUsage.inputTokenDetails?.cacheWriteTokens != null
+    || totalUsage.cachedInputTokens != null
+  )
+  const metrics = buildLlmUsageMetrics({
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    generationMs,
+    cacheReported,
+    segmentIndex,
+  })
+  writer.write({ type: 'data-llm-usage', data: metrics, transient: true } as never)
+}
+
+function buildChatSystemPrompt(transport: 'chat' | 'responses'): string {
+  // 观察篮行情不得拼进 system：价/fetchedAt 一变会打爆整段 prompt cache。
+  return buildStableChatSystemPrompt({
+    rolePrompt: WYCKOFF_CHAT_SYSTEM_PROMPT,
+    webSearchGuidance: transport === 'responses' ? WEB_SEARCH_GUIDANCE : '',
+  })
+}
+
+async function runChatAttempt(args: ChatResilienceArgs, config: ChatModelConfig, marketWatchContext: string): Promise<void> {
+  writeRunEvent(args, { type: 'model_started', label: `开始使用 ${config.model}` })
+  writeStageProgress(args.writer, { stage: 'model', state: 'started', message: '正在分析', model: config.model })
+  let succeeded = false
+  let outputStarted = false
+  try {
+    const resolved = resolveChatLanguageModel(config, createProviderFetch())
+    const tools = buildTools(args, config, resolved.nestedModel, resolved.providerTools)
+    const recentMessages = removeSupersededToolApprovals(args.messages.slice(-40))
+    const normalizedMessages = resolved.transport === 'chat'
+      ? sanitizeMessagesForChatTransport(recentMessages)
+      : recentMessages
+    let modelMessages = await convertToModelMessages(normalizedMessages, {
+      tools,
+      ignoreIncompleteToolCalls: true,
+    })
+    // 行情作为当轮额外 user 消息挂在末尾，不改写 system / 历史前缀。
+    modelMessages = appendMarketWatchModelMessage(modelMessages, marketWatchContext)
+    let continuationCount = 0
+    let totalSteps = 0
+    let segmentIndex = 0
+    let finalFinishReason = 'stop'
+
+    const system = buildChatSystemPrompt(resolved.transport)
+
+    while (true) {
+      const remainingSteps = CHAT_MAX_TOTAL_STEPS - totalSteps
+      if (remainingSteps <= 0) throw new Error(continuationLimitMessage('step-limit'))
+      const segmentMaxSteps = Math.min(CHAT_MAX_STEPS, remainingSteps)
+      
+      const segment = await runChatSegment(
+        args,
+        system,
+        modelMessages,
+        tools,
+        segmentMaxSteps,
+        segmentIndex,
+        resolved,
+      )
+
+      if (segment.outputStarted) {
+        outputStarted = true
+      }
+
+      totalSteps += segment.steps.length
+      finalFinishReason = segment.finishReason
+      
+      const lastStep = segment.steps.at(-1)
+      const decision = decideAgentLoop({
+        finishReason: segment.finishReason,
+        stepCount: segment.steps.length,
+        maxSteps: segmentMaxSteps,
+        hasToolCalls: Boolean(lastStep?.toolCalls.length),
+        hasToolApproval: segment.hasToolApproval,
+        hasIncompleteToolCall: segment.hasIncompleteToolCall,
+      })
+
+      if (decision.kind === 'error') throw new Error(decision.message)
+      if (decision.kind === 'continue') {
+        if (continuationCount >= CHAT_MAX_AUTO_CONTINUATIONS || totalSteps >= CHAT_MAX_TOTAL_STEPS) {
+          throw new Error(continuationLimitMessage(decision.reason))
+        }
+        if (!segment.responseMessages.length) throw new Error(continuationLimitMessage(decision.reason))
+        modelMessages = [
+          ...modelMessages,
+          ...(segment.responseMessages as typeof modelMessages),
+          { role: 'user', content: CHAT_CONTINUATION_PROMPT },
+        ]
+        continuationCount += 1
+        segmentIndex += 1
+        writeRunEvent(args, {
+          type: 'agent_continuation',
+          label: decision.reason === 'output-length' ? '回答达到单段上限，继续生成' : '工具步骤达到单段上限，继续执行',
+        })
+        continue
+      }
+      break
+    }
+    args.writer.write({ type: 'finish', finishReason: finalFinishReason } as never)
+    succeeded = true
+  } catch (error) {
+    throw Object.assign(error instanceof Error ? error : new Error(String(error)), {
+      outputStarted,
+    })
+  } finally {
+    writeStageProgress(args.writer, { stage: 'model', state: 'completed', success: succeeded, model: config.model })
+    writeRunEvent(args, { type: succeeded ? 'model_completed' : 'model_failed', label: succeeded ? '模型分析完成' : '模型分析失败' })
+  }
+}
+
+function flushChunks(writer: ChatResilienceArgs['writer'], chunks: UIMessageChunk[]): void {
+  while (chunks.length > 0) writer.write(chunks.shift() as never)
+}
+
+function isVisibleChatChunk(chunk: UIMessageChunk): boolean {
+  return chunk.type === 'text-start' || chunk.type === 'text-delta' || chunk.type === 'reasoning-start' || chunk.type === 'reasoning-delta' || chunk.type === 'tool-input-start' || chunk.type === 'tool-input-available' || chunk.type === 'tool-input-error' || chunk.type === 'tool-output-available' || chunk.type === 'tool-output-error' || chunk.type === 'tool-approval-request'
+}
+
+function writeModelStatus(writer: ChatResilienceArgs['writer'], status: { phase: 'retrying' | 'fallback'; model: string; attempt: number; nextModel?: string }): void {
+  writer.write({ type: 'data-model-status', data: { kind: 'model', ...status }, transient: true } as never)
+}
+
+function writeStageProgress(
+  writer: ChatResilienceArgs['writer'],
+  progress: { stage: 'model'; state: 'started' | 'completed'; message?: string; success?: boolean; model: string },
+): void {
+  writer.write({ type: 'data-stage-progress', data: { kind: 'stage', ...progress }, transient: true } as never)
+}
+
+function writeMarketWatchStatus(writer: ChatResilienceArgs['writer'], snapshot: MarketWatchSnapshot): void {
+  writer.write({ type: 'data-market-watch', data: snapshot, transient: true } as never)
+}
+
+function writeChunkRunEvent(args: ChatResilienceArgs, chunk: UIMessageChunk): void {
+  if (chunk.type === 'tool-input-start') {
+    writeRunEvent(args, { type: 'tool_started', label: `读取 ${chunk.toolName}`, toolName: chunk.toolName })
+  } else if (chunk.type === 'tool-output-available') {
+    writeRunEvent(args, { type: 'tool_completed', label: '数据读取完成', toolCallId: chunk.toolCallId })
+  } else if (chunk.type === 'tool-output-error') {
+    writeRunEvent(args, { type: 'tool_failed', label: '数据读取失败', toolCallId: chunk.toolCallId })
+  } else if (chunk.type === 'text-start') {
+    writeRunEvent(args, { type: 'answer_started', label: '开始生成结论' })
+  }
+}
+
+function writeRunEvent(
+  args: ChatResilienceArgs,
+  event: { type: string; label: string; toolName?: string; toolCallId?: string },
+): void {
+  args.sequence += 1
+  args.writer.write({
+    type: 'data-run-event',
+    data: {
+      runId: args.runId,
+      sequence: args.sequence,
+      type: event.type,
+      label: event.label,
+      toolName: event.toolName,
+      toolCallId: event.toolCallId,
+      timestamp: new Date().toISOString(),
+    },
+    transient: true,
+  } as never)
+}
+
+function isRetryableModelError(error: unknown): boolean {
+  const status = providerStatusCode(error)
+  if (status == null) return true
+  return status === 408 || status === 409 || status === 429 || status >= 500
+}
+
+async function waitForRetry(attempt: number, signal: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, attempt * 350)
+    signal.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
+  })
 }
 
 function buildReadTools(deps: ToolDeps, userId: string, model: unknown) {
@@ -248,7 +649,7 @@ function buildReadTools(deps: ToolDeps, userId: string, model: unknown) {
     market_overview: tool({ description: '查看当前/最新大盘行情信号。', inputSchema: z.object({}), execute: () => execMarketOverview(deps) }),
     market_history: tool({ description: '回看大盘指数过去N个交易日K线，分析量价关系和威科夫阶段。', inputSchema: z.object({ days: z.number().nullable(), index: z.enum(['sse', 'csi300', 'szse', 'chinext']).nullable() }), execute: ({ days, index }) => execMarketHistory(deps, userId, model, days ?? 100, index ?? 'sse') }),
     query_recommendations: tool({ description: '查询形态复盘记录。', inputSchema: z.object({ limit: z.number() }), execute: ({ limit }) => execQueryRecommendations(deps, limit) }),
-    query_tail_buy: tool({ description: '查询尾盘买入策略历史记录。', inputSchema: z.object({ limit: z.number() }), execute: ({ limit }) => execQueryTailBuy(deps, limit) }),
+    query_attribution: tool({ description: '查询远端策略归因治理器、operator_summary、latest_policy_display、latest_execution_summary、promotion_checklist 和 latest_operations；本地 --no-write 报告需走 CLI/MCP。', inputSchema: z.object({ limit: z.number() }), execute: ({ limit }) => execQueryAttribution(deps, limit) }),
   }
 }
 
@@ -271,7 +672,7 @@ function buildAnalysisTools(deps: ToolDeps, userId: string, config: LLMToolConfi
 
 const PORTFOLIO_UPDATE_SCHEMA = z.object({
   action: z.enum(['add', 'update', 'delete']),
-  code: z.string(),
+  code: z.string().describe('A股6位 / 港股00700.HK / 美股AAPL.US'),
   name: z.string().nullable(),
   shares: z.number().nullable(),
   cost_price: z.number().nullable(),
@@ -314,7 +715,12 @@ function forwardProxyHeaders(headers: HeadersInit | undefined): Headers {
 }
 
 function isOneRouteChatCompletion(url: string): boolean {
-  return url.startsWith('https://www.1route.dev') && url.includes('/chat/completions')
+  try {
+    const target = new URL(url)
+    return ONE_ROUTE_ORIGINS.has(target.origin) && target.pathname.endsWith('/chat/completions')
+  } catch {
+    return false
+  }
 }
 
 function isGeminiChatCompletion(url: string): boolean {
@@ -341,5 +747,33 @@ function normalizeStreamError(error: unknown): string {
   if (/Tool results? (are|is) missing for tool calls?/i.test(message)) {
     return '上一次工具调用被中断，请重新发送当前问题。'
   }
+  const statusCode = providerStatusCode(error)
+  if (statusCode === 503 || /Service temporarily unavailable/i.test(message)) {
+    return '模型服务暂时不可用（上游 503）。请稍后重试，或在设置里切换到其他可用模型。'
+  }
+  if (statusCode === 401 || statusCode === 403) {
+    return '模型服务鉴权失败，请检查设置页里的模型 API Key。'
+  }
+  if (statusCode === 404) {
+    return '模型服务找不到当前模型，请检查设置页里的模型名称。'
+  }
   return message
+}
+
+function providerStatusCode(error: unknown): number | null {
+  if (!error || typeof error !== 'object') return null
+  const value = error as { statusCode?: unknown; status?: unknown; response?: { status?: unknown } }
+  for (const candidate of [value.statusCode, value.status, value.response?.status]) {
+    const direct = Number(candidate)
+    if (Number.isFinite(direct)) return direct
+  }
+  const lastError = (error as { lastError?: unknown }).lastError
+  if (lastError && typeof lastError === 'object') {
+    const nestedValue = lastError as { statusCode?: unknown; status?: unknown; response?: { status?: unknown } }
+    for (const candidate of [nestedValue.statusCode, nestedValue.status, nestedValue.response?.status]) {
+      const nested = Number(candidate)
+      if (Number.isFinite(nested)) return nested
+    }
+  }
+  return null
 }

@@ -1,0 +1,48 @@
+"""Shared defaults for daily backtest entrypoints."""
+
+from __future__ import annotations
+
+import os
+
+from core.backtest_execution import DEFAULT_ENTRY_PRICE_TIME as CORE_DEFAULT_ENTRY_PRICE_TIME
+
+# 对齐近端 A 股最优：5 日时间兑现，默认无固定止损截断右尾。
+DEFAULT_HOLD_DAYS = 5
+DEFAULT_EXIT_MODE = "sltp"
+DEFAULT_STOP_LOSS_PCT = 0.0
+DEFAULT_TAKE_PROFIT_PCT = 0.0
+DEFAULT_TRAILING_STOP_PCT = 0.0
+DEFAULT_TRAILING_ACTIVATE_PCT = 0.0
+DEFAULT_ATR_PERIOD = 14
+DEFAULT_ATR_MULTIPLIER = 2.0
+DEFAULT_ATR_HARD_STOP_PCT = 0.0
+DEFAULT_ATR_MAX_HOLD_DAYS = 120
+DEFAULT_USE_CURRENT_META = False
+# 保留缓变的市值/行业/概念归属，只剔除 concept_heat 题材热度快照。
+# 默认关闭以保持既有回测口径不变；基线回测建议显式打开 --allow-static-meta。
+DEFAULT_ALLOW_STATIC_META = os.getenv("BACKTEST_ALLOW_STATIC_META", "0").strip().lower() in {"1", "true", "yes", "on"}
+DEFAULT_BUY_FRICTION_PCT = float(os.getenv("BACKTEST_BUY_FRICTION_PCT", "0.5"))
+DEFAULT_SELL_FRICTION_PCT = float(os.getenv("BACKTEST_SELL_FRICTION_PCT", "0.5"))
+DEFAULT_METRICS_ENGINE = os.getenv("BACKTEST_METRICS_ENGINE", "legacy").strip().lower() or "legacy"
+DEFAULT_WBT_FEE_RATE = float(os.getenv("BACKTEST_WBT_FEE_RATE", "0.0"))
+DEFAULT_WBT_N_JOBS = int(os.getenv("BACKTEST_WBT_N_JOBS", "1"))
+DEFAULT_CASH_PORTFOLIO_INITIAL_CASH = 100_000.0
+DEFAULT_CASH_PORTFOLIO_MAX_POSITIONS = 4
+DEFAULT_CASH_PORTFOLIO_COMMISSION_RATE = 0.0002
+DEFAULT_CASH_PORTFOLIO_MIN_COMMISSION = 5.0
+DEFAULT_CASH_PORTFOLIO_STAMP_DUTY_RATE = 0.0005
+DEFAULT_CASH_PORTFOLIO_TRANSFER_FEE_RATE = 0.00001
+DEFAULT_CASH_PORTFOLIO_LOT_SIZE = 100
+DEFAULT_CASH_PORTFOLIO_STYLES = (
+    os.getenv("BACKTEST_PORTFOLIO_STYLES", "confirmation_only").strip() or "confirmation_only"
+)
+DEFAULT_ENTRY_PRICE_TIME = CORE_DEFAULT_ENTRY_PRICE_TIME
+DEFAULT_ENTRY_PRICE_FALLBACK = os.getenv("BACKTEST_ENTRY_PRICE_FALLBACK", "close").strip().lower() or "close"
+FUNNEL_AI_SELECTION_MODE = os.getenv("FUNNEL_AI_SELECTION_MODE", "tradeable_l4").strip().lower()
+
+
+def full_formal_l4_max() -> int:
+    try:
+        return max(int(float(os.getenv("FUNNEL_FULL_FORMAL_L4_MAX", "25"))), 0)
+    except Exception:
+        return 25

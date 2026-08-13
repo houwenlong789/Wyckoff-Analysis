@@ -14,8 +14,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from utils.env import env_bool
 
+logger = logging.getLogger(__name__)
 DEFAULT_NEGATIVE_KEYWORDS = [
     "立案",
     "调查",
@@ -42,12 +43,7 @@ DEFAULT_NEGATIVE_KEYWORDS = [
 
 RAG_MAX_WORKERS = int(os.getenv("RAG_MAX_WORKERS", "6"))
 RAG_NEWS_LOOKBACK_DAYS = int(os.getenv("RAG_NEWS_LOOKBACK_DAYS", "7"))
-RAG_SEMANTIC_VETO_ENABLED = os.getenv("RAG_SEMANTIC_VETO_ENABLED", "1").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+RAG_SEMANTIC_VETO_ENABLED = env_bool("RAG_SEMANTIC_VETO_ENABLED", True)
 RAG_SEMANTIC_TIMEOUT = int(os.getenv("RAG_SEMANTIC_TIMEOUT", "25"))
 RAG_SEMANTIC_API_KEY = os.getenv("RAG_SEMANTIC_API_KEY", "").strip()
 RAG_SEMANTIC_MODEL = os.getenv("RAG_SEMANTIC_MODEL", "").strip()
@@ -74,6 +70,15 @@ class VetoResult:
     error: str | None = None
 
 
+@dataclass
+class SemanticDecision:
+    veto: bool
+    checked: bool = False
+    negative: bool | None = None
+    reason: str | None = None
+    error: str | None = None
+
+
 def is_rag_veto_enabled() -> bool:
     flag = os.getenv("RAG_VETO_ENABLED", "1").strip().lower()
     return flag in {"1", "true", "yes", "on"}
@@ -81,12 +86,16 @@ def is_rag_veto_enabled() -> bool:
 
 def get_rag_veto_runtime_status() -> dict[str, Any]:
     enabled = is_rag_veto_enabled()
+    semantic_provider, _, semantic_model, _, semantic_error = _semantic_llm_config()
     return {
         "enabled": enabled,
         "has_provider": True,  # akshare 无需 API key
         "lookback_days": int(max(RAG_NEWS_LOOKBACK_DAYS, 1)),
         "max_workers": int(max(RAG_MAX_WORKERS, 1)),
         "source": "akshare/eastmoney",
+        "semantic_provider": semantic_provider,
+        "semantic_model": semantic_model,
+        "semantic_error": semantic_error,
     }
 
 
@@ -96,26 +105,6 @@ def _normalize_keywords() -> list[str]:
         return DEFAULT_NEGATIVE_KEYWORDS
     parts = [x.strip().lower() for x in raw.replace("，", ",").split(",") if x.strip()]
     return parts or DEFAULT_NEGATIVE_KEYWORDS
-
-
-def _normalize_match_text(s: str) -> str:
-    return re.sub(r"\s+", "", str(s or "")).lower()
-
-
-def _extract_hits(text: str, keywords: list[str]) -> list[str]:
-    hits: list[str] = []
-    for kw in keywords:
-        k = str(kw or "").strip().lower()
-        if not k or k in {"st", "*st"}:
-            continue
-        if k in text and k not in hits:
-            hits.append(k)
-
-    if _STAR_ST_PATTERN.search(text):
-        hits.append("*st")
-    if _ST_PATTERN.search(text):
-        hits.append("st")
-    return hits
 
 
 def _is_about_this_stock(sentence: str, code: str, name: str) -> bool:
@@ -325,28 +314,7 @@ def _semantic_negative_via_llm(
         return (None, f"semantic_llm_err:{e}")
 
 
-def _scan_one(code: str, name: str, keywords: list[str]) -> VetoResult:
-    started = time.perf_counter()
-    search_source = "akshare"
-
-    try:
-        results = _fetch_news_akshare(code)
-    except Exception as e:
-        logger.debug("[rag_veto] akshare fetch failed for %s: %s", code, e)
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        return VetoResult(
-            code=code,
-            name=name,
-            veto=False,
-            hits=[],
-            evidence=[],
-            search_source=search_source,
-            raw_result_count=0,
-            relevant_result_count=0,
-            elapsed_ms=elapsed_ms,
-            error=f"akshare_err:{e}",
-        )
-
+def _news_scan_inputs(results: list[dict[str, str]]) -> tuple[list[str], list[str], list[str]]:
     text_parts: list[str] = []
     evidence: list[str] = []
     semantic_snippets: list[str] = []
@@ -359,14 +327,116 @@ def _scan_one(code: str, name: str, keywords: list[str]) -> VetoResult:
             semantic_snippets.append(merged)
         if title:
             evidence.append(title)
+    return text_parts, evidence, semantic_snippets
+
+
+def _prioritize_hit_evidence(evidence: list[str], hit_evidence: list[str]) -> list[str]:
+    if not hit_evidence:
+        return evidence
+    return hit_evidence + [item for item in evidence if item not in hit_evidence]
+
+
+def _semantic_veto_decision(code: str, name: str, hits: list[str], semantic_snippets: list[str]) -> SemanticDecision:
+    verdict, reason_or_err = _semantic_negative_via_llm(
+        code=code,
+        name=name,
+        hits=hits,
+        snippets=semantic_snippets,
+    )
+    if verdict is None:
+        return SemanticDecision(veto=True, error=reason_or_err)
+    return SemanticDecision(
+        veto=bool(verdict),
+        checked=True,
+        negative=bool(verdict),
+        reason=reason_or_err,
+    )
+
+
+def _build_veto_result(
+    *,
+    code: str,
+    name: str,
+    veto: bool,
+    hits: list[str],
+    evidence: list[str],
+    search_source: str,
+    raw_result_count: int,
+    relevant_result_count: int,
+    elapsed_ms: int,
+    semantic: SemanticDecision | None = None,
+    error: str | None = None,
+) -> VetoResult:
+    return VetoResult(
+        code=code,
+        name=name,
+        veto=veto,
+        hits=hits,
+        evidence=evidence[:3],
+        search_source=search_source,
+        raw_result_count=raw_result_count,
+        relevant_result_count=relevant_result_count,
+        elapsed_ms=elapsed_ms,
+        semantic_checked=semantic.checked if semantic else False,
+        semantic_negative=semantic.negative if semantic else None,
+        semantic_reason=semantic.reason if semantic else None,
+        error=semantic.error if semantic else error,
+    )
+
+
+def _merge_news(*batches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for batch in batches:
+        for item in batch:
+            title = " ".join(str(item.get("title") or "").lower().split())
+            key = str(item.get("url") or "").strip() or title
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return sorted(merged, key=lambda item: str(item.get("pub_date") or item.get("date") or ""), reverse=True)
+
+
+def _fetch_merged_news(code: str, name: str) -> tuple[list[dict[str, Any]], str, list[str]]:
+    _ = name
+    remote_news: list[dict[str, Any]] = []
+    errors: list[str] = []
+    try:
+        remote_news = _fetch_news_akshare(code)
+    except Exception as exc:
+        errors.append(f"akshare:{exc}")
+        logger.debug("[rag_veto] akshare news fetch failed for %s: %s", code, exc)
+    source = "akshare" if remote_news else "none"
+    return _merge_news(remote_news), source, errors
+
+
+def _scan_one(code: str, name: str, keywords: list[str]) -> VetoResult:
+    started = time.perf_counter()
+    results, search_source, errors = _fetch_merged_news(code, name)
+    if not results and errors:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        return _build_veto_result(
+            code=code,
+            name=name,
+            veto=False,
+            hits=[],
+            evidence=[],
+            search_source=search_source,
+            raw_result_count=0,
+            relevant_result_count=0,
+            elapsed_ms=elapsed_ms,
+            error="fetch_err:" + ";".join(errors),
+        )
+
+    text_parts, evidence, semantic_snippets = _news_scan_inputs(results)
     relevant_count = len(results)
     elapsed_ms = int((time.perf_counter() - started) * 1000)
 
     hits, hit_evidence = _extract_hits_strict(text_parts, keywords, code, name)
-    if hit_evidence:
-        evidence = hit_evidence + [e for e in evidence if e not in hit_evidence]
+    evidence = _prioritize_hit_evidence(evidence, hit_evidence)
     if not hits:
-        return VetoResult(
+        return _build_veto_result(
             code=code,
             name=name,
             veto=False,
@@ -378,40 +448,23 @@ def _scan_one(code: str, name: str, keywords: list[str]) -> VetoResult:
             elapsed_ms=elapsed_ms,
         )
 
-    # 关键词命中 → 语义二判
-    semantic_checked = False
-    semantic_negative: bool | None = None
-    semantic_reason: str | None = None
-    semantic_err: str | None = None
-    verdict, reason_or_err = _semantic_negative_via_llm(
+    semantic = _semantic_veto_decision(
         code=code,
         name=name,
         hits=hits,
-        snippets=semantic_snippets,
+        semantic_snippets=semantic_snippets,
     )
-    if verdict is not None:
-        semantic_checked = True
-        semantic_negative = bool(verdict)
-        semantic_reason = reason_or_err
-        veto = bool(verdict)
-    else:
-        veto = True
-        semantic_err = reason_or_err
-
-    return VetoResult(
+    return _build_veto_result(
         code=code,
         name=name,
-        veto=veto,
+        veto=semantic.veto,
         hits=hits,
         evidence=evidence[:3],
         search_source=search_source,
         raw_result_count=len(results),
         relevant_result_count=relevant_count,
         elapsed_ms=elapsed_ms,
-        semantic_checked=semantic_checked,
-        semantic_negative=semantic_negative,
-        semantic_reason=semantic_reason,
-        error=semantic_err,
+        semantic=semantic,
     )
 
 

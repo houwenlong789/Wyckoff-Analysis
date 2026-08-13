@@ -12,8 +12,11 @@ on:
         type: string
 
 concurrency:
-  group: daily-job-${{ github.ref }}
+  group: step4-oms-a-share-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   run:
@@ -34,6 +37,7 @@ jobs:
       DEFAULT_LLM_PROVIDER: ${{ secrets.DEFAULT_LLM_PROVIDER }}
       STEP3_LLM_PROVIDER: ${{ vars.STEP3_LLM_PROVIDER || secrets.STEP3_LLM_PROVIDER || 'gemini' }}
       STEP3_LLM_FALLBACK_PROVIDERS: ${{ vars.STEP3_LLM_FALLBACK_PROVIDERS || secrets.STEP3_LLM_FALLBACK_PROVIDERS || 'efficiency' }}
+      STEP3_SEND_COMPLIANCE_BRIEF: "1"
       STEP4_LLM_PROVIDER: ${{ vars.STEP4_LLM_PROVIDER || secrets.STEP4_LLM_PROVIDER || 'efficiency' }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
@@ -73,32 +77,40 @@ jobs:
       SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
       RAG_SEMANTIC_VETO_ENABLED: ${{ vars.RAG_SEMANTIC_VETO_ENABLED || '1' }}
       RAG_SEMANTIC_PROVIDER: ${{ vars.RAG_SEMANTIC_PROVIDER || secrets.RAG_SEMANTIC_PROVIDER || 'efficiency' }}
-      # 实盘风控参数：锁死 -8% 止损 + 单票仓位上限
+      # 实盘风控：ATR/结构止损优先，-12% 仅灾难地板；非主线 5 日时间管理见 holding_time_policy
       STEP4_BUY_HARD_STOP_ENABLED: "1"
-      STEP4_BUY_HARD_STOP_PCT: "8.0"
+      STEP4_BUY_HARD_STOP_PCT: "12.0"
       STEP4_BUY_STOP_MODE: "floor"
       STEP4_PROBE_BUDGET_LIMIT: "0.10"
-      STEP4_ATTACK_BUDGET_LIMIT: "0.25"
-      STEP4_BUY_BLOCK_REGIMES: "CRASH,BLACK_SWAN,RISK_OFF"
+      STEP4_REPAIR_PROBE_BUDGET_LIMIT: "0.05"
+      STEP4_ATTACK_BUDGET_LIMIT: "0.20"
+      STEP4_BUY_BLOCK_REGIMES: "UNKNOWN,RISK_ON,BEAR_REBOUND,PANIC_REPAIR,RISK_OFF,CRASH,BLACK_SWAN"
       STEP4_REQUIRE_CONFIRMED_BUY_CANDIDATE: "1"
       # AI 候选选择：按可交易 L4 收口，避免裸 SOS/EVR 噪声直接进入执行链路。
       FUNNEL_AI_SELECTION_MODE: ${{ vars.FUNNEL_AI_SELECTION_MODE || 'tradeable_l4' }}
       FUNNEL_AI_TOTAL_CAP: "8"
-      # off=静态配额；shadow=旁路记录动态策略差异；on=正式启用动态配额。
+      FUNNEL_AI_MAX_PER_SECTOR: "2"
+      # 生产按质量池统一裁剪；动态配额仅保留 shadow 对照。
       FUNNEL_DYNAMIC_POLICY: ${{ vars.FUNNEL_DYNAMIC_POLICY || secrets.FUNNEL_DYNAMIC_POLICY || 'shadow' }}
       FUNNEL_DYNAMIC_POLICY_HORIZON: "5"
+      STRATEGY_ATTRIBUTION_MAX_AGE_DAYS: "7"
       FUNNEL_DEFENSIVE_FORCE_QUOTA: "1"
-      FUNNEL_AI_RISK_ON_TREND: "3"
-      FUNNEL_AI_RISK_ON_ACCUM: "5"
+      # A 股赚钱书：RISK_ON 禁新仓；NEUTRAL 主线/趋势主导
+      FUNNEL_AI_RISK_ON_TREND: "5"
+      FUNNEL_AI_RISK_ON_ACCUM: "1"
+      FUNNEL_LOSS_GUARD_RISK_ON_PRE5_RET: "35.0"
+      FUNNEL_MAX_STRUCTURE_STOP_PCT: "12.0"
       FUNNEL_AI_RISK_OFF_TREND: "0"
       FUNNEL_AI_RISK_OFF_ACCUM: "0"
-      FUNNEL_AI_NEUTRAL_TREND: "2"
-      FUNNEL_AI_NEUTRAL_ACCUM: "3"
-      FUNNEL_AI_BEAR_REBOUND_TREND: "1"
-      FUNNEL_AI_BEAR_REBOUND_ACCUM: "2"
+      FUNNEL_AI_NEUTRAL_TREND: "5"
+      FUNNEL_AI_NEUTRAL_ACCUM: "1"
+      FUNNEL_AI_BEAR_REBOUND_TREND: "0"
+      FUNNEL_AI_BEAR_REBOUND_ACCUM: "0"
       FUNNEL_L2_BYPASS_AI_ENABLED: "0"
       FUNNEL_STRATEGIC_L2_BYPASS_AI_CAP: "2"
       FUNNEL_THEME_RADAR_PROMOTE_CAP: "2"
+      FUNNEL_ENFORCE_TARGET_TRADE_DATE: "1"
+      FUNNEL_DATA_FRESHNESS_HARD_FAIL: "1"
       DAILY_JOB_ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
       TZ: Asia/Shanghai
 

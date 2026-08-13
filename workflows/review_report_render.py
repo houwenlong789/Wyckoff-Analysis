@@ -1,0 +1,209 @@
+"""Markdown report rendering for strong-move replay reviews."""
+
+from __future__ import annotations
+
+from collections import Counter
+from datetime import date
+from typing import Any
+
+from core.funnel_taxonomy import (
+    REVIEW_STAGE_BASE_REJECT,
+    REVIEW_STAGE_CANDIDATE_HIT,
+    REVIEW_STAGE_RISK_BLOCK,
+    REVIEW_STAGE_STRENGTH_MISS,
+    REVIEW_STAGE_THEME_MISS,
+    REVIEW_STAGE_TRIGGER_HIT,
+    REVIEW_STAGE_TRIGGER_MISS,
+)
+from core.review_shadow_lanes import shadow_lane_label
+
+
+def short_code_list(rows: list[dict[str, Any]], limit: int = 8) -> str:
+    shown = [f"{row['code']}{row['name']}" for row in rows[:limit]]
+    if len(rows) > limit:
+        shown.append(f"等{len(rows)}只")
+    return "、".join(shown) if shown else "无"
+
+
+def build_focus_lines(rows: list[dict[str, Any]], today: date, previous_trade_date: date) -> list[str]:
+    total = max(len(rows), 1)
+    stage_rows = _group_stage_rows(rows)
+    lines = ["**重点归因**"]
+    lines.extend(_date_gap_lines(today, previous_trade_date))
+    lines.extend(_stage_focus_lines(stage_rows, total))
+    return lines
+
+
+def build_report_lines(
+    rows: list[dict[str, Any]],
+    stage_counter: Counter[str],
+    today: date,
+    previous_trade_date: date,
+    end_trade_date: str,
+    stats: dict[str, Any] | None = None,
+) -> list[str]:
+    summary = " | ".join([f"{key}{value}" for key, value in stage_counter.items()]) or "无"
+    lines = [
+        f"**今日**: {today}",
+        f"**前一日漏斗**: {end_trade_date}",
+        f"**今日收盘涨幅>+7%且前一交易日收盘涨幅<+3%股票数**: {len(rows)}",
+    ]
+    if stats:
+        if stats.get("context_source"):
+            lines.append(f"**归因数据源**: {stats['context_source']}")
+        stats_line = (
+            f"**漏斗全链路追踪**: 前一日候选 {stats['candidate']}/{stats['total']} | "
+            f"跟踪表记录 {stats.get('tracked_previous_day', stats['recommended'])}/{stats['total']} | "
+            f"AI正式推荐 {stats.get('ai_recommended_previous_day', 0)}/{stats['total']}"
+        )
+        lines.append(stats_line)
+        if stats.get("shadow"):
+            lines.append(
+                f"**影子召回（不进推荐）**: {stats['shadow']}/{stats['total']} | "
+                f"其中次日开盘可交易 {stats.get('shadow_open_executable', 0)}/{stats['shadow']} | "
+                "这是事后命中统计，不是影子池规模或次日买入清单"
+            )
+        execution_line = _execution_scope_line(stats)
+        if execution_line:
+            lines.append(execution_line)
+    lines.extend(
+        [
+            f"**结果汇总**: {summary}",
+            "",
+            *build_focus_lines(rows, today=today, previous_trade_date=previous_trade_date),
+            "",
+            "**逐票复盘（前一日候选链路状态与原因）**",
+            "",
+        ]
+    )
+    lines.extend(_detail_lines(rows))
+    return lines
+
+
+def _execution_scope_line(stats: dict[str, Any]) -> str:
+    if stats.get("execution_available", 0) <= 0:
+        return ""
+    eligible = stats.get("l1_eligible", 0)
+    executable = stats.get("open_executable", 0)
+    captured = stats.get("candidate_open_executable", 0)
+    intraday = stats.get("intraday_executable", 0)
+    intraday_captured = stats.get("candidate_intraday_executable", 0)
+    return (
+        f"**可交易复盘口径**: 前日基础准入 {eligible}/{stats.get('total', 0)} | "
+        f"次日开盘≤+4%且非一字板 {executable}/{eligible} | 可交易样本前日候选 {captured}/{executable} | "
+        f"盘中曾给≤+4%价格 {intraday}/{eligible} | 其中前日候选 {intraday_captured}/{intraday}"
+    )
+
+
+def _group_stage_rows(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    stage_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        stage_rows.setdefault(row["stage"], []).append(row)
+    return stage_rows
+
+
+def _date_gap_lines(today: date, previous_trade_date: date) -> list[str]:
+    gap_days = (today - previous_trade_date).days
+    if gap_days <= 1:
+        return []
+    return [
+        f"- **日期间隔**：{previous_trade_date} 收盘后到 {today} 之间跨 {gap_days} 个自然日，节假日/周末消息驱动的跳空异动，本来就很难由前一交易日日线结构提前捕获。"
+    ]
+
+
+def _stage_focus_lines(stage_rows: dict[str, list[dict[str, Any]]], total: int) -> list[str]:
+    lines: list[str] = []
+    lines.extend(_candidate_hit_focus(stage_rows.get(REVIEW_STAGE_CANDIDATE_HIT, [])))
+    lines.extend(_strength_miss_focus(stage_rows.get(REVIEW_STAGE_STRENGTH_MISS, []), total))
+    lines.extend(_risk_focus(stage_rows.get(REVIEW_STAGE_RISK_BLOCK, [])))
+    lines.extend(_trigger_miss_focus(stage_rows.get(REVIEW_STAGE_TRIGGER_MISS, [])))
+    lines.extend(_theme_miss_focus(stage_rows.get(REVIEW_STAGE_THEME_MISS, [])))
+    lines.extend(_base_reject_focus(stage_rows.get(REVIEW_STAGE_BASE_REJECT, [])))
+    lines.extend(_trigger_hit_focus(stage_rows.get(REVIEW_STAGE_TRIGGER_HIT, [])))
+    return lines
+
+
+def _candidate_hit_focus(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return []
+    return [
+        f"- **候选池已捕获**：{short_code_list(rows)}。这些票已进入前一日多路候选池，后续重点核对 AI 配额、跨日 confirmed 和 OMS 风控是否挡住。"
+    ]
+
+
+def _strength_miss_focus(rows: list[dict[str, Any]], total: int) -> list[str]:
+    if not rows:
+        return []
+    pct = len(rows) / total * 100.0
+    return [
+        f"- **未入候选池：结构强度不足**：{len(rows)} / {total}（{pct:.1f}%）没有被主线、趋势回踩、趋势突破、板块强势或 Wyckoff 结构车道接住。"
+    ]
+
+
+def _risk_focus(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return []
+    return [
+        f"- **风控拦截优先复盘**：{short_code_list(rows)}。这些票被结构止损/派发信号硬拦截，适合单独检查止损是否对强修复过敏。"
+    ]
+
+
+def _trigger_miss_focus(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return []
+    return [
+        f"- **买点未确认**：{short_code_list(rows)}。这些票已有结构基础但未触发买点确认，适合检查“爆发前夜压缩/试盘”类车道是否需要补强。"
+    ]
+
+
+def _theme_miss_focus(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return []
+    return [f"- **题材共振不足**：{short_code_list(rows)}。优先检查题材映射、主线热度和板块强势车道覆盖。"]
+
+
+def _base_reject_focus(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return []
+    return [f"- **基础准入淘汰**：{short_code_list(rows)}。主要是成交额/基础流动性，不建议为涨停复盘反向放宽。"]
+
+
+def _trigger_hit_focus(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return []
+    return [f"- **买点已确认**：{short_code_list(rows)}。这类不是形态漏检，后续应核对是否被 AI 配额或风控环节挡住。"]
+
+
+def _detail_lines(rows: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for row in rows:
+        recommendation = str(row.get("recommendation", "")).strip()
+        suffix = f" | {recommendation}" if recommendation else ""
+        state = _state_suffix(row)
+        lines.append(f"• {row['code']} {row['name']} | {row['stage']} | {row['reason']}{state}{suffix}")
+    return lines
+
+
+def _state_suffix(row: dict[str, Any]) -> str:
+    states: list[str] = []
+    if row.get("shadow_lane"):
+        states.append(f"影子={shadow_lane_label(str(row['shadow_lane']))}")
+    if row.get("trigger_labels"):
+        states.append(f"买点={'、'.join(str(x) for x in row['trigger_labels'])}")
+    if row.get("risk_signal"):
+        states.append(f"风控={row['risk_signal']}")
+    if row.get("tracked_previous_day"):
+        status = "、".join(str(x) for x in row.get("candidate_statuses") or []) or "已跟踪"
+        states.append(f"跟踪状态={status}")
+    if row.get("execution_available"):
+        open_gap = _pct(row.get("open_gap_pct"))
+        low_gap = _pct(row.get("low_gap_pct"))
+        states.append(f"次日开盘{open_gap}，最低{low_gap}")
+    return f" | {' | '.join(states)}" if states else ""
+
+
+def _pct(value: Any) -> str:
+    try:
+        return f"{float(value):+.2f}%"
+    except (TypeError, ValueError):
+        return "未知"

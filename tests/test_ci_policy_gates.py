@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from scripts.check_pr_policy import validate_policy
+from scripts.check_pr_policy import _dependency_only_change, _is_dependabot_event, validate_policy
 from scripts.check_workflow_hygiene import _check_workflow
 
 
@@ -22,6 +22,31 @@ def test_pr_policy_blocks_logs_and_secret_like_body():
     assert result.ok is False
     assert any("secret" in item for item in result.failures)
     assert any("local logs" in item for item in result.failures)
+
+
+def test_pr_policy_allows_dependabot_dependency_body_without_manual_headings():
+    body = "Bumps vite from 6.4.2 to 6.4.3.\n\n---\nupdated-dependencies:\n- dependency-name: vite"
+
+    result = validate_policy(body, ["web/package.json", "web/pnpm-lock.yaml"], automated_dependency_pr=True)
+
+    assert result.ok is True
+
+
+def test_pr_policy_still_blocks_dependabot_secret_body():
+    body = "Bumps vite.\n\nBearer eyJabc.def.ghi"
+
+    result = validate_policy(body, ["web/package.json"], automated_dependency_pr=True)
+
+    assert result.ok is False
+    assert any("secret" in item for item in result.failures)
+
+
+def test_dependabot_relaxation_requires_dependency_files():
+    event = {"pull_request": {"user": {"login": "dependabot[bot]"}}, "sender": {"login": "YoungCan-Wang"}}
+
+    assert _is_dependabot_event(event) is True
+    assert _dependency_only_change(["web/package.json", "web/pnpm-lock.yaml"]) is True
+    assert _dependency_only_change(["scripts/check_pr_policy.py"]) is False
 
 
 def test_workflow_hygiene_requires_concurrency_for_manual_automation(tmp_path: Path):
@@ -55,6 +80,8 @@ on:
 concurrency:
   group: manual-${{ github.ref }}
   cancel-in-progress: true
+permissions:
+  contents: read
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -70,3 +97,22 @@ jobs:
     )
 
     assert _check_workflow(workflow) == []
+
+
+def test_signal_feedback_manual_dynamic_approval_is_explicit():
+    workflow = Path(".github/workflows/signal_feedback.yml").read_text(encoding="utf-8")
+
+    assert "formal_dynamic_approved:" in workflow
+    assert "type: boolean" in workflow
+    assert "formal_dynamic_approval_reason:" in workflow
+    assert "formal_dynamic_approval_reason is required" in workflow
+    assert '"approved_by": os.environ.get("GITHUB_ACTOR", "")' in workflow
+    assert "--formal-dynamic-approval-json formal_dynamic_approval.json" in workflow
+
+
+def test_ci_runs_python_suite_once_and_reuses_it_for_coverage():
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert workflow.count("python -m coverage run -m pytest tests/ -x -q") == 1
+    assert "\n  coverage-report:" not in workflow
+    assert "name: coverage-report-${{ github.run_number }}" in workflow

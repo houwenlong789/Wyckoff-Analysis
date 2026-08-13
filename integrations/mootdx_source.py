@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from datetime import datetime
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 def _debug_source_fail(source: str, err: Exception) -> None:
@@ -15,7 +18,7 @@ def _debug_source_fail(source: str, err: Exception) -> None:
         "on",
     }
     if debug:
-        print(f"[data_source] {source} failed: {type(err).__name__}: {err}")
+        logger.debug("%s failed: %s: %s", source, type(err).__name__, err)
 
 
 def _compact_error(err: Exception, max_len: int = 120) -> str:
@@ -40,9 +43,7 @@ def _pick_column(df: pd.DataFrame, candidates: tuple[str, ...], label: str) -> p
     raise RuntimeError(f"mootdx missing column {label}")
 
 
-def fetch_stock_mootdx(
-    symbol: str, start: str, end: str, adjust: str
-) -> pd.DataFrame:
+def fetch_stock_mootdx(symbol: str, start: str, end: str, adjust: str) -> pd.DataFrame:
     """
     MooTDX 日线主链路。
     输出列与主链路保持一致：日期, 开盘, 最高, 最低, 收盘, 成交量, 成交额, 涨跌幅, 换手率, 振幅

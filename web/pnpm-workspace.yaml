@@ -2,7 +2,11 @@ packages:
   - 'apps/*'
   - 'packages/*'
 overrides:
-  ws: 8.20.1
+  '@babel/core': 7.29.6
+  esbuild: 0.25.12
+  nanoid: 3.3.17
+  undici: 7.29.0
+  ws: 8.21.0
 allowBuilds:
   esbuild: true
   sharp: true

@@ -29,17 +29,17 @@ def _timestamp() -> str:
     return datetime.now().isoformat(timespec="milliseconds")
 
 
-def _scrub(value: Any) -> Any:
+def scrub_sensitive_value(value: Any) -> Any:
     """Make values JSON-safe and redact obvious secrets."""
 
     if isinstance(value, dict):
         cleaned: dict[str, Any] = {}
         for key, item in value.items():
             key_text = str(key)
-            cleaned[key_text] = "***REDACTED***" if _SENSITIVE_KEY_RE.search(key_text) else _scrub(item)
+            cleaned[key_text] = "***REDACTED***" if _SENSITIVE_KEY_RE.search(key_text) else scrub_sensitive_value(item)
         return cleaned
     if isinstance(value, (list, tuple, set)):
-        return [_scrub(item) for item in value]
+        return [scrub_sensitive_value(item) for item in value]
     if isinstance(value, bytes):
         return f"<bytes:{len(value)}>"
     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -68,9 +68,10 @@ class AgentScratchpad:
         self.dir = scratchpad_dir or wyckoff_home() / "scratchpad"
         self.dir.mkdir(parents=True, exist_ok=True)
 
-        query_hash = hashlib.sha1(query.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        query_hash = hashlib.sha256(query.encode("utf-8", errors="ignore")).hexdigest()[:12]
         stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
         self.path = self.dir / f"{stamp}_{query_hash}.jsonl"
+        self._context_sources: list[dict[str, Any]] = []
 
         self.append(
             {
@@ -82,7 +83,7 @@ class AgentScratchpad:
         )
 
     def append(self, entry: dict[str, Any]) -> None:
-        safe_entry = _scrub(entry)
+        safe_entry = scrub_sensitive_value(entry)
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(safe_entry, ensure_ascii=False, default=str))
             fh.write("\n")
@@ -107,6 +108,7 @@ class AgentScratchpad:
         duration_ms: int | None = None,
         status: str = "ok",
     ) -> None:
+        self._record_context_source(tool_name, result)
         entry: dict[str, Any] = {
             "type": "tool_result",
             "timestamp": _timestamp(),
@@ -119,15 +121,51 @@ class AgentScratchpad:
             entry["durationMs"] = duration_ms
         self.append(entry)
 
-    def record_compaction(self, *, before_messages: int, after_messages: int) -> None:
+    def _record_context_source(self, tool_name: str, result: Any) -> None:
+        if not isinstance(result, dict):
+            return
+        quality = result.get("data_quality")
+        source = result.get("data_source") or result.get("source")
+        as_of = result.get("data_asof") or result.get("latest_date") or result.get("trade_date")
+        if not any((quality, source, as_of)):
+            return
+        item = {
+            "tool": str(tool_name or ""),
+            "source": str(source or ""),
+            "as_of": str(as_of or ""),
+            "quality": scrub_sensitive_value(quality) if isinstance(quality, dict) else str(quality or ""),
+        }
+        if item not in self._context_sources:
+            self._context_sources.append(item)
+
+    def record_context_snapshot(self, *, provider: str = "", model: str = "") -> None:
+        """Persist the low-sensitivity data context used by this analysis turn."""
         self.append(
             {
-                "type": "compaction",
+                "type": "context_snapshot",
                 "timestamp": _timestamp(),
-                "beforeMessages": before_messages,
-                "afterMessages": after_messages,
+                "provider": provider,
+                "model": model,
+                "sources": self._context_sources,
             }
         )
+
+    def record_compaction(
+        self,
+        *,
+        before_messages: int,
+        after_messages: int,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        entry = {
+            "type": "compaction",
+            "timestamp": _timestamp(),
+            "beforeMessages": before_messages,
+            "afterMessages": after_messages,
+        }
+        if metadata:
+            entry["contextArchive"] = metadata
+        self.append(entry)
 
     def record_final(
         self,
@@ -136,7 +174,10 @@ class AgentScratchpad:
         input_tokens: int = 0,
         output_tokens: int = 0,
         elapsed_s: float = 0.0,
+        provider: str = "",
+        model: str = "",
     ) -> None:
+        self.record_context_snapshot(provider=provider, model=model)
         self.append(
             {
                 "type": "final",

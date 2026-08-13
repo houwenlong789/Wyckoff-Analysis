@@ -7,33 +7,18 @@ selection until outcome data proves that it helps.
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
-CANDIDATE_SHADOW_SCORE_VERSION = "candidate_shadow_score_v1"
+from utils.safe import parse_cn_num
+
+CANDIDATE_SHADOW_SCORE_VERSION = "candidate_shadow_score_v2"
 
 _ACCUM_SIGNALS = {"spring", "lps", "compression"}
 
 
 def _num(raw: Any, default: float = 0.0) -> float:
-    if raw is None or isinstance(raw, bool):
-        return default
-    if isinstance(raw, int | float):
-        value = float(raw)
-        return default if math.isnan(value) else value
-    text = str(raw).strip().replace(",", "")
-    if text.lower() in {"", "-", "--", "nan", "none"}:
-        return default
-    multiplier = 1.0
-    if "亿" in text:
-        multiplier = 100_000_000.0
-    elif "万" in text:
-        multiplier = 10_000.0
-    text = text.replace("%", "").replace("亿", "").replace("万", "")
-    try:
-        return float(text) * multiplier
-    except ValueError:
-        return default
+    value = parse_cn_num(raw)
+    return default if value is None else value
 
 
 def _bounded100(raw: Any) -> float:
@@ -131,33 +116,8 @@ def _springboard_component(springboard: dict[str, Any]) -> tuple[float, list[str
     if grade and grade.lower() != "none":
         tags.append(f"springboard:{grade}")
     if max(met_count, float(bool_hits)) >= 2:
-        tags.append("springboard_confirmed")
+        tags.append("springboard_structure_ready")
     return component, tags
-
-
-def _tail_component(intraday_tail: dict[str, Any]) -> tuple[float, list[str], list[str]]:
-    if not intraday_tail:
-        return 0.0, [], []
-    decision = str(intraday_tail.get("tail_decision") or "").strip().upper()
-    score = _points(intraday_tail.get("tail_score"), 14.0)
-    if decision == "BUY":
-        score = min(14.0, score + 2.0)
-    elif decision == "WATCH":
-        score = min(14.0, score + 0.8)
-    tags = []
-    negative = []
-    if decision == "BUY":
-        tags.append("tail_buy_confirmation")
-    elif decision == "WATCH":
-        tags.append("tail_watch_confirmation")
-    elif decision == "SKIP":
-        negative.append("tail_skip")
-    if "dist_vwap_pct" in intraday_tail:
-        if _num(intraday_tail.get("dist_vwap_pct")) >= 0:
-            tags.append("above_vwap")
-        else:
-            negative.append("below_vwap")
-    return round(score, 1), tags, negative
 
 
 def _external_capital_component(source_context: dict[str, Any]) -> tuple[float, list[str], list[str]]:
@@ -168,40 +128,43 @@ def _external_capital_component(source_context: dict[str, Any]) -> tuple[float, 
     negative = []
 
     lhb = source_context.get("lhb") or {}
-    lhb_net = _num(lhb.get("net_buy")) if isinstance(lhb, dict) else 0.0
-    if lhb_net > 0:
+    lhb_net = parse_cn_num(lhb.get("net_buy")) if isinstance(lhb, dict) else None
+    if lhb_net is not None and lhb_net > 0:
         score += 3.0
         positive.append("lhb_net_buy")
-    elif lhb_net < 0:
+    elif lhb_net is not None and lhb_net < 0:
         negative.append("lhb_net_sell")
 
     margin = source_context.get("margin") or {}
     if isinstance(margin, dict):
-        margin_buy = _num(margin.get("margin_buy"))
-        margin_repay = _num(margin.get("margin_repay"))
-        if margin_buy > 0 and margin_buy > margin_repay:
+        margin_buy = parse_cn_num(margin.get("margin_buy"))
+        margin_repay = parse_cn_num(margin.get("margin_repay")) or 0.0
+        if margin_buy is not None and margin_buy > 0 and margin_buy > margin_repay:
             score += 1.5
             positive.append("margin_buying")
-        if _num(margin.get("short_sell")) > _num(margin.get("short_repay")) > 0:
+        short_sell = parse_cn_num(margin.get("short_sell"))
+        short_repay = parse_cn_num(margin.get("short_repay"))
+        if short_sell is not None and short_repay is not None and short_sell > short_repay > 0:
             negative.append("short_selling_pressure")
 
     block_trade = source_context.get("block_trade") or {}
-    if isinstance(block_trade, dict) and _num(block_trade.get("total_amount")) > 0:
+    total_amount = parse_cn_num(block_trade.get("total_amount")) if isinstance(block_trade, dict) else None
+    if total_amount is not None and total_amount > 0:
         score += 1.0
         if "avg_discount_pct" in block_trade:
-            discount = _num(block_trade.get("avg_discount_pct"))
-            if discount >= 0:
+            discount = parse_cn_num(block_trade.get("avg_discount_pct"))
+            if discount is not None and discount >= 0:
                 score += 0.5
                 positive.append("block_trade_premium")
-            elif discount <= -3:
+            elif discount is not None and discount <= -3:
                 negative.append("block_trade_discount")
 
     tick = source_context.get("tick_large_order") or {}
-    tick_net = _num(tick.get("large_net_amount_yuan")) if isinstance(tick, dict) else 0.0
-    if tick_net > 0:
+    tick_net = parse_cn_num(tick.get("large_net_amount_yuan")) if isinstance(tick, dict) else None
+    if tick_net is not None and tick_net > 0:
         score += 2.0
         positive.append("large_order_net_buy")
-    elif tick_net < 0:
+    elif tick_net is not None and tick_net < 0:
         negative.append("large_order_net_sell")
 
     return round(min(score, 8.0), 1), positive, negative
@@ -214,7 +177,6 @@ def score_candidate_shadow(
     priority_score: float = 0.0,
     footprint: dict[str, Any] | None = None,
     springboard: dict[str, Any] | None = None,
-    intraday_tail: dict[str, Any] | None = None,
     source_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a compact, deterministic candidate-quality score."""
@@ -224,16 +186,14 @@ def score_candidate_shadow(
     funnel_score, funnel_tags = _funnel_component(trigger_score, priority_score)
     price_action, risk_penalty, pa_tags, pa_negative = _price_action_component(signal_type, footprint or {})
     springboard_score, spring_tags = _springboard_component(springboard or {})
-    tail_score, tail_tags, tail_negative = _tail_component(intraday_tail or {})
     external_score, external_tags, external_negative = _external_capital_component(source_context or {})
 
-    positive.extend(funnel_tags + pa_tags + spring_tags + tail_tags + external_tags)
-    negative.extend(pa_negative + tail_negative + external_negative)
+    positive.extend(funnel_tags + pa_tags + spring_tags + external_tags)
+    negative.extend(pa_negative + external_negative)
     components = {
         "funnel": funnel_score,
         "price_action": price_action,
         "springboard": springboard_score,
-        "tail_confirmation": tail_score,
         "external_capital": external_score,
         "risk_penalty": risk_penalty,
     }
@@ -246,7 +206,7 @@ def score_candidate_shadow(
         "positive_tags": _unique(positive),
         "negative_tags": _unique(negative),
         "score_inputs": {
-            "trigger_score": round(float(trigger_score or 0.0), 4),
-            "priority_score": round(float(priority_score or 0.0), 4),
+            "trigger_score": round(_num(trigger_score), 4),
+            "priority_score": round(_num(priority_score), 4),
         },
     }

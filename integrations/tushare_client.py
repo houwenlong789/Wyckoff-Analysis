@@ -19,6 +19,7 @@ import logging
 import os
 import time
 import warnings
+from contextvars import ContextVar
 from threading import Lock
 
 # ── 全局滑动窗口限流器（进程级单例，线程安全） ──
@@ -29,7 +30,7 @@ _call_times: list[float] = []
 _call_lock = Lock()
 
 
-def _wait_for_rate_limit() -> None:
+def wait_for_rate_limit() -> None:
     """滑动窗口限流：确保过去 60 秒内调用不超过 _RATE_LIMIT 次。"""
     while True:
         with _call_lock:
@@ -53,7 +54,7 @@ class _RateLimitedPro:
         if callable(attr):
 
             def wrapper(*args, **kwargs):
-                _wait_for_rate_limit()
+                wait_for_rate_limit()
                 return attr(*args, **kwargs)
 
             wrapper.__name__ = name
@@ -63,7 +64,7 @@ class _RateLimitedPro:
 
 def get_pro():
     """返回限流版 Tushare Pro API 实例；若未配置 token 则返回 None。"""
-    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    token = _runtime_token.get() or os.getenv("TUSHARE_TOKEN", "").strip()
 
     if not token:
         return None
@@ -76,7 +77,17 @@ def get_pro():
         )
         import tushare as ts
 
-        ts.set_token(token)
-        return _RateLimitedPro(ts.pro_api())
+        return _RateLimitedPro(ts.pro_api(token))
     except ImportError:
         return None
+
+
+_runtime_token: ContextVar[str] = ContextVar("wyckoff_tushare_token", default="")
+
+
+def set_runtime_token(token: str) -> None:
+    _runtime_token.set(str(token or "").strip())
+
+
+def has_tushare_token() -> bool:
+    return bool(_runtime_token.get() or os.getenv("TUSHARE_TOKEN", "").strip())

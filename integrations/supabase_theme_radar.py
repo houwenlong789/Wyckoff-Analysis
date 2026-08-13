@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from core.constants import TABLE_THEME_RADAR_SNAPSHOT
@@ -12,6 +13,8 @@ from integrations.supabase_base import create_read_client as _read
 from integrations.supabase_base import is_admin_configured as _configured
 from integrations.supabase_base import require_server_write_context
 
+logger = logging.getLogger(__name__)
+
 
 def upsert_theme_radar_snapshot(snapshot: dict[str, Any]) -> int:
     """Write one theme radar snapshot, upsert on trade_date."""
@@ -19,19 +22,14 @@ def upsert_theme_radar_snapshot(snapshot: dict[str, Any]) -> int:
     if not _configured() or not trade_date:
         return 0
     require_server_write_context("upsert theme_radar_snapshot")
-    payload = {
-        "trade_date": trade_date,
-        "snapshot_json": snapshot,
-        "top_themes": _top_theme_names(snapshot),
-        "top_candidates": _top_candidate_codes(snapshot),
-    }
+    payload = build_theme_radar_snapshot_row(snapshot)
     client = None
     try:
         client = _admin()
         client.table(TABLE_THEME_RADAR_SNAPSHOT).upsert(payload, on_conflict="trade_date").execute()
         return 1
     except Exception as exc:
-        print(f"[theme_radar] supabase write failed: {exc}")
+        logger.warning("theme radar write failed: %s", exc)
         return 0
     finally:
         if client is not None:
@@ -51,13 +49,24 @@ def load_latest_theme_radar_snapshot_from_supabase() -> dict | None:
             .execute()
         )
     except Exception as exc:
-        print(f"[theme_radar] supabase read failed: {exc}")
+        logger.warning("theme radar read failed: %s", exc)
         return None
     finally:
         if client is not None:
             _close(client)
     rows = resp.data or []
     return _decode_snapshot(rows[0].get("snapshot_json")) if rows else None
+
+
+def build_theme_radar_snapshot_row(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Build the normalized Supabase row for a theme radar snapshot."""
+
+    return {
+        "trade_date": str(snapshot.get("trade_date") or ""),
+        "snapshot_json": snapshot,
+        "top_themes": _top_theme_names(snapshot),
+        "top_candidates": _top_candidate_codes(snapshot),
+    }
 
 
 def _top_theme_names(snapshot: dict[str, Any]) -> list[str]:

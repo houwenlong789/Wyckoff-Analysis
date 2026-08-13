@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from core.concept_filters import is_actionable_theme_name
@@ -12,10 +13,18 @@ from integrations.supabase_base import create_read_client as _read
 from integrations.supabase_base import is_admin_configured as _configured
 from integrations.supabase_base import require_server_write_context
 
+logger = logging.getLogger(__name__)
+
 
 def _top_heat_items(heat: list[dict[str, Any]], top_n: int) -> list[dict[str, Any]]:
     clean = [item for item in heat if is_actionable_theme_name(str(item.get("name", "")))]
-    return sorted(clean, key=lambda x: x.get("net_inflow", 0), reverse=True)[: max(int(top_n), 1)]
+    limit = max(int(top_n), 1)
+    selected: dict[str, dict[str, Any]] = {}
+    for item in sorted(clean, key=lambda x: x.get("net_inflow", 0), reverse=True)[:limit]:
+        selected[str(item.get("name"))] = item
+    for item in sorted(clean, key=lambda x: x.get("pct", 0), reverse=True)[:limit]:
+        selected[str(item.get("name"))] = item
+    return list(selected.values())
 
 
 def upsert_concept_heat_history(trade_date: str, heat: list[dict[str, Any]], top_n: int = 20) -> int:
@@ -50,29 +59,25 @@ def upsert_concept_heat_history(trade_date: str, heat: list[dict[str, Any]], top
         ).execute()
         return len(payload)
     except Exception as exc:
-        print(f"[concept_heat] supabase write failed: {exc}")
+        logger.warning("concept heat write failed: %s", exc)
         return 0
     finally:
         if client is not None:
             _close(client)
 
 
-def load_concept_heat_history_from_supabase(limit_days: int = 20) -> dict[str, dict]:
+def load_concept_heat_history_from_supabase(limit_days: int = 20, as_of_date: str | None = None) -> dict[str, dict]:
     """读取最近 N 个交易日的概念热度历史。"""
     row_limit = max(int(limit_days), 1) * 50
     client = None
     try:
         client = _read()
-        resp = (
-            client.table(TABLE_CONCEPT_HEAT_HISTORY)
-            .select("trade_date,concept_name,pct,net_inflow,rank")
-            .order("trade_date", desc=True)
-            .order("rank")
-            .limit(row_limit)
-            .execute()
-        )
+        query = client.table(TABLE_CONCEPT_HEAT_HISTORY).select("trade_date,concept_name,pct,net_inflow,rank")
+        if as_of_date:
+            query = query.lte("trade_date", as_of_date)
+        resp = query.order("trade_date", desc=True).order("rank").limit(row_limit).execute()
     except Exception as exc:
-        print(f"[concept_heat] supabase read failed: {exc}")
+        logger.warning("concept heat read failed: %s", exc)
         return {}
     finally:
         if client is not None:

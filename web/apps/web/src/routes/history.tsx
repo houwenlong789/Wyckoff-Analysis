@@ -1,24 +1,40 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
-import { BarChart3, Briefcase, Clock3, FileText, History, Search, Swords, Trash2, type LucideIcon } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { BarChart3, Briefcase, Clock3, FileText, History, Search, Swords, Trash2, Cpu, Database, Hash, Calendar, ListCollapse, type LucideIcon } from 'lucide-react'
 import { MarkdownContent } from '@/components/markdown'
 import { KlineChart } from '@/components/kline-chart'
 import { MultiStockChart, type ComparisonSeries } from '@/components/multi-stock-chart'
 import { clearAllAnalysisHistory, clearAnalysisHistory, deleteAnalysisHistory, listAllAnalysisHistory, type AnalysisHistoryKind, type AnalysisHistoryRecord } from '@/lib/local-history'
-import { formatValuePercent, sourceLabel } from '@/lib/value-analysis'
+import { formatSignedPercent } from '@/lib/format'
+import { formatValuePercent } from '@/lib/value-analysis'
 import { usePreferences, type Locale } from '@/lib/preferences'
 import { useAuthStore } from '@/stores/auth'
-import type { KlineData, ValueSnapshot } from '@/lib/kline'
+import { formatAnalysisContextPack, sourceLabel, type AnalysisContextPack, type KlineRow, type ValueSnapshot } from '@wyckoff/shared'
 
 type FilterKey = 'all' | AnalysisHistoryKind
 type HistoryRecord = AnalysisHistoryRecord<HistoryPayload>
 type HistoryPayload = SinglePayload | BattlePayload | PortfolioPayload | Record<string, unknown>
 
+interface TraceMeta {
+  inputSnapshotHash?: string
+  promptVersion?: string
+  model?: string
+  generatedAt?: string
+  valueSource?: string
+  reportDate?: string
+  valueRulesetVersion?: string
+  valueDataQuality?: string
+  valueRuleCodes?: string[]
+  klineRows?: number
+}
+
 interface SinglePayload {
   report: string
   symbol: string
   name: string
-  klineData: KlineData[]
+  klineData: KlineRow[]
   valueSnapshot: ValueSnapshot
+  contextPack?: AnalysisContextPack
+  meta?: TraceMeta
 }
 
 interface BattlePayload {
@@ -28,13 +44,14 @@ interface BattlePayload {
   mode: string
   overlayLimit: number
   report: string
-  benchmark: KlineData[]
+  benchmark: KlineRow[]
+  meta?: TraceMeta
 }
 
 interface BattleStockPayload {
   code: string
   name: string
-  data: KlineData[]
+  data: KlineRow[]
   stats: { ret20: number; ret60: number; ret120: number; drawdown60: number; volumeRatio: number; score: number }
   valueSnapshot: ValueSnapshot
 }
@@ -43,6 +60,7 @@ interface PortfolioPayload {
   source: 'database' | 'manual'
   result: PortfolioResultPayload
   report: string
+  meta?: TraceMeta
 }
 
 interface PortfolioResultPayload {
@@ -178,14 +196,14 @@ function useHistoryRecords(userId: string | undefined) {
   const [records, setRecords] = useState<HistoryRecord[]>([])
   const [loading, setLoading] = useState(true)
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     setLoading(true)
     try {
       setRecords(await listAllAnalysisHistory<HistoryPayload>(userId))
     } finally {
       setLoading(false)
     }
-  }
+  }, [userId])
 
   async function remove(id: string) {
     await deleteAnalysisHistory(id)
@@ -198,7 +216,7 @@ function useHistoryRecords(userId: string | undefined) {
     await refresh()
   }
 
-  useEffect(() => { void refresh() }, [userId])
+  useEffect(() => { void refresh() }, [refresh])
   return { records, loading, remove, clear }
 }
 
@@ -377,10 +395,21 @@ function SingleDetail({ copy, payload }: { copy: HistoryCopy; payload: SinglePay
   return (
     <div className="space-y-5">
       <SummaryGrid items={metrics} />
+      <HistoryTracePanel meta={payload.meta} />
+      {payload.contextPack && <HistoryContextPack pack={payload.contextPack} />}
       <Section title={copy.chart}>{payload.klineData.length > 0 && <KlineChart data={payload.klineData} height={360} />}</Section>
       <ValueSnapshotBlock title={copy.value} snapshot={payload.valueSnapshot} />
       <ReportBlock title={copy.report} report={payload.report} />
     </div>
+  )
+}
+
+function HistoryContextPack({ pack }: { pack: AnalysisContextPack }) {
+  return (
+    <details className="rounded-lg border border-border bg-muted/20 p-4">
+      <summary className="cursor-pointer text-sm font-semibold">分析上下文与证据链</summary>
+      <pre className="mt-3 whitespace-pre-wrap rounded-md bg-background p-3 text-xs leading-5 text-muted-foreground">{formatAnalysisContextPack(pack)}</pre>
+    </details>
   )
 }
 
@@ -391,6 +420,7 @@ function BattleDetail({ copy, payload }: { copy: HistoryCopy; payload: BattlePay
   return (
     <div className="space-y-5">
       <SummaryGrid items={metrics} />
+      <HistoryTracePanel meta={payload.meta} />
       <Section title={copy.chart}><BattleChart payload={payload} /></Section>
       <BattleStockTable copy={copy} stocks={payload.stocks} />
       <Section title={copy.input}><pre className="whitespace-pre-wrap rounded-lg bg-muted/50 p-3 text-sm text-muted-foreground">{payload.input}</pre></Section>
@@ -402,13 +432,77 @@ function BattleDetail({ copy, payload }: { copy: HistoryCopy; payload: BattlePay
 function PortfolioDetail({ copy, payload }: { copy: HistoryCopy; payload: PortfolioPayload | null }) {
   if (!payload) return <ExpiredRecord copy={copy} />
   const result = payload.result
-  const metrics = [{ label: '持仓', value: `${result.summaryStats.count}` }, { label: '总市值', value: formatMoney(result.summaryStats.totalMarket) }, { label: '现金', value: formatMoney(result.summaryStats.freeCash) }, { label: '盈亏', value: formatPercent(result.summaryStats.pnlPct), tone: pnlTone(result.summaryStats.pnlPct) }]
+  const metrics = [{ label: '持仓', value: `${result.summaryStats.count}` }, { label: '总市值', value: formatMoney(result.summaryStats.totalMarket) }, { label: '现金', value: formatMoney(result.summaryStats.freeCash) }, { label: '盈亏', value: formatSignedPercent(result.summaryStats.pnlPct), tone: pnlTone(result.summaryStats.pnlPct) }]
   return (
     <div className="space-y-5">
       <SummaryGrid items={metrics} />
+      <HistoryTracePanel meta={payload.meta} />
       <PortfolioPositionTable copy={copy} positions={result.positions} />
       <PortfolioValueTable title={copy.value} values={result.values} />
       <ReportBlock title={copy.report} report={payload.report || result.report} />
+    </div>
+  )
+}
+
+function HistoryTracePanel({ meta }: { meta?: TraceMeta }) {
+  if (!meta || !meta.inputSnapshotHash) return null
+  return (
+    <div className="rounded-lg border border-border bg-muted/20 p-4">
+      <h3 className="mb-3 flex items-center gap-1.5 text-xs font-bold uppercase tracking-wider text-muted-foreground/80">
+        <Cpu size={14} className="text-primary/70" />
+        分析溯源信息 (Report Trace Panel)
+      </h3>
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 text-xs">
+        <div className="flex items-center gap-2 rounded bg-background p-2 border border-border">
+          <Hash size={14} className="text-muted-foreground shrink-0" />
+          <div className="truncate">
+            <div className="text-muted-foreground scale-95 origin-left">输入快照 Hash</div>
+            <div className="font-mono font-medium text-foreground select-all mt-0.5">{meta.inputSnapshotHash}</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 rounded bg-background p-2 border border-border">
+          <Cpu size={14} className="text-muted-foreground shrink-0" />
+          <div className="truncate">
+            <div className="text-muted-foreground scale-95 origin-left">AI 模型 / 提示词版本</div>
+            <div className="font-medium text-foreground mt-0.5">{meta.model} ({meta.promptVersion || 'v1.0'})</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 rounded bg-background p-2 border border-border">
+          <Calendar size={14} className="text-muted-foreground shrink-0" />
+          <div className="truncate">
+            <div className="text-muted-foreground scale-95 origin-left">生成时间</div>
+            <div className="font-medium text-foreground mt-0.5">{new Date(meta.generatedAt || '').toLocaleString()}</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 rounded bg-background p-2 border border-border">
+          <Database size={14} className="text-muted-foreground shrink-0" />
+          <div className="truncate">
+            <div className="text-muted-foreground scale-95 origin-left">基本面源 / 报告期</div>
+            <div className="font-medium text-foreground mt-0.5">{meta.valueSource || 'N/A'} ({meta.reportDate || 'N/A'})</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 rounded bg-background p-2 border border-border">
+          <ListCollapse size={14} className="text-muted-foreground shrink-0" />
+          <div className="truncate">
+            <div className="text-muted-foreground scale-95 origin-left">价值规则 / 数据状态</div>
+            <div className="font-mono font-medium text-foreground mt-0.5">{meta.valueRulesetVersion || 'legacy'} · {meta.valueDataQuality || 'N/A'}</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 rounded bg-background p-2 border border-border">
+          <ListCollapse size={14} className="text-muted-foreground shrink-0" />
+          <div className="truncate">
+            <div className="text-muted-foreground scale-95 origin-left">触发的价值规则</div>
+            <div className="font-mono font-medium text-foreground mt-0.5">{meta.valueRuleCodes?.join(', ') || 'N/A'}</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 rounded bg-background p-2 border border-border">
+          <ListCollapse size={14} className="text-muted-foreground shrink-0" />
+          <div className="truncate">
+            <div className="text-muted-foreground scale-95 origin-left">历史行情长度</div>
+            <div className="font-medium text-foreground mt-0.5">{meta.klineRows ? `${meta.klineRows} 行` : 'N/A'}</div>
+          </div>
+        </div>
+      </div>
     </div>
   )
 }
@@ -470,7 +564,7 @@ function BattleStockTable({ copy, stocks }: { copy: HistoryCopy; stocks: BattleS
       <div className="overflow-auto">
         <table className="w-full text-sm">
           <thead className="text-xs text-muted-foreground"><tr>{['代码', '名称', '强度', '20D', '60D', '120D', '回撤'].map((head) => <th key={head} className="px-2 py-2 text-left font-medium">{head}</th>)}</tr></thead>
-          <tbody>{rows.map((stock) => <tr key={stock.code} className="border-t border-border"><td className="px-2 py-2 font-mono">{stock.code}</td><td className="px-2 py-2">{stock.name}</td><td className="px-2 py-2 font-semibold">{stock.stats.score.toFixed(1)}</td><td className="px-2 py-2">{formatPercent(stock.stats.ret20)}</td><td className="px-2 py-2">{formatPercent(stock.stats.ret60)}</td><td className="px-2 py-2">{formatPercent(stock.stats.ret120)}</td><td className="px-2 py-2">{formatPercent(stock.stats.drawdown60)}</td></tr>)}</tbody>
+          <tbody>{rows.map((stock) => <tr key={stock.code} className="border-t border-border"><td className="px-2 py-2 font-mono">{stock.code}</td><td className="px-2 py-2">{stock.name}</td><td className="px-2 py-2 font-semibold">{stock.stats.score.toFixed(1)}</td><td className="px-2 py-2">{formatSignedPercent(stock.stats.ret20)}</td><td className="px-2 py-2">{formatSignedPercent(stock.stats.ret60)}</td><td className="px-2 py-2">{formatSignedPercent(stock.stats.ret120)}</td><td className="px-2 py-2">{formatSignedPercent(stock.stats.drawdown60)}</td></tr>)}</tbody>
         </table>
       </div>
     </Section>
@@ -483,7 +577,7 @@ function PortfolioPositionTable({ copy, positions }: { copy: HistoryCopy; positi
       <div className="overflow-auto">
         <table className="w-full text-sm">
           <thead className="text-xs text-muted-foreground"><tr>{['代码', '名称', '股数', '成本', '现价', '市值', '盈亏', '仓位'].map((head) => <th key={head} className="px-2 py-2 text-left font-medium">{head}</th>)}</tr></thead>
-          <tbody>{positions.map((row) => <tr key={row.code} className="border-t border-border"><td className="px-2 py-2 font-mono">{row.code}</td><td className="px-2 py-2">{row.name}</td><td className="px-2 py-2">{row.shares.toLocaleString()}</td><td className="px-2 py-2">{formatNumber(row.cost)}</td><td className="px-2 py-2">{formatNumber(row.latest)}</td><td className="px-2 py-2">{formatMoney(row.mktVal)}</td><td className={`px-2 py-2 font-semibold ${metricClass(pnlTone(row.pnlPct))}`}>{formatPercent(row.pnlPct)}</td><td className="px-2 py-2">{formatUnsignedPercent(row.weight)}</td></tr>)}</tbody>
+          <tbody>{positions.map((row) => <tr key={row.code} className="border-t border-border"><td className="px-2 py-2 font-mono">{row.code}</td><td className="px-2 py-2">{row.name}</td><td className="px-2 py-2">{row.shares.toLocaleString()}</td><td className="px-2 py-2">{formatNumber(row.cost)}</td><td className="px-2 py-2">{formatNumber(row.latest)}</td><td className="px-2 py-2">{formatMoney(row.mktVal)}</td><td className={`px-2 py-2 font-semibold ${metricClass(pnlTone(row.pnlPct))}`}>{formatSignedPercent(row.pnlPct)}</td><td className="px-2 py-2">{formatUnsignedPercent(row.weight)}</td></tr>)}</tbody>
         </table>
       </div>
     </Section>
@@ -561,7 +655,7 @@ function battleMetrics(payload: BattlePayload): MetricItem[] {
 
 function portfolioMetrics(payload: PortfolioPayload): MetricItem[] {
   const stats = payload.result.summaryStats
-  return [{ label: '持仓', value: `${stats.count}` }, { label: '盈亏', value: formatPercent(stats.pnlPct), tone: pnlTone(stats.pnlPct) }, { label: '市值', value: formatCompactMoney(stats.totalMarket) }]
+  return [{ label: '持仓', value: `${stats.count}` }, { label: '盈亏', value: formatSignedPercent(stats.pnlPct), tone: pnlTone(stats.pnlPct) }, { label: '市值', value: formatCompactMoney(stats.totalMarket) }]
 }
 
 function countByKind(records: HistoryRecord[]): Record<AnalysisHistoryKind, number> {
@@ -718,10 +812,6 @@ function formatFullTime(value: string): string {
 
 function formatNumber(value: number | undefined): string {
   return Number.isFinite(value) ? (value as number).toFixed(2) : '--'
-}
-
-function formatPercent(value: number | undefined): string {
-  return Number.isFinite(value) ? `${(value as number) >= 0 ? '+' : ''}${(value as number).toFixed(2)}%` : '--'
 }
 
 function formatUnsignedPercent(value: number | undefined): string {

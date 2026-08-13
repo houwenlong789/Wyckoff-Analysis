@@ -1,0 +1,485 @@
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type FormEvent,
+  type RefObject,
+  type SetStateAction,
+} from 'react'
+import {
+  DefaultChatTransport,
+  lastAssistantMessageIsCompleteWithApprovalResponses,
+  type UIMessage,
+} from 'ai'
+import { useChat } from '@ai-sdk/react'
+import { apiUrl } from '@/lib/api-url'
+import type { TranslationKey } from '@/lib/preferences'
+import { useAgentRunSocket } from './agent-run-socket'
+import {
+  cancelAgentRun,
+  expiredAgentRun,
+  collectSandboxRunTools,
+  fetchAgentRun,
+  isAgentRunTerminal,
+  type AgentRunRecord,
+  type SandboxRunTool,
+} from './agent-runs'
+import { replaceConversationToolOutput, type ReadingRoomConversations } from './conversations'
+import { scrollToMessage } from './run-records'
+import { mergeLlmUsageMetrics, type LlmUsageMetrics } from '@wyckoff/shared'
+import type { ChatConfig, ChatRunEvent, ChatRunStatus, MarketWatchSnapshot, QueuedMessage, ReadingRoomTab, StageProgressStatus, WatchItem } from './types'
+import { writeBooleanStorage } from './utils'
+
+export const CONVERSATION_SIDEBAR_STORAGE_KEY = 'wyckoff:reading-room-sidebar-collapsed-v1'
+
+const MAX_QUEUED_MESSAGES = 5
+
+export type ReadingRoomChat = ReturnType<typeof useChat<UIMessage>> & {
+  clearLlmUsage: () => void
+}
+
+export interface MessageQueue {
+  messages: QueuedMessage[]
+  enqueue: (text: string) => void
+  clear: () => void
+}
+
+export interface AgentRunController {
+  records: Record<string, AgentRunRecord>
+  cancel: (runId: string) => Promise<void>
+}
+
+type ConversationSandboxRunTool = SandboxRunTool & { conversationId: string }
+
+interface SubmitHandlerArgs {
+  chat: ReadingRoomChat
+  config: ChatConfig
+  input: string
+  loading: boolean
+  queue: MessageQueue
+  token: string | undefined
+  t: (key: TranslationKey) => string
+  setActiveTab: (value: ReadingRoomTab) => void
+  setInput: Dispatch<SetStateAction<string>>
+  setLocalError: Dispatch<SetStateAction<string>>
+}
+
+interface ReadingRoomActionArgs {
+  chat: ReadingRoomChat
+  config: ChatConfig
+  conversations: ReadingRoomConversations
+  loading: boolean
+  queue: MessageQueue
+  scrollRef: RefObject<HTMLDivElement | null>
+  token: string | undefined
+  t: (key: TranslationKey) => string
+  setActiveTab: (value: ReadingRoomTab) => void
+  setInput: Dispatch<SetStateAction<string>>
+  setLocalError: Dispatch<SetStateAction<string>>
+  setSidebarCollapsed: Dispatch<SetStateAction<boolean>>
+}
+
+export function useSubmitHandler(args: SubmitHandlerArgs) {
+  const { chat, config, input, loading, queue, token, t, setActiveTab, setInput, setLocalError } = args
+  const submitText = useCallback((rawText: string) => {
+    const text = rawText.trim()
+    if (!text) return
+    if (!token) { setLocalError(t('chat.requestFailed')); return }
+    if (!config.configured) { setLocalError(config.error || t('chat.configureLLM')); return }
+    setActiveTab('chat')
+    setInput('')
+    setLocalError('')
+    chat.clearError()
+    if (loading) {
+      queue.enqueue(text)
+      return
+    }
+    void chat.sendMessage({ text })
+  }, [chat, config.configured, config.error, loading, queue, setActiveTab, setInput, setLocalError, t, token])
+
+  return useCallback((e: FormEvent) => {
+    e.preventDefault()
+    submitText(input)
+  }, [input, submitText])
+}
+
+export function useReadingRoomActions(args: ReadingRoomActionArgs) {
+  const {
+    chat, config, conversations, loading, queue, scrollRef, token, t,
+    setActiveTab, setInput, setLocalError, setSidebarCollapsed,
+  } = args
+  const resetInputState = useCallback(() => {
+    queue.clear()
+    setInput('')
+    setLocalError('')
+    setActiveTab('chat')
+    chat.clearError()
+  }, [chat, queue, setActiveTab, setInput, setLocalError])
+
+  const selectConversation = useCallback((id: string) => {
+    if (loading) void chat.stop()
+    resetInputState()
+    conversations.select(id)
+  }, [chat, conversations, loading, resetInputState])
+
+  const removeConversation = useCallback((id: string) => {
+    if (loading) void chat.stop()
+    resetInputState()
+    conversations.remove(id)
+  }, [chat, conversations, loading, resetInputState])
+
+  const renameConversation = useCallback((id: string, title: string) => conversations.rename(id, title), [conversations])
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsed((value) => {
+      const next = !value
+      writeBooleanStorage(CONVERSATION_SIDEBAR_STORAGE_KEY, next)
+      return next
+    })
+  }, [setSidebarCollapsed])
+
+  const openRunRecord = useCallback((messageId: string) => {
+    setActiveTab('chat')
+    window.setTimeout(() => scrollToMessage(scrollRef.current, messageId), 0)
+  }, [scrollRef, setActiveTab])
+
+  const startNewConversation = useStartNewConversation({
+    chat, config, conversations, loading, queue, token, t, setActiveTab, setInput, setLocalError,
+  })
+  return { openRunRecord, removeConversation, renameConversation, selectConversation, startNewConversation, toggleSidebar }
+}
+
+function useStartNewConversation(args: Omit<ReadingRoomActionArgs, 'scrollRef' | 'setSidebarCollapsed'>) {
+  const { chat, config, conversations, loading, queue, token, t, setActiveTab, setInput, setLocalError } = args
+  return useCallback((rawText?: string) => {
+    const text = typeof rawText === 'string' ? rawText.trim() : ''
+    if (text && !token) { setLocalError(t('chat.requestFailed')); return }
+    if (text && !config.configured) { setLocalError(config.error || t('chat.configureLLM')); return }
+    if (loading) void chat.stop()
+    queue.clear()
+    setInput('')
+    setLocalError('')
+    setActiveTab('chat')
+    conversations.create()
+    chat.clearError()
+    if (text) {
+      window.setTimeout(() => {
+        void chat.sendMessage({ text }).catch((error: unknown) => setLocalError(normalizeClientError(error, t)))
+      }, 0)
+    }
+  }, [chat, config.configured, config.error, conversations, loading, queue, setActiveTab, setInput, setLocalError, t, token])
+}
+
+export function useReadingRoomChat(
+  token: string | undefined,
+  setLocalError: (value: string) => void,
+  t: (key: TranslationKey) => string,
+  setModelStatus: (value: ChatRunStatus | null) => void,
+  setLlmUsage: (value: LlmUsageMetrics | null) => void,
+  watchlist: Pick<WatchItem, 'code' | 'name'>[],
+  marketWatch: MarketWatchSnapshot | null,
+  setMarketWatch: (value: MarketWatchSnapshot) => void,
+  onRunEvent?: (event: ChatRunEvent) => void,
+  onRunFinish?: () => void,
+  onRunError?: () => void,
+) {
+  const watchlistRef = useRef(watchlist)
+  const marketWatchRef = useRef(marketWatch)
+  const usagePartsRef = useRef<LlmUsageMetrics[]>([])
+  useEffect(() => { watchlistRef.current = watchlist }, [watchlist])
+  useEffect(() => { marketWatchRef.current = marketWatch }, [marketWatch])
+  const clearLlmUsage = useCallback(() => {
+    usagePartsRef.current = []
+    setLlmUsage(null)
+  }, [setLlmUsage])
+  const transport = useMemo(() => buildChatTransport(token, watchlistRef, marketWatchRef), [token])
+  const chat = useChat({
+    transport,
+    experimental_throttle: 120,
+    sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithApprovalResponses,
+    onData: (part) => {
+      if (part.type === 'data-run-event') onRunEvent?.(part.data as ChatRunEvent)
+      if (part.type === 'data-model-status') setModelStatus(part.data as ChatRunStatus)
+      if (part.type === 'data-market-watch') setMarketWatch(part.data as MarketWatchSnapshot)
+      if (part.type === 'data-llm-usage') {
+        const metrics = part.data as LlmUsageMetrics
+        if (metrics.segmentIndex === 0) usagePartsRef.current = [metrics]
+        else usagePartsRef.current = [...usagePartsRef.current, metrics]
+        setLlmUsage(mergeLlmUsageMetrics(usagePartsRef.current))
+      }
+      if (part.type === 'data-stage-progress') {
+        const progress = part.data as StageProgressStatus
+        setModelStatus(progress.state === 'completed' ? null : progress)
+      }
+    },
+    onFinish: () => {
+      setModelStatus(null)
+      usagePartsRef.current = []
+      onRunFinish?.()
+    },
+    onError: (err) => {
+      setModelStatus(null)
+      usagePartsRef.current = []
+      onRunError?.()
+      setLocalError(err.message || t('chat.requestFailed'))
+    },
+  })
+  return { ...chat, clearLlmUsage }
+}
+
+export function useAgentRunPolling(
+  chat: ReadingRoomChat,
+  conversations: ReadingRoomConversations,
+  token: string | undefined,
+  setLocalError: (value: string) => void,
+): AgentRunController {
+  const [records, setRecords] = useState<Record<string, AgentRunRecord>>({})
+  const tools = useMemo(
+    () => collectConversationSandboxRunTools(chat.messages, conversations),
+    [chat.messages, conversations],
+  )
+  const activeTools = useMemo(() => tools.filter((tool) => !isAgentRunTerminal(records[tool.runId] || tool.record)), [records, tools])
+
+  useEffect(() => {
+    if (tools.length === 0) return
+    setRecords((current) => mergeAgentRunRecords(current, tools.map((tool) => tool.record)))
+  }, [tools])
+
+  const applyPushedRecord = useCallback((record: AgentRunRecord) => {
+    setRecords((current) => mergeAgentRunRecords(current, [record]))
+  }, [])
+  const pushConnected = useAgentRunSocket(token, activeTools.length > 0, applyPushedRecord)
+
+  useEffect(() => {
+    if (!token || activeTools.length === 0) return
+    let cancelled = false
+    const poll = async () => {
+      const results = await Promise.allSettled(activeTools.map(async (tool) => {
+        const record = await fetchAgentRun(tool.runId, token)
+        return { tool, record: record ?? expiredAgentRun(tool.record) }
+      }))
+      if (cancelled) return
+      const next: AgentRunRecord[] = []
+      for (const result of results) {
+        if (result.status === 'fulfilled') next.push(result.value.record)
+      }
+      if (next.length > 0) setRecords((current) => mergeAgentRunRecords(current, next))
+      const failure = results.find((result) => result.status === 'rejected')
+      if (failure?.status === 'rejected') setLocalError(failure.reason instanceof Error ? failure.reason.message : '隔离任务状态读取失败')
+    }
+    void poll()
+    // With a live push channel, polling is only a safety net against missed messages.
+    const interval = window.setInterval(() => { void poll() }, pushConnected ? 15_000 : 2_000)
+    return () => { cancelled = true; window.clearInterval(interval) }
+  }, [activeTools, pushConnected, setLocalError, token])
+
+  useEffect(() => {
+    for (const tool of tools) {
+      const record = records[tool.runId] || tool.record
+      // Normalize the approval/output lifecycle as soon as the queued result exists, then
+      // keep replacing that same output as polling advances it to a terminal state.
+      conversations.replaceToolOutput(tool.conversationId, tool.toolCallId, record)
+      if (tool.conversationId === conversations.activeId) {
+        chat.setMessages((messages) => replaceConversationToolOutput(messages, tool.toolCallId, record))
+      }
+    }
+  }, [chat, conversations, records, tools])
+
+  const cancel = useCallback(async (runId: string) => {
+    if (!token) return
+    try {
+      const record = await cancelAgentRun(runId, token)
+      setRecords((current) => ({ ...current, [runId]: record }))
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : '隔离任务取消失败')
+    }
+  }, [setLocalError, token])
+
+  return useMemo(() => ({ records, cancel }), [cancel, records])
+}
+
+function collectConversationSandboxRunTools(
+  messages: UIMessage[],
+  conversations: ReadingRoomConversations,
+): ConversationSandboxRunTool[] {
+  const activeTools = collectSandboxRunTools(messages).map((tool) => ({ ...tool, conversationId: conversations.activeId }))
+  const storedTools = conversations.items
+    .filter((conversation) => conversation.id !== conversations.activeId)
+    .flatMap((conversation) => collectSandboxRunTools(conversation.messages).map((tool) => ({ ...tool, conversationId: conversation.id })))
+  return deduplicateConversationSandboxRunTools([...activeTools, ...storedTools])
+}
+
+function deduplicateConversationSandboxRunTools(tools: ConversationSandboxRunTool[]): ConversationSandboxRunTool[] {
+  const runIds = new Set<string>()
+  return tools.filter((tool) => {
+    if (runIds.has(tool.runId)) return false
+    runIds.add(tool.runId)
+    return true
+  })
+}
+
+export function useAgentRunInterpretation(
+  chat: ReadingRoomChat,
+  queue: MessageQueue,
+  loading: boolean,
+  setLocalError: (value: string) => void,
+  t: (key: TranslationKey) => string,
+): (runId: string) => void {
+  return useCallback((runId: string) => {
+    const prompt = `请根据本轮已完成的隔离 Python 研究计算结果（runId: ${runId}）给出简明解读：说明结果、计算局限，以及它不构成投资建议。不要重新执行沙箱。`
+    if (loading) {
+      queue.enqueue(prompt)
+      return
+    }
+    setLocalError('')
+    chat.clearError()
+    void chat.sendMessage({ text: prompt }).catch((error: unknown) => {
+      setLocalError(normalizeClientError(error, t))
+    })
+  }, [chat, loading, queue, setLocalError, t])
+}
+
+export function useChatConfig(
+  token: string | undefined,
+  t: (key: TranslationKey, vars?: Record<string, string>) => string,
+): ChatConfig {
+  const [config, setConfig] = useState<ChatConfig>({ configured: false, model: null })
+  useEffect(() => {
+    if (!token) return
+    let cancelled = false
+    fetchChatConfig(token, t)
+      .then((next) => { if (!cancelled) setConfig(next) })
+      .catch(() => {
+        if (!cancelled) setConfig({ configured: false, model: null, error: t('chat.configUnreachable') })
+      })
+    return () => { cancelled = true }
+  }, [t, token])
+  return config
+}
+
+export function hasPendingToolApproval(messages: UIMessage[]): boolean {
+  for (const message of messages) {
+    for (const part of message.parts ?? []) {
+      if (!part || typeof part !== 'object') continue
+      const state = 'state' in part ? String((part as { state?: unknown }).state ?? '') : ''
+      if (state === 'approval-requested') return true
+    }
+  }
+  return false
+}
+
+export function useMessageQueue(
+  chat: ReadingRoomChat,
+  loading: boolean,
+  token: string | undefined,
+  configured: boolean,
+  setLocalError: (value: string) => void,
+  t: (key: TranslationKey) => string,
+): MessageQueue {
+  const [messages, setMessages] = useState<QueuedMessage[]>([])
+  const dispatchingRef = useRef('')
+  const enqueue = useCallback((text: string) => {
+    setMessages((items) => {
+      if (items.length >= MAX_QUEUED_MESSAGES) {
+        setLocalError(t('chat.queueFull'))
+        return items
+      }
+      return [...items, { id: createQueuedMessageId(), text }]
+    })
+  }, [setLocalError, t])
+  const clear = useCallback(() => setMessages([]), [])
+
+  useEffect(() => {
+    const next = messages[0]
+    // 审批未完成时 loading 可能已 false，不能把队列消息抢发出去。
+    if (!next || loading || !token || !configured || dispatchingRef.current) return
+    if (hasPendingToolApproval(chat.messages)) return
+    dispatchingRef.current = next.id
+    setMessages((items) => items[0]?.id === next.id ? items.slice(1) : items.filter((item) => item.id !== next.id))
+    setLocalError('')
+    chat.clearError()
+    void chat.sendMessage({ text: next.text })
+      .catch((error: unknown) => setLocalError(normalizeClientError(error, t)))
+      .finally(() => { dispatchingRef.current = '' })
+  }, [chat, configured, loading, messages, setLocalError, t, token])
+
+  return useMemo(() => ({ messages, enqueue, clear }), [clear, enqueue, messages])
+}
+
+export function useAutoScroll(
+  ref: RefObject<HTMLDivElement | null>,
+  messages: UIMessage[],
+  loading: boolean,
+  queuedCount: number,
+) {
+  useEffect(() => {
+    ref.current?.scrollTo({ top: ref.current.scrollHeight, behavior: 'smooth' })
+  }, [messages, loading, queuedCount, ref])
+}
+
+function createQueuedMessageId(): string {
+  return `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+function mergeAgentRunRecords(
+  current: Record<string, AgentRunRecord>,
+  next: AgentRunRecord[],
+): Record<string, AgentRunRecord> {
+  let changed = false
+  const merged = { ...current }
+  for (const record of next) {
+    if (shouldReplaceAgentRunRecord(merged[record.id], record)) {
+      merged[record.id] = record
+      changed = true
+    }
+  }
+  return changed ? merged : current
+}
+
+function shouldReplaceAgentRunRecord(current: AgentRunRecord | undefined, next: AgentRunRecord): boolean {
+  if (!current) return true
+  const currentRank = agentRunStatusRank(current)
+  const nextRank = agentRunStatusRank(next)
+  if (currentRank !== nextRank) return nextRank > currentRank
+  if (current.status !== next.status) return false
+  return JSON.stringify(current) !== JSON.stringify(next)
+}
+
+function agentRunStatusRank(record: AgentRunRecord): number {
+  if (isAgentRunTerminal(record)) return 2
+  return record.status === 'running' ? 1 : 0
+}
+
+function normalizeClientError(error: unknown, t: (key: TranslationKey) => string): string {
+  return error instanceof Error ? error.message : t('chat.requestFailed')
+}
+
+function buildChatTransport(
+  token: string | undefined,
+  watchlistRef: RefObject<Pick<WatchItem, 'code' | 'name'>[]>,
+  marketWatchRef: RefObject<MarketWatchSnapshot | null>,
+) {
+  return new DefaultChatTransport({
+    api: apiUrl('/api/chat'),
+    headers: (): Record<string, string> => token ? { Authorization: `Bearer ${token}` } : {},
+    body: () => ({ watchlist: watchlistRef.current, marketWatch: marketWatchRef.current }),
+  })
+}
+
+async function fetchChatConfig(
+  token: string,
+  t: (key: TranslationKey, vars?: Record<string, string>) => string,
+): Promise<ChatConfig> {
+  let response: Response
+  try {
+    response = await fetch(apiUrl('/api/chat/config'), {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+  } catch {
+    return { configured: false, model: null, error: t('chat.configUnreachable') }
+  }
+  if (!response.ok) return { configured: false, model: null, error: t('chat.configHttpError', { status: String(response.status) }) }
+  return await response.json() as ChatConfig
+}

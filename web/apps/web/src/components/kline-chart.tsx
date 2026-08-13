@@ -1,5 +1,8 @@
 import { useState, useEffect, useMemo, useRef } from 'react'
+import { watchChartResize } from '@/lib/chart-resize'
+import { formatSignedPercent } from '@/lib/format'
 import { avg, rsi as calcRSI, macd as calcMACD, bollinger as calcBollinger } from '@/lib/math'
+import type { KlineRow } from '@wyckoff/shared'
 import {
   createChart,
   CandlestickSeries,
@@ -17,15 +20,6 @@ import {
   type Time,
 } from 'lightweight-charts'
 
-interface KlineData {
-  date: string
-  open: number
-  high: number
-  low: number
-  close: number
-  volume: number
-}
-
 interface WyckoffMarkerInput {
   date: string
   type: 'spring' | 'sos' | 'lps' | 'evr'
@@ -34,12 +28,13 @@ interface WyckoffMarkerInput {
 }
 
 interface KlineChartProps {
-  data: KlineData[]
+  data: KlineRow[]
   height?: number
   wyckoffMarkers?: WyckoffMarkerInput[]
   tradingRange?: { support: number; resistance: number }
   stage?: string
   showIndicators?: boolean
+  onBarClick?: (date: string) => void
 }
 
 interface StructureSnapshot {
@@ -66,7 +61,7 @@ interface ChartRefs {
 
 type ChartTheme = ReturnType<typeof readChartTheme>
 
-export function KlineChart({ data, height = 400, wyckoffMarkers, tradingRange, stage, showIndicators = false }: KlineChartProps) {
+export function KlineChart({ data, height = 400, wyckoffMarkers, tradingRange, stage, showIndicators = false, onBarClick }: KlineChartProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRefs = useRef<ChartRefs | null>(null)
   const themeRef = useRef(readChartTheme())
@@ -75,6 +70,7 @@ export function KlineChart({ data, height = 400, wyckoffMarkers, tradingRange, s
 
   useChartInit(containerRef, chartRefs, themeRef, height)
   useChartData(chartRefs, themeRef, data, wyckoffMarkers, tradingRange)
+  useChartSelection(chartRefs, onBarClick)
   useBollingerOverlay(chartRefs, data, indicators.boll)
 
   const closes = useMemo(() => data.map((d) => d.close), [data])
@@ -83,13 +79,29 @@ export function KlineChart({ data, height = 400, wyckoffMarkers, tradingRange, s
   return (
     <div className="space-y-3">
       {structure && <StructureMetrics structure={structure} />}
-      <div ref={containerRef} className="h-[350px] w-full overflow-hidden rounded-lg border border-border bg-background sm:h-auto" />
+      <div
+        ref={containerRef}
+        className={`w-full overflow-hidden rounded-lg border border-border bg-background ${onBarClick ? 'cursor-crosshair' : ''}`}
+        style={{ height }}
+      />
       {showIndicators && <IndicatorBar indicators={indicators} setIndicators={setIndicators} />}
       {indicators.rsi && <RSISubChart closes={closes} dates={dates} />}
       {indicators.macd && <MACDSubChart closes={closes} dates={dates} />}
       <ChartLegend boll={indicators.boll} wyckoffMarkers={!!wyckoffMarkers} />
     </div>
   )
+}
+
+function useChartSelection(chartRefs: React.MutableRefObject<ChartRefs | null>, onBarClick?: (date: string) => void) {
+  useEffect(() => {
+    const chart = chartRefs.current?.chart
+    if (!chart || !onBarClick) return
+    const handleClick = (param: { time?: Time }) => {
+      if (typeof param.time === 'string') onBarClick(param.time)
+    }
+    chart.subscribeClick(handleClick)
+    return () => chart.unsubscribeClick(handleClick)
+  }, [chartRefs, onBarClick])
 }
 
 function useChartInit(
@@ -122,17 +134,15 @@ function useChartInit(
     const volume = chart.addSeries(HistogramSeries, { priceFormat: { type: 'volume' }, priceScaleId: 'volume' })
     chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.84, bottom: 0 } })
     chartRefs.current = { chart, candle, ma5, ma20, ma50, volume, markers: null }
-    const handleResize = () => { if (containerRef.current) chart.applyOptions({ width: containerRef.current.clientWidth }) }
-    window.addEventListener('resize', handleResize)
-    handleResize()
-    return () => { window.removeEventListener('resize', handleResize); chartRefs.current?.markers?.detach(); chart.remove(); chartRefs.current = null }
-  }, [height])
+    const stopResize = watchChartResize(containerRef.current, chart)
+    return () => { stopResize(); chartRefs.current?.markers?.detach(); chart.remove(); chartRefs.current = null }
+  }, [containerRef, chartRefs, themeRef, height])
 }
 
 function useChartData(
   chartRefs: React.MutableRefObject<ChartRefs | null>,
   themeRef: React.MutableRefObject<ChartTheme>,
-  data: KlineData[],
+  data: KlineRow[],
   wyckoffMarkers: WyckoffMarkerInput[] | undefined,
   tradingRange: { support: number; resistance: number } | undefined,
 ) {
@@ -155,10 +165,10 @@ function useChartData(
     refs.candle.priceLines().forEach((line) => refs.candle.removePriceLine(line))
     addPriceLines(refs.candle, tradingRange ?? buildPriceLevels(data), theme)
     refs.chart.timeScale().fitContent()
-  }, [data, wyckoffMarkers, tradingRange])
+  }, [chartRefs, themeRef, data, wyckoffMarkers, tradingRange])
 }
 
-function useBollingerOverlay(chartRefs: React.MutableRefObject<ChartRefs | null>, data: KlineData[], active: boolean) {
+function useBollingerOverlay(chartRefs: React.MutableRefObject<ChartRefs | null>, data: KlineRow[], active: boolean) {
   useEffect(() => {
     const refs = chartRefs.current
     if (!refs || data.length === 0) return
@@ -174,13 +184,13 @@ function useBollingerOverlay(chartRefs: React.MutableRefObject<ChartRefs | null>
       bollRefs.push(upper, mid, lower)
     }
     return () => { bollRefs.forEach((s) => refs.chart.removeSeries(s)) }
-  }, [data, active])
+  }, [chartRefs, data, active])
 }
 
 function StructureMetrics({ structure }: { structure: StructureSnapshot }) {
   return (
     <div className="grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-4">
-      <Metric label="最新收盘" value={`${formatPrice(structure.latestClose)} (${formatPct(structure.changePct)})`} tone={structure.tone} />
+      <Metric label="最新收盘" value={`${formatPrice(structure.latestClose)} (${formatSignedPercent(structure.changePct)})`} tone={structure.tone} />
       <Metric label="结构状态" value={structure.phase} tone={structure.tone} />
       <Metric label="支撑 / 压力" value={`${formatPrice(structure.support)} / ${formatPrice(structure.resistance)}`} />
       <Metric label="量能 / 均线" value={`${structure.volumeRatio.toFixed(1)}x · MA20 ${formatPrice(structure.ma20)} · MA50 ${formatPrice(structure.ma50)}`} />
@@ -257,10 +267,8 @@ function RSISubChart({ closes, dates }: { closes: number[]; dates: string[] }) {
     line.createPriceLine({ price: 70, color: '#ef4444', lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false })
     line.createPriceLine({ price: 30, color: '#10b981', lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false })
     chart.timeScale().fitContent()
-    const resize = () => { if (containerRef.current) chart.applyOptions({ width: containerRef.current.clientWidth }) }
-    window.addEventListener('resize', resize)
-    resize()
-    return () => { window.removeEventListener('resize', resize); chart.remove() }
+    const stopResize = watchChartResize(containerRef.current, chart)
+    return () => { stopResize(); chart.remove() }
   }, [closes, dates])
   return <div ref={containerRef} className="w-full overflow-hidden rounded-lg border border-border bg-background" />
 }
@@ -291,10 +299,8 @@ function MACDSubChart({ closes, dates }: { closes: number[]; dates: string[] }) 
         .filter(Boolean) as HistogramData<Time>[],
     )
     chart.timeScale().fitContent()
-    const resize = () => { if (containerRef.current) chart.applyOptions({ width: containerRef.current.clientWidth }) }
-    window.addEventListener('resize', resize)
-    resize()
-    return () => { window.removeEventListener('resize', resize); chart.remove() }
+    const stopResize = watchChartResize(containerRef.current, chart)
+    return () => { stopResize(); chart.remove() }
   }, [closes, dates])
   return <div ref={containerRef} className="w-full overflow-hidden rounded-lg border border-border bg-background" />
 }
@@ -348,7 +354,7 @@ function readChartTheme() {
   }
 }
 
-function movingAverage(data: KlineData[], period: number): LineData<Time>[] {
+function movingAverage(data: KlineRow[], period: number): LineData<Time>[] {
   if (data.length < period) return []
   const points: LineData<Time>[] = []
   let sum = 0
@@ -375,7 +381,7 @@ function toSeriesMarkers(markers: WyckoffMarkerInput[]): SeriesMarker<Time>[] {
   })
 }
 
-function buildMarkers(data: KlineData[]): SeriesMarker<Time>[] {
+function buildMarkers(data: KlineRow[]): SeriesMarker<Time>[] {
   const markers: SeriesMarker<Time>[] = []
   const start = Math.max(20, data.length - 150)
 
@@ -417,7 +423,7 @@ function buildMarkers(data: KlineData[]): SeriesMarker<Time>[] {
 }
 
 function buildStructureSnapshot(
-  data: KlineData[],
+  data: KlineRow[],
   trOverride?: { support: number; resistance: number },
   stageOverride?: string,
 ): StructureSnapshot | null {
@@ -447,7 +453,7 @@ function buildStructureSnapshot(
   return { changePct, latestClose: latest.close, ma20, ma50, volumeRatio, ...levels, phase: '区间观察', tone: 'watch' }
 }
 
-function buildPriceLevels(data: KlineData[]) {
+function buildPriceLevels(data: KlineRow[]) {
   const recent = data.slice(-60)
   return {
     support: Math.min(...recent.map((d) => d.low)),
@@ -457,9 +463,4 @@ function buildPriceLevels(data: KlineData[]) {
 
 function formatPrice(value: number): string {
   return Number.isFinite(value) ? value.toFixed(2) : '--'
-}
-
-function formatPct(value: number): string {
-  if (!Number.isFinite(value)) return '--'
-  return `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`
 }

@@ -40,6 +40,14 @@ SECRET_PATTERNS = (
 DANGEROUS_FILENAMES = {".env", ".env.local", "id_rsa", "id_ed25519"}
 DANGEROUS_SUFFIXES = {".db", ".dump", ".key", ".log", ".pem", ".sqlite", ".sqlite3"}
 DANGEROUS_PREFIXES = ("logs/", ".traces/", "artifacts/")
+DEPENDENCY_FILE_NAMES = {
+    "package.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "package-lock.json",
+    "uv.lock",
+}
+DEPENDABOT_LOGINS = {"dependabot[bot]", "dependabot-preview[bot]"}
 
 
 @dataclass(frozen=True)
@@ -76,7 +84,24 @@ def _dangerous_files(changed_files: list[str]) -> list[str]:
     return dangerous
 
 
-def validate_policy(body: str, changed_files: list[str]) -> PolicyResult:
+def _dependency_only_change(changed_files: list[str]) -> bool:
+    if not changed_files:
+        return False
+    for raw_path in changed_files:
+        path = raw_path.strip()
+        if not path:
+            continue
+        if Path(path).name not in DEPENDENCY_FILE_NAMES and not path.endswith(".lock"):
+            return False
+    return True
+
+
+def validate_policy(
+    body: str,
+    changed_files: list[str],
+    *,
+    automated_dependency_pr: bool = False,
+) -> PolicyResult:
     failures: list[str] = []
     warnings: list[str] = []
     body = body.strip()
@@ -84,10 +109,11 @@ def validate_policy(body: str, changed_files: list[str]) -> PolicyResult:
         return PolicyResult(ok=False, failures=("PR body is empty",), warnings=())
 
     headings = _heading_names(body)
-    if not headings.intersection(SUMMARY_HEADINGS):
-        failures.append("PR body is missing a Summary/变更摘要 section")
-    if not headings.intersection(VALIDATION_HEADINGS):
-        failures.append("PR body is missing a Validation/验证 section")
+    if not automated_dependency_pr:
+        if not headings.intersection(SUMMARY_HEADINGS):
+            failures.append("PR body is missing a Summary/变更摘要 section")
+        if not headings.intersection(VALIDATION_HEADINGS):
+            failures.append("PR body is missing a Validation/验证 section")
 
     for pattern in SECRET_PATTERNS:
         if pattern.search(body):
@@ -116,6 +142,26 @@ def _load_body(args: argparse.Namespace) -> str:
     raise SystemExit("error: provide --body, --body-file, or --event-path with pull_request.body")
 
 
+def _load_event(args: argparse.Namespace) -> dict:
+    event_path = args.event_path or os.environ.get("GITHUB_EVENT_PATH")
+    if not event_path:
+        return {}
+    return json.loads(Path(event_path).read_text(encoding="utf-8"))
+
+
+def _is_dependabot_event(event: dict) -> bool:
+    if not isinstance(event, dict):
+        return False
+    pull_request = event.get("pull_request", {})
+    pr_user = pull_request.get("user", {}) if isinstance(pull_request, dict) else {}
+    sender = event.get("sender", {})
+    logins = [
+        pr_user.get("login") if isinstance(pr_user, dict) else "",
+        sender.get("login") if isinstance(sender, dict) else "",
+    ]
+    return any(str(login or "").lower() in DEPENDABOT_LOGINS for login in logins)
+
+
 def _load_changed_files(args: argparse.Namespace) -> list[str]:
     if args.changed_file:
         return args.changed_file
@@ -137,7 +183,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--changed-file", action="append", default=[], help="Changed path; repeatable")
     args = parser.parse_args(argv)
 
-    result = validate_policy(_load_body(args), _load_changed_files(args))
+    changed_files = _load_changed_files(args)
+    event = _load_event(args)
+    result = validate_policy(
+        _load_body(args),
+        changed_files,
+        automated_dependency_pr=_is_dependabot_event(event) and _dependency_only_change(changed_files),
+    )
     if result.ok:
         print("PR Policy: PASS")
         for warning in result.warnings:

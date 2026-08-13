@@ -15,10 +15,17 @@ from typing import Any
 from supabase import Client
 
 from core.constants import TABLE_MARKET_SIGNAL_DAILY
+from core.market_trade_mode import (
+    EXECUTE_BLOCK_NEW_BUY_REGIMES,
+    KNOWN_MARKET_REGIMES,
+    PROBE_ONLY_REGIMES,
+    stricter_market_regime,
+)
 from integrations.supabase_base import create_admin_client as _get_supabase_admin_client
 from integrations.supabase_base import create_read_client as _get_supabase_read_client
 from integrations.supabase_base import is_admin_configured as is_supabase_admin_configured
 from integrations.supabase_base import require_server_write_context
+from utils.safe import finite_float as _safe_float
 
 logger = logging.getLogger(__name__)
 
@@ -32,78 +39,61 @@ def _normalize_trade_date(raw: Any) -> str:
     return text
 
 
-def _safe_float(raw: Any) -> float | None:
-    try:
-        if raw is None:
-            return None
-        text = str(raw).strip().replace(",", "")
-        if not text:
-            return None
-        return float(text)
-    except Exception:
-        return None
-
-
-def _format_signed_pct(raw: Any) -> str:
-    value = _safe_float(raw)
-    if value is None:
-        return "--"
-    return f"{value:+.2f}%"
-
-
-def _format_plain(raw: Any, digits: int = 2) -> str:
-    value = _safe_float(raw)
-    if value is None:
-        return "--"
-    return f"{value:.{digits}f}"
-
-
-def _benchmark_regime_desc(regime: str) -> str:
-    mapping = {
-        "RISK_ON": "偏强",
-        "NEUTRAL": "中性",
-        "RISK_OFF": "偏弱",
-        "CRASH": "极弱",
-        "BLACK_SWAN": "极端恶劣",
-        "UNKNOWN": "待确认",
-    }
-    return mapping.get(str(regime or "").strip().upper(), "待确认")
-
-
-def _premarket_regime_desc(regime: str) -> str:
-    mapping = {
-        "NORMAL": "平稳",
-        "CAUTION": "情绪冲击",
-        "RISK_OFF": "转冷",
-        "BLACK_SWAN": "急剧恶化",
-    }
-    return mapping.get(str(regime or "").strip().upper(), "待确认")
+def market_signal_readiness(row: dict[str, Any] | None, expected_trade_date: date | str) -> dict[str, str]:
+    expected = _normalize_trade_date(expected_trade_date)
+    if not row:
+        return {"status": "missing", "reason": "market_signal_daily 无当日记录"}
+    actual = _normalize_trade_date(row.get("trade_date"))
+    if not actual or actual != expected:
+        return {"status": "stale", "reason": f"市场信号日期 {actual or '-'} != {expected}"}
+    benchmark = str(row.get("benchmark_regime") or "").strip().upper()
+    if not benchmark:
+        return {"status": "partial", "reason": "当日盘后 benchmark 尚未就绪"}
+    if benchmark not in KNOWN_MARKET_REGIMES:
+        return {"status": "partial", "reason": f"当日 benchmark 状态无效: {benchmark}"}
+    premarket = str(row.get("premarket_regime") or "").strip().upper()
+    if not premarket:
+        return {"status": "partial", "reason": "当日盘前风险尚未就绪"}
+    if premarket not in {"NORMAL", "CAUTION", "RISK_OFF", "BLACK_SWAN"}:
+        return {"status": "partial", "reason": f"当日盘前风险状态无效: {premarket}"}
+    return {"status": "ready", "reason": "当日 benchmark 与盘前风险均已就绪"}
 
 
 def _normalize_benchmark_slot(regime: str) -> str:
     normalized = str(regime or "").strip().upper()
+    if not normalized:
+        return "UNKNOWN"
     if normalized == "RISK_ON":
         return "RISK_ON"
     if normalized == "NEUTRAL":
         return "NEUTRAL"
+    if normalized == "CAUTION":
+        return "CAUTION"
+    if normalized in {"PANIC_REPAIR_CONFIRMED", "PANIC_REPAIR_INTRADAY"}:
+        return "CAUTION"
     if normalized in {"CRASH", "BLACK_SWAN"}:
         return "CRASH"
-    return "RISK_OFF"
+    if normalized in {"RISK_OFF", "BEAR_REBOUND", "PANIC_REPAIR"}:
+        return "RISK_OFF"
+    return "UNKNOWN"
 
 
 def _normalize_premarket_slot(regime: str) -> str:
     normalized = str(regime or "").strip().upper()
-    if normalized in {"BLACK_SWAN", "RISK_OFF", "CAUTION", "NORMAL"}:
+    if normalized in {"UNKNOWN", "BLACK_SWAN", "RISK_OFF", "CAUTION", "NORMAL"}:
         return normalized
-    return "NORMAL"
+    return "UNKNOWN"
 
 
 def _benchmark_state_sentence(regime: str) -> str:
     mapping = {
-        "RISK_ON": "盘后主线仍偏强",
+        "RISK_ON": "盘后市场处于过热禁追区",
         "NEUTRAL": "盘后市场仍在震荡观察",
+        "CAUTION": "盘后广度转弱，需要谨慎确认",
         "RISK_OFF": "盘后市场已偏弱",
         "CRASH": "盘后市场已处在明显防守区",
+        "PANIC_REPAIR": "盘后市场出现修复候选，仍需次日确认",
+        "PANIC_REPAIR_CONFIRMED": "盘后修复已通过次日广度与价格确认",
         "BLACK_SWAN": "盘后市场已处在明显防守区",
         "UNKNOWN": "盘后市场状态仍待确认",
     }
@@ -112,6 +102,7 @@ def _benchmark_state_sentence(regime: str) -> str:
 
 def _premarket_state_sentence(regime: str) -> str:
     mapping = {
+        "UNKNOWN": "隔夜外部数据仍待确认",
         "NORMAL": "隔夜外部冲击相对平稳",
         "CAUTION": "隔夜情绪扰动已经出现",
         "RISK_OFF": "隔夜风险偏好明显转冷",
@@ -129,6 +120,33 @@ STRUCTURED_MARKET_SIGNAL_FIELDS = {
     "water_phrase",
     "action_phrase",
 }
+CUSTOM_BANNER_FIELDS = ("banner_title", "banner_message", "banner_tone")
+BENCHMARK_MERGE_FIELDS = (
+    "trade_date",
+    "benchmark_regime",
+    "main_index_code",
+    "main_index_close",
+    "main_index_ma50",
+    "main_index_ma200",
+    "main_index_recent3_cum_pct",
+    "main_index_today_pct",
+    "smallcap_index_code",
+    "smallcap_close",
+    "smallcap_recent3_cum_pct",
+)
+PREMARKET_MERGE_FIELDS = ("premarket_regime", "premarket_reasons")
+A50_MERGE_FIELDS = ("a50_value_date", "a50_source", "a50_close", "a50_pct_chg")
+VIX_MERGE_FIELDS = ("vix_value_date", "vix_source", "vix_close", "vix_pct_chg")
+
+UNKNOWN_MARKET_STRATEGY = {
+    "posture_code": "DATA_HOLD",
+    "posture_name": "数据待确认",
+    "tone": "保守",
+    "title": "亲爱的投资者，关键市场数据尚未完整就绪，当前先暂停新开仓。",
+    "wind": "市场风向仍待数据确认",
+    "water": "资金状态暂不作乐观推断",
+    "action": "只管理已有仓位，禁止新开仓，等待关键数据恢复",
+}
 
 
 MARKET_BANNER_MATRIX: dict[str, dict[str, dict[str, str]]] = {
@@ -140,7 +158,7 @@ MARKET_BANNER_MATRIX: dict[str, dict[str, dict[str, str]]] = {
             "title": "亲爱的投资者，最新交易日大盘偏强，但隔夜恐慌冲击已显著抬升。",
             "wind": "盘面风向正在由进攻转向防守",
             "water": "避险资金正在快速回流",
-            "action": "先收缩防线，暂停激进追价，只保留最确定的观察与应对",
+            "action": "暂停新开仓，只管理已有仓位并等待过热与隔夜冲击同时缓解",
         },
         "NEUTRAL": {
             "posture_code": "HARD_DEFENSE",
@@ -178,7 +196,7 @@ MARKET_BANNER_MATRIX: dict[str, dict[str, dict[str, str]]] = {
             "title": "亲爱的投资者，最新交易日大盘偏强，但隔夜风险偏好已经转冷。",
             "wind": "盘面风向仍在上方，但阻力开始变大",
             "water": "资金从全面进攻转向去弱留强",
-            "action": "控制节奏和仓位，只跟随最强、最清晰的主线机会",
+            "action": "停止新开仓，只做已有仓位的持有、减仓或退出管理",
         },
         "NEUTRAL": {
             "posture_code": "DEFENSIVE",
@@ -210,13 +228,13 @@ MARKET_BANNER_MATRIX: dict[str, dict[str, dict[str, str]]] = {
     },
     "CAUTION": {
         "RISK_ON": {
-            "posture_code": "CONTROLLED_ATTACK",
-            "posture_name": "控制试探",
-            "tone": "谨慎乐观",
-            "title": "亲爱的投资者，最新交易日大盘仍偏强，但隔夜情绪出现扰动。",
-            "wind": "做多风向还在，但节奏开始放缓",
-            "water": "资金仍会流向强者，只是不再全面扩散",
-            "action": "可以继续顺势跟随，但要用更轻的仓位去做更高胜率的确认机会",
+            "posture_code": "OVERHEAT_HOLD",
+            "posture_name": "过热不追",
+            "tone": "保守",
+            "title": "亲爱的投资者，盘后市场过热且隔夜情绪出现扰动，当前不要追新。",
+            "wind": "短线过热尚未消化，隔夜扰动进一步降低容错",
+            "water": "资金集中度较高，但追涨反转风险仍在",
+            "action": "暂停新开仓，只管理已有仓位并等待重新回到可执行区",
         },
         "NEUTRAL": {
             "posture_code": "PATIENT_OBSERVE",
@@ -248,13 +266,13 @@ MARKET_BANNER_MATRIX: dict[str, dict[str, dict[str, str]]] = {
     },
     "NORMAL": {
         "RISK_ON": {
-            "posture_code": "FULL_ATTACK",
-            "posture_name": "顺势进攻",
-            "tone": "乐观",
-            "title": "亲爱的投资者，最新交易日内外部信号共振偏强。",
-            "wind": "做多风向仍在发酵",
-            "water": "资金仍在向强势主线集中",
-            "action": "顺势跟随，但只参与有确认、有纪律的高胜率机会",
+            "posture_code": "OVERHEAT_HOLD",
+            "posture_name": "过热不追",
+            "tone": "保守",
+            "title": "亲爱的投资者，隔夜环境平稳，但盘后市场仍处于过热禁追区。",
+            "wind": "强势风向已进入容易反转的过热阶段",
+            "water": "资金仍集中于强势方向，但新增追价的赔率不足",
+            "action": "暂停新开仓，只管理已有仓位并等待过热降温",
         },
         "NEUTRAL": {
             "posture_code": "PATIENT_OBSERVE",
@@ -287,15 +305,28 @@ MARKET_BANNER_MATRIX: dict[str, dict[str, dict[str, str]]] = {
 }
 
 
+def _select_market_strategy(premarket_slot: str, benchmark_slot: str) -> dict[str, str]:
+    if "UNKNOWN" in {premarket_slot, benchmark_slot}:
+        return UNKNOWN_MARKET_STRATEGY
+    benchmark_key = "NEUTRAL" if benchmark_slot == "CAUTION" else benchmark_slot
+    strategy = MARKET_BANNER_MATRIX.get(premarket_slot, {}).get(benchmark_key)
+    if not strategy:
+        return UNKNOWN_MARKET_STRATEGY
+    effective_regime = stricter_market_regime(premarket_slot, benchmark_slot)
+    if effective_regime in EXECUTE_BLOCK_NEW_BUY_REGIMES:
+        return {**strategy, "action": "只管理已有仓位，禁止新开仓"}
+    if effective_regime in PROBE_ONLY_REGIMES:
+        return {**strategy, "action": "最多一只二次确认候选执行小额 PROBE，禁止 ATTACK"}
+    return strategy
+
+
 def compose_market_state(row: dict[str, Any] | None) -> dict[str, str]:
     data = dict(row or {})
     benchmark_regime = str(data.get("benchmark_regime", "") or "").strip().upper()
     premarket_regime = str(data.get("premarket_regime", "") or "").strip().upper()
     benchmark_slot = _normalize_benchmark_slot(benchmark_regime)
     premarket_slot = _normalize_premarket_slot(premarket_regime)
-    strategy = (
-        MARKET_BANNER_MATRIX.get(premarket_slot, {}).get(benchmark_slot) or MARKET_BANNER_MATRIX["CAUTION"]["NEUTRAL"]
-    )
+    strategy = _select_market_strategy(premarket_slot, benchmark_slot)
 
     return {
         "benchmark_slot": benchmark_slot,
@@ -314,10 +345,7 @@ def compose_market_banner(row: dict[str, Any] | None) -> dict[str, str]:
     benchmark_regime = str(data.get("benchmark_regime", "") or "").strip().upper()
     premarket_regime = str(data.get("premarket_regime", "") or "").strip().upper()
     state = compose_market_state(data)
-    title = (
-        MARKET_BANNER_MATRIX.get(state["premarket_slot"], {}).get(state["benchmark_slot"], {}).get("title")
-        or "亲爱的投资者，最新交易日请顺势而为，保持节奏。"
-    )
+    title = _select_market_strategy(state["premarket_slot"], state["benchmark_slot"])["title"]
     body = (
         "以上指标按各自最新可用时间更新。"
         f"{_benchmark_state_sentence(benchmark_regime)}，{_premarket_state_sentence(premarket_regime)}。"
@@ -342,6 +370,77 @@ def _deep_merge_source_jobs(base: Any, patch: Any) -> dict[str, Any]:
             merged[key] = {**merged[key], **value}
         else:
             merged[key] = value
+    return merged
+
+
+def _custom_banner_fields(row: dict[str, Any] | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key in CUSTOM_BANNER_FIELDS:
+        text = str((row or {}).get(key) or "").strip()
+        if text:
+            out[key] = text
+    return out
+
+
+def _is_non_empty(value: Any) -> bool:
+    if value is None:
+        return False
+    return str(value).strip() != ""
+
+
+def _pick_latest_with_fields(rows: list[dict[str, Any]], required_any: tuple[str, ...]) -> dict[str, Any] | None:
+    for row in rows:
+        if any(_is_non_empty(row.get(key)) for key in required_any):
+            return row
+    return None
+
+
+def _copy_market_signal_fields(target: dict[str, Any], source: dict[str, Any] | None, fields: tuple[str, ...]) -> None:
+    if not source:
+        return
+    for key in fields:
+        target[key] = source.get(key)
+
+
+def _latest_market_signal_rows(client: Client, limit: int = 120) -> list[dict[str, Any]]:
+    resp = (
+        client.table(TABLE_MARKET_SIGNAL_DAILY)
+        .select("*")
+        .order("trade_date", desc=True)
+        .order("updated_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return [dict(row) for row in (resp.data or []) if isinstance(row, dict)]
+
+
+def _merge_latest_market_signal_rows(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    merged = dict(rows[0])
+    _copy_market_signal_fields(
+        merged,
+        _pick_latest_with_fields(rows, ("benchmark_regime", "main_index_close", "main_index_ma50", "main_index_ma200")),
+        BENCHMARK_MERGE_FIELDS,
+    )
+    _copy_market_signal_fields(
+        merged,
+        _pick_latest_with_fields(rows, ("premarket_regime", "premarket_reasons")),
+        PREMARKET_MERGE_FIELDS,
+    )
+    _copy_market_signal_fields(
+        merged,
+        _pick_latest_with_fields(rows, ("a50_close", "a50_pct_chg", "a50_value_date")),
+        A50_MERGE_FIELDS,
+    )
+    _copy_market_signal_fields(
+        merged,
+        _pick_latest_with_fields(rows, ("vix_close", "vix_pct_chg", "vix_value_date")),
+        VIX_MERGE_FIELDS,
+    )
+    custom_banner = _custom_banner_fields(merged)
+    merged.update(compose_market_banner(merged))
+    merged.update(custom_banner)
     return merged
 
 
@@ -393,36 +492,73 @@ def _iter_market_signal_clients(client: Client | None = None) -> list[Client]:
     return clients
 
 
+_UPSERT_MAX_RETRIES = 3
+
+
+def _build_merged_row(existing: dict[str, Any], trade_date_text: str, patch: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(existing)
+    merged.update(_normalize_row_for_upsert(dict(patch or {})))
+    merged["trade_date"] = trade_date_text
+    merged["source_jobs"] = _deep_merge_source_jobs(
+        existing.get("source_jobs"),
+        patch.get("source_jobs") if isinstance(patch, dict) else None,
+    )
+    custom_banner = _custom_banner_fields(patch)
+    merged.update(compose_market_banner(merged))
+    merged.update(custom_banner)
+    merged["updated_at"] = datetime.now(UTC).isoformat()
+    return merged
+
+
+def _write_merged_row(client: Client, merged: dict[str, Any]) -> None:
+    try:
+        client.table(TABLE_MARKET_SIGNAL_DAILY).upsert(
+            _normalize_row_for_upsert(merged),
+            on_conflict="trade_date",
+        ).execute()
+    except Exception:
+        fallback = {k: v for k, v in merged.items() if k not in STRUCTURED_MARKET_SIGNAL_FIELDS}
+        client.table(TABLE_MARKET_SIGNAL_DAILY).upsert(
+            _normalize_row_for_upsert(fallback),
+            on_conflict="trade_date",
+        ).execute()
+
+
+def _row_unchanged_since_read(client: Client, trade_date_text: str, expected_updated_at: Any) -> bool:
+    """Best-effort optimistic-lock check: re-read the row right before writing and bail out
+    (to retry with a fresh snapshot) if another writer already updated it concurrently."""
+    latest = _load_market_signal_by_trade_date(client, trade_date_text)
+    if latest is None:
+        return expected_updated_at is None
+    return latest.get("updated_at") == expected_updated_at
+
+
 def upsert_market_signal_daily(trade_date: date | str, patch: dict[str, Any]) -> bool:
     if not is_supabase_admin_configured():
         return False
     require_server_write_context("upsert market_signal_daily")
+    trade_date_text = _normalize_trade_date(trade_date)
     try:
         client = _get_supabase_admin_client()
-        trade_date_text = _normalize_trade_date(trade_date)
+        for attempt in range(_UPSERT_MAX_RETRIES):
+            existing = _load_market_signal_by_trade_date(client, trade_date_text) or {}
+            merged = _build_merged_row(existing, trade_date_text, patch)
+            if _row_unchanged_since_read(client, trade_date_text, existing.get("updated_at")):
+                _write_merged_row(client, merged)
+                return True
+            logger.debug(
+                "[supabase_market_signal] concurrent update detected for %s, retrying (%d/%d)",
+                trade_date_text,
+                attempt + 1,
+                _UPSERT_MAX_RETRIES,
+            )
+        # Retries exhausted: write anyway so the job's own data isn't silently dropped, but a
+        # concurrent writer may have raced us between the last check and this final write.
         existing = _load_market_signal_by_trade_date(client, trade_date_text) or {}
-        merged = dict(existing)
-        merged.update(_normalize_row_for_upsert(dict(patch or {})))
-        merged["trade_date"] = trade_date_text
-        merged["source_jobs"] = _deep_merge_source_jobs(
-            existing.get("source_jobs"),
-            patch.get("source_jobs") if isinstance(patch, dict) else None,
-        )
-        merged.update(compose_market_banner(merged))
-        merged["updated_at"] = datetime.now(UTC).isoformat()
-        try:
-            client.table(TABLE_MARKET_SIGNAL_DAILY).upsert(
-                _normalize_row_for_upsert(merged),
-                on_conflict="trade_date",
-            ).execute()
-        except Exception:
-            fallback = {k: v for k, v in merged.items() if k not in STRUCTURED_MARKET_SIGNAL_FIELDS}
-            client.table(TABLE_MARKET_SIGNAL_DAILY).upsert(
-                _normalize_row_for_upsert(fallback),
-                on_conflict="trade_date",
-            ).execute()
+        _write_merged_row(client, _build_merged_row(existing, trade_date_text, patch))
         return True
-    except Exception:
+    except Exception as e:
+        logger.warning("[supabase_market_signal] upsert_market_signal_daily failed: %s", e)
         return False
 
 
@@ -433,91 +569,21 @@ def load_market_signal_daily(trade_date: date | str, client: Client | None = Non
             row = _load_market_signal_by_trade_date(sb, trade_date_text)
             if row:
                 return row
-        except Exception:
+        except Exception as e:
+            logger.debug("[supabase_market_signal] load_market_signal_daily failed for client: %s", e)
             continue
     return None
 
 
 def load_latest_market_signal_daily(client: Client | None = None) -> dict[str, Any] | None:
-    def _is_non_empty(value: Any) -> bool:
-        if value is None:
-            return False
-        text = str(value).strip()
-        return text != ""
-
-    def _pick_latest_with_fields(rows: list[dict[str, Any]], required_any: tuple[str, ...]) -> dict[str, Any] | None:
-        for r in rows:
-            if any(_is_non_empty(r.get(k)) for k in required_any):
-                return r
-        return None
-
     for sb in _iter_market_signal_clients(client):
         try:
             if sb is None:
                 continue
-            resp = (
-                sb.table(TABLE_MARKET_SIGNAL_DAILY)
-                .select("*")
-                .order("trade_date", desc=True)
-                .order("updated_at", desc=True)
-                .limit(120)
-                .execute()
-            )
-            rows = [dict(x) for x in (resp.data or []) if isinstance(x, dict)]
-            if not rows:
-                continue
-
-            # 基础记录：整体最新一条，用于兜底字段。
-            merged = dict(rows[0])
-
-            benchmark_row = _pick_latest_with_fields(
-                rows,
-                ("benchmark_regime", "main_index_close", "main_index_ma50", "main_index_ma200"),
-            )
-            premarket_row = _pick_latest_with_fields(
-                rows,
-                ("premarket_regime", "premarket_reasons"),
-            )
-            a50_row = _pick_latest_with_fields(
-                rows,
-                ("a50_close", "a50_pct_chg", "a50_value_date"),
-            )
-            vix_row = _pick_latest_with_fields(
-                rows,
-                ("vix_close", "vix_pct_chg", "vix_value_date"),
-            )
-
-            if benchmark_row:
-                for key in (
-                    "trade_date",
-                    "benchmark_regime",
-                    "main_index_code",
-                    "main_index_close",
-                    "main_index_ma50",
-                    "main_index_ma200",
-                    "main_index_recent3_cum_pct",
-                    "main_index_today_pct",
-                    "smallcap_index_code",
-                    "smallcap_close",
-                    "smallcap_recent3_cum_pct",
-                ):
-                    merged[key] = benchmark_row.get(key)
-
-            if premarket_row:
-                for key in ("premarket_regime", "premarket_reasons"):
-                    merged[key] = premarket_row.get(key)
-
-            if a50_row:
-                for key in ("a50_value_date", "a50_source", "a50_close", "a50_pct_chg"):
-                    merged[key] = a50_row.get(key)
-
-            if vix_row:
-                for key in ("vix_value_date", "vix_source", "vix_close", "vix_pct_chg"):
-                    merged[key] = vix_row.get(key)
-
-            # 用合并后的“最新可用分组数据”重算文案
-            merged.update(compose_market_banner(merged))
-            return merged
-        except Exception:
+            merged = _merge_latest_market_signal_rows(_latest_market_signal_rows(sb))
+            if merged:
+                return merged
+        except Exception as e:
+            logger.debug("[supabase_market_signal] load_latest_market_signal_daily failed for client: %s", e)
             continue
     return None

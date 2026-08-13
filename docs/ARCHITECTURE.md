@@ -2,7 +2,8 @@
 
 [← 返回 README](../README.md)
 
-> 本文是当前架构、数据表、Actions 与缓存口径的事实文档。策略逻辑详见 [`../README_STRATEGY.md`](../README_STRATEGY.md)。
+> 本文是当前架构、数据表、Actions 与缓存口径的事实文档。
+> 策略逻辑见 [`../README_STRATEGY.md`](../README_STRATEGY.md)；**实盘操作**见 [`OPERATOR_PLAYBOOK.md`](OPERATOR_PLAYBOOK.md)；A 股链路见 [`A_SHARE_FUNNEL_FLOW.md`](A_SHARE_FUNNEL_FLOW.md)。
 
 ## 系统全景
 
@@ -17,7 +18,7 @@
      │                              Agent Brain                                        │
      │              React: Vercel AI SDK · CLI: AgentRuntime · MCP                     │
      │                                                                                 │
-     │  CLI 21 tools · Web 13 tools · MCP 15 tools — LLM 自主编排                        │
+     │  CLI 21 tools · Web 13 tools · MCP 15 tools — 按通道权限编排                      │
      │  提示词驱动规划 — 复杂任务先列步骤再执行                                          │
      └──────────────────────────────┬──────────────────────────────────────────────────┘
                                     │
@@ -31,7 +32,7 @@
    │ Strategy    │         │ OpenAI       │              │  (离线缓存)  │
    │ Signal      │         │ DeepSeek     │              │ CF Pages     │
    │ Sector      │         │ Qwen/兼容端点│              │  (边缘代理)  │
-   │ Tail-Buy    │         │ 智谱/火山    │              └──────────────┘
+   │ Holding     │         │ 智谱/火山    │              └──────────────┘
    └──────┬──────┘         │ Minimax      │
           │                │ 1Route       │
           ▼                └──────────────┘
@@ -53,28 +54,92 @@
 ```
 浏览器 (React SPA)
   │
-  ├─→ Supabase (Auth + DB)     ← 直连，无 CORS 问题（Supabase 自带 CORS 头）
+  ├─→ Supabase (Auth + DB)     ← Auth、白名单、配置、持仓、复盘表等仍按 RLS 直连
   │
-  ├─→ /api/llm-proxy/*         ← CF Pages Functions 边缘代理
+  ├─→ /api/chat/*              ← Pages Function 转发到 Hono Worker API
   │       │
-  │       └─→ X-Target-URL 头指定目标 → DeepSeek / OpenAI / 1Route / ...
+  │       └─→ Vercel AI SDK streamText + tools + 协议层工具审批
+  │
+  ├─→ /api/llm-proxy/*         ← 兼容代理，用于行情/LLM 直连能力
+  │       │
+  │       └─→ X-Target-URL 头指定目标 → TickFlow / Tushare / DeepSeek / OpenAI / 1Route / ...
   │
   └─→ 静态资源 (CF Pages CDN)
 ```
 
-**为什么需要边缘代理？**
+**为什么需要 API 层与边缘代理？**
 
-浏览器直接请求 LLM API 会被 CORS 拦截（这些 API 不返回 `Access-Control-Allow-Origin`），而 Supabase 本身配置了 CORS 所以可直连。CF Pages Functions 在边缘节点代理请求，绕过浏览器同源限制。
+读盘室主链路已经后端化到 `web/apps/api/src/routes/chat.ts`：独立 `wyckoff-api` Worker 通过 `worker-chat.ts` 注入沙箱工具，负责读取用户模型配置、执行工具、限流、返回 UIMessage stream，并通过 Vercel AI SDK 的 approval parts 约束 `execute_portfolio_update`。生产 React 通过 `VITE_API_URL` 调用这个 Worker；`web/functions/api/{chat,portfolio,settings}/[[path]].ts` 保留为同源兼容入口，但不是生产前端的默认链路。Pages 兼容 app 使用不含沙箱工具的 `chatRoutes`，并明确不挂载 `/api/agent-runs`。Vercel Sandbox 的 Node.js SDK 只在 `web/apps/sandbox-bridge/` 的 Vercel Node Function 中运行，Worker 与 Pages Functions 都不会加载它。
+
+Hono app 的公共中间件按请求 ID、安全响应头、CORS、256 KiB 请求体上限的顺序执行；路由随后执行 Supabase JWT 鉴权与业务校验。聊天 POST 在鉴权后执行用户限流：同时配置 `UPSTASH_REDIS_REST_URL` 和 `UPSTASH_REDIS_REST_TOKEN` 时使用 Upstash Redis REST 共享额度，未配置时保留单 Worker 实例内的软限流，Redis 超时或不可用时返回 `X-RateLimit-Backend: local-fallback` 并启用本地保护。只配置一个 Upstash 变量属于部署错误，请求会失败而不会静默使用不完整连接。
+
+`/api/agent-runs` 是云 Agent 的异步执行边界：只接受已登录且在有效白名单内的用户，并且只有 `AGENT_SANDBOX_ENABLED=true` 时开放。POST 接受一个最多 12,000 字符的 `python_research` 脚本，先把 `queued` 记录写入按认证用户隔离的 Upstash Redis，再发送到 `wyckoff-agent-runs`，两步成功后返回 `202` 和 `runId`；脚本只在队列消息中传递，不写入 Redis 或结构化日志。GET 只能读取当前用户的记录；`POST /:id/cancel` 只允许取消尚未领取的 `queued` 任务；DELETE 只删除 `completed`、`failed` 或 `cancelled` 的短期记录，避免运行中的消费者重新写回已删除状态。沙箱创建额度在入队边界统一执行：REST 与聊天工具共用同一份 Upstash 配额（默认每用户每天 20 次、两次提交至少间隔 10 秒），超限返回 `429`；配置了 Redis 后限额服务不可用会返回 `503`，绝不降级到本地计数。每个用户同时只能保留一个 `queued` 或 `running` 沙箱任务，第二次提交同样返回 `429`；取消、终态完成或死信失败都会释放这个占位。终态任务把 bridge 回传的实际 `activeCpuUsageMs` 累加到按 UTC 日过期的 Redis 计数，下一次提交会先检查默认每用户每天 120,000 ms 的 CPU 预算；计量读取异常同样返回 `503`，而计量写入异常不会重跑已完成的计算，并让后续提交在读到 Redis 异常时停住。该额度独立于聊天限流，目的是把 Vercel Hobby 的月度沙箱创建数锁在免费范围内。
+
+队列消费者固定 `max_batch_size=1`、`max_concurrency=1`，入队前用按用户归属的 Redis 原子占位阻止单个用户积压多个活动任务，每次领取记录时再用 Redis 租约防止重复交付并发执行；Worker 调 bridge 的请求会在“沙箱超时 + 30 秒”后主动中止，确保任何挂起的调用都先于 180 秒租约失效，不给重复投递留下并行执行的窗口。Cloudflare Queue 是至少一次投递而不是顺序工作流：bridge、Redis 等瞬时基础设施异常会以 10/20/40 秒退避重试，最多三次后进入 `wyckoff-agent-runs-dlq` 并把记录标为 `failed`；Python 返回非零退出码是用户计算的终态失败，不自动重跑。bridge 已成功返回后，Worker 会先把 stdout/stderr/用量暂存到仍为 `running` 的 Redis 记录，再写终态；若终态写入失败而触发队列重投，下一次消费只做落盘，不再二次进入 bridge。计量写入异常同样不会重跑已完成的计算。因而脚本必须是有限、无外部副作用的研究计算，不能在其中下单、写外部系统或依赖“恰好执行一次”。已进入 `running` 的沙箱不能被该控制面中断；需要再次执行时提交新的脚本请求。
+
+Worker 负责鉴权、输入校验、队列控制面和 HMAC 签名。Vercel Node bridge 只接受五分钟内的有效签名，随后以平台自动注入的短期 OIDC 凭据调用 Sandbox。每次任务使用 `python3.13`、`networkPolicy=deny-all`、`persistent=false`，不注入业务或用户密钥，并把 stdout/stderr 各限制在 32 KiB；命令结束后先收集 CPU/网络用量，再永久删除沙箱。结果按认证用户写入 Upstash Redis，默认一小时过期。
+
+每个实际执行都会复用 API 的 `requestId` 并生成独立 `runId`；Worker 用两个 ID 调 bridge，bridge 在 Vercel Runtime Logs 中输出同一对 ID，因此两侧能按 ID 关联。Worker 日志事件为 `sandbox_run.queued|started|retrying|finished|failed|cancelled|metering_failed`，bridge 事件为 `sandbox_bridge.started|finished|rejected|failed`；只包含状态、尝试次数、耗时、退出码、脚本字节数和 CPU/网络用量，不记录 Python 源码、stdout/stderr、HMAC、Token 或原始用户 ID。实时排查可在 `web/apps/api/` 运行 `pnpm exec wrangler tail wyckoff-api --format pretty`，或在 `web/apps/sandbox-bridge/` 运行 `pnpm exec vercel logs https://wyckoff-agent-sandbox.vercel.app --json`；历史 Vercel 日志在项目 Deployment 的 Functions Logs 中查看。
+
+读盘室仅在沙箱显式开启且当前用户在有效白名单内时，才向模型注册 `run_python_research` 工具；非白名单用户在模型侧看不到该能力，不会出现“审批后才失败”的体验。工具仅在用户明确提出计算需求后使用，且 Vercel AI SDK 必须取得用户确认才会执行。确认后，状态回传以推送为主、轮询兜底：前端在存在未终态任务时向 `GET /api/agent-runs/ws` 发起 WebSocket 连接（浏览器无法在升级请求上带 Authorization 头，登录令牌经 `Sec-WebSocket-Protocol` 子协议传递，Worker 验证令牌与白名单后才转交按用户命名的 `AgentRunNotifier` Durable Object），队列消费者在任务进入 `running` 或终态时把记录 POST 给该 DO 广播到用户所有打开的标签页。DO 使用 WebSocket Hibernation API，空闲连接不消耗免费套餐的 DO 时长；推送是尽力而为，投递失败不影响任务状态。推送通道在线时轮询间隔放宽到 15 秒，通道断开或不可用时回落到 2 秒轮询 `GET /api/agent-runs/:id`：它只读取该用户的记录，并在工具返回排队记录时就将该输出合并回原调用，仅移除已被输出取代的同 ID `approval-responded` 副本；此后轮询再在原位将该记录更新为最终 stdout、stderr、退出码和用量。Worker 在转换模型消息前也仅移除已有后续输出的早先审批副本，保证旧对话恢复为合法的 `assistant tool-call` / `tool-result` 序列，不静默改写其他工具结果。轮询覆盖当前浏览器保存的各个对话；状态先写入所属对话的本地存储，再在该对话仍处于前台时同步 live chat，避免切走对话时只更新内存态而丢掉结果。因此刷新或切走对话不会遗失未终态任务，终态会回写到其原来的对话。若记录已超过 Redis 保存期（轮询收到 404），前端把该任务落定为“结果已过期”的失败终态并停止轮询，而不是无限重试。用户可在 `queued` 时取消，完成后点“解读结果”才向模型发送基于该终态输出的后续请求；这避免把尚未完成的队列确认误当作研究结论。执行时再次校验当前用户的白名单，复用与 REST 端点完全相同的 Redis 记录、超时和删除流程；未开启沙箱或未在白名单中的用户不能经聊天路径绕过这道边界。
+
+| Worker 变量 | 默认值 | 作用 |
+|---|---:|---|
+| `CHAT_DAILY_LIMIT_PER_USER` | `80` | 每个用户每天允许的聊天 POST 数 |
+| `CHAT_MIN_INTERVAL_MS` | `2500` | 同一用户两次聊天 POST 的最小间隔 |
+| `CHAT_TOOL_APPROVAL_SECRET` | Worker secret | Web 工具审批签名专用随机密钥；建议独立配置。迁移期缺失时从 service-role key 做单向域分离派生，不直接复用或传播原值 |
+| `UPSTASH_REDIS_REST_URL` | 未设置 | Upstash Redis REST 地址；与 Token 同时存在时启用共享限流 |
+| `UPSTASH_REDIS_REST_TOKEN` | 未设置 | Upstash Redis REST Token，必须通过 Worker secret 注入 |
+| `AGENT_SANDBOX_ENABLED` | `false` | 显式开启白名单 Agent 沙箱端点；本地/生产凭据与一次真实调用验证通过后才打开 |
+| `AGENT_SANDBOX_TIMEOUT_MS` | `60000` | 单次沙箱会话超时；代码硬上限为 120 秒 |
+| `AGENT_RUN_TTL_SECONDS` | `3600` | Redis 中短期任务结果的存活秒数，最长 24 小时 |
+| `AGENT_RUN_DAILY_LIMIT_PER_USER` | `20` | 每个用户每天允许创建的沙箱任务数；REST 与聊天工具共用 |
+| `AGENT_RUN_DAILY_CPU_LIMIT_MS` | `120000` | 每个用户每天允许累计的实际 Sandbox CPU 毫秒数；在下一次提交前检查 |
+| `AGENT_RUN_MIN_INTERVAL_MS` | `10000` | 同一用户两次沙箱任务提交的最小间隔 |
+| `AGENT_RUN_QUEUE` | Cloudflare Queue binding | `wyckoff-agent-runs` 的生产者绑定；不是密钥，声明在 `wrangler.toml` |
+| `AGENT_RUN_NOTIFIER` | Durable Object binding | 按用户命名的 `AgentRunNotifier` 推送通道；SQLite-backed 类（免费套餐唯一可用形态），迁移声明在 `wrangler.toml` |
+| `SANDBOX_BRIDGE_URL` | 未设置 | Vercel Node bridge 的 HTTPS `/api/sandbox-run` 地址；可作为普通 Worker 变量 |
+| `SANDBOX_BRIDGE_SECRET` | Worker secret | 与 Vercel 项目环境变量同值的 HMAC 密钥；不进 git、不回传浏览器或沙箱 |
+
+`X-RateLimit-Backend` 明确返回 `redis`、`local` 或 `local-fallback`，便于区分共享额度、未配置 Redis 和 Redis 故障降级。Redis 只承载可过期的协调状态与短期 Agent Run 结果，不承载持仓、订单、交易信号或审计真相；这些数据仍由 Supabase/RLS 管理。
+
+读盘室只在用户问题命中观察篮代码，或明确要求复盘观察篮时，从 TickFlow 拉取相关标的的最新可用行情。快照只在浏览器保存 45 秒，随请求传入 Worker 并校验代码集合、时间和数值类型；它不写入 Supabase 或 Redis，数据源不可用时模型必须明确说明缺失，不得估算价格。行情块以当轮额外 user 消息注入模型上下文，**不拼进 system prompt**，避免价/时间戳变动打爆 prompt cache。
+
+前端的 `web/apps/web/src/lib/api-url.ts` 统一生成 chat、portfolio 和 settings 的后端地址。本地开发默认连接 `http://127.0.0.1:8787`，生产默认连接 `https://wyckoff-api.yongkai-wang.workers.dev`；部署环境可用公开的构建变量 `VITE_API_URL` 覆盖地址。该变量只包含公开服务地址，不能放 Token。
+
+每次 `main` 上的 CI 成功后，`Web deployment health` 工作流会从 GitHub runner 轮询 Worker 的公开 `/api/health` 与 Pages 的 `/chat`，直到两者同时通过；也可在 Actions 页面手动运行。它只验证部署可达性，不会调用需要登录的聊天、持仓或沙箱端点，也不会创建沙箱。
+
+本地开发可复制 `web/apps/api/.dev.vars.example` 为 `.dev.vars`。首次部署异步 Agent 前，先在 `web/apps/api/` 创建两个队列，再部署 Worker：`pnpm exec wrangler queues create wyckoff-agent-runs`、`pnpm exec wrangler queues create wyckoff-agent-runs-dlq`、`pnpm run deploy`。部署时不要把密钥写入 `wrangler.toml`：在 Vercel 项目将 `SANDBOX_BRIDGE_SECRET` 写入 production 环境变量，并在 `web/apps/api/` 下分别执行 `pnpm exec wrangler secret put CHAT_TOOL_APPROVAL_SECRET`、`pnpm exec wrangler secret put UPSTASH_REDIS_REST_URL`、`pnpm exec wrangler secret put UPSTASH_REDIS_REST_TOKEN` 和 `pnpm exec wrangler secret put SANDBOX_BRIDGE_SECRET`。Vercel bridge 在生产环境由平台 OIDC 自动获取短期 Sandbox 凭据，Cloudflare Worker 不再保留 Vercel Access Token。
+
+**零成本执行面（Hobby）**：系统控制面继续跑在 Cloudflare Workers/Pages + Upstash 免费额度；Vercel 只用于按需 microVM。Hobby 套餐每月包含 Sandbox 额度（约 5 小时 Active CPU、420 GB-hour 内存、5,000 次创建、20 GB 传输），超限后创建会被暂停而不是自动扣费。为压低用量，当前实现固定 `resources.vcpus=1`、`networkPolicy=deny-all`、`persistent=false`、60s 超时，并在结束后 `stop` + `delete`。
+
+**凭据落点**（四处，职责不同）：
+
+| 位置 | 放什么 | 用途 |
+|---|---|---|
+| `web/apps/api/.dev.vars`（gitignored） | Bridge URL/Secret；可选 Vercel Token + Team/Project ID | 本地 Worker 调桥；可选真实 Node smoke |
+| Cloudflare Worker | `SANDBOX_BRIDGE_URL` → `[vars]`；`SANDBOX_BRIDGE_SECRET` → `wrangler secret put` | 生产 `/api/agent-runs` 的控制面与桥鉴权 |
+| Vercel `wyckoff-agent-sandbox` 项目 | `SANDBOX_BRIDGE_SECRET` | 验证 Worker 请求；Sandbox SDK 使用平台短期 OIDC，不保存 Access Token |
+| GitHub repo secrets | `VERCEL_TOKEN`、`VERCEL_TEAM_ID`、`VERCEL_PROJECT_ID` | 预留给 CI 可选真实沙箱 smoke / 运维复用；**默认 CI 不创建沙箱** |
+
+服务端断点调试在 `web/apps/api/` 执行 `pnpm dev:debug`，再从 VS Code 选择 `Wyckoff API: Attach Wrangler`；Inspector 固定使用 9229，TypeScript source map 直接定位到 `src/**/*.ts`。API 的 `pnpm test` 通过 `@cloudflare/vitest-pool-workers` 在本地 `workerd` 中执行，测试配置使用隔离绑定而不读取 `.dev.vars`。真实 Upstash 用例只在显式导出 `UPSTASH_REDIS_REST_URL`、`UPSTASH_REDIS_REST_TOKEN` 后执行 `pnpm test:upstash`，它会验证共享限流及 Agent Run 的 Redis CAS 状态转换；真实 Vercel 用例从 `web/apps/api/` 执行 `pnpm test:sandbox`，它在 Node bridge 中运行 SDK，需要本地 Vercel Token、Team ID 与 Project ID。默认测试不发起真实网络请求，也不会创建沙箱。
+
+`/api/llm-proxy/*` 继续保留为兼容代理：一部分 Web 工具和本地开发路径仍需要同域转发 TickFlow / Tushare / OpenAI-compatible 请求，避免浏览器 CORS 和供应商 SSE 差异。
+
+代理只接受受信 Web Origin（无 `Origin` 的 CLI 请求继续兼容）、`GET/POST`、2 MiB 以内请求，并限制到 HTTPS 白名单上游；服务端模型 `base_url` 同样拒绝凭据、非标准端口、loopback、私网和 link-local 地址，且不跟随重定向。
+
+CLI Agent 的本地命令工具只允许明确的只读命令；文件工具继续执行隐藏目录、凭据文件和系统目录阻断。公开网页检索走 `browser_research`（本机 Chrome CDP），导航目标复用公网 URL 校验。本地 Dashboard 使用进程级随机令牌及 Host/Origin 校验，不把绑定 `127.0.0.1` 当作唯一安全边界。云端用户凭据只从该用户上下文读取，不回退到运维者本机配置或环境变量。
 
 ### 技术栈
 
 | 层 | 技术 |
 |---|---|
-| 框架 | React 19 + React Router 7 + TypeScript |
-| AI SDK | Vercel AI SDK（`@ai-sdk/openai`，`compatibility: 'compatible'`） |
+| 框架 | React 19 + React Router 8 + TypeScript |
+| AI SDK | 前端 `@ai-sdk/react` + Worker 端 `ai` / `@ai-sdk/openai` / `@ai-sdk/anthropic` |
 | 样式 | Tailwind CSS 4 + shadcn/ui 组件 |
 | 构建 | Vite 6 → CF Pages 部署 |
-| 边缘代理 | CF Pages Functions（`web/functions/api/llm-proxy/[[path]].ts`） |
+| API 层 | Hono Worker app（`web/apps/api/src/index.ts`），由 Pages Function `/api/chat` 转发 |
+| 兼容代理 | CF Pages Functions（`web/functions/api/llm-proxy/[[path]].ts`） |
 | 状态管理 | Zustand（auth store） |
 | 数据 | Supabase JS SDK 直连 |
 
@@ -86,17 +151,15 @@
 | `/analysis` | 单股分析 | 输入代码 → K 线图 + LLM 诊断 |
 | `/portfolio` | 持仓 | 持仓明细 + 收益率 |
 | `/tracking` | 跟踪 | 形态复盘 + 涨跌幅 |
-| `/tail-buy` | 尾盘记录 | 尾盘策略执行历史 |
 | `/export` | 数据导出 | CSV 导出 |
-| `/guide` | 功能说明 | Web 端功能入口和日常工作流说明 |
+| `/guide` | 功能与能力边界 | Web 端功能入口、日常工作流和运行边界说明 |
 | `/settings` | 设置 | 模型 / API Key / 数据源配置 |
 
-### DeepSeek R1 兼容
+`/tracking` 按数据库实际存在的最近 30 个复盘交易日分页读取。窗口原始记录数保留数据源行数，“总入选次数”以唯一 `(code, recommend_date)` 为粒度；“覆盖股票数”及平均/最高/最低涨跌幅先按 `code` 去重，使用窗口内该股的最新复盘行和粘住的首次推荐价。
 
-DeepSeek 推理模型要求多轮对话中 assistant 消息必须携带 `reasoning_content` 字段。Web 端通过 `buildProxiedFetch()` / `wrapReasoningStream()` 自定义 fetch 包装器实现：
+### Provider Stream 兼容
 
-1. 响应时缓存每轮 assistant 的 `reasoning_content`
-2. 下次请求时自动注入到历史 assistant 消息中
+读盘室走 `/api/chat` 的 UIMessage stream，Worker 端根据用户设置创建 OpenAI-compatible 或 Anthropic provider。Gemini OpenAI-compatible SSE 会经过 `normalizeGeminiStream()` 归一化，避免工具调用 chunk 在前端缺失。旧的 `/api/llm-proxy` 路径仍服务单股、多股、导出等非读盘室直连能力。
 
 ### 与 CLI 的能力差异
 
@@ -108,19 +171,19 @@ DeepSeek 推理模型要求多轮对话中 assistant 消息必须携带 `reasoni
 
 ### 三通道复用
 
-React Web、CLI、MCP 共享核心金融引擎、行情/存储集成和部分业务能力，但不强行共享同一套 runtime 或同一份 System Prompt。CLI / MCP 主要复用 `agents/chat_tools.py`；Web 在 `web/apps/web/src/lib/chat-agent.ts` / `chat-tools.ts` 中用 TypeScript 封装自己的工具名和前端提示词。
+React Web、CLI、MCP 共享核心金融引擎、行情/存储集成和部分业务能力，但不强行共享同一套 runtime 或同一份 System Prompt。CLI / MCP 的 Python 工具按职责拆在 `agents/diagnosis_tools.py`、`agents/screen_tools.py`、`agents/report_tools.py`、`agents/strategy_tools.py` 等模块；Web 读盘室由 `web/apps/api/src/routes/chat.ts` 承载 agent loop，工具实现集中在 `web/packages/shared/src/chat-tools.ts`，前端用 `@ai-sdk/react` 渲染 UIMessage parts。
 
 | | React Web (CF Pages) | CLI（TUI） | MCP Server |
 |---|---|---|---|
-| 运行时 | Vercel AI SDK `streamText` | `AgentRuntime`（`cli/runtime.py`） | FastMCP（stdio） |
+| 运行时 | Worker 端 Vercel AI SDK `streamText` + 前端 `useChat` | `AgentRuntime`（`cli/runtime.py`） | FastMCP（stdio） |
 | UI | React SPA | Textual 全屏 TUI | 无（被 Claude Code 等调用） |
-| 入口 | `web/apps/web/` | `wyckoff`（无子命令） | `wyckoff-mcp` |
-| 工具数 | 13（TS 独立封装） | 21（含本地工具 / Skill / 委派） | 15（三层权限） |
-| 部署 | CF Pages + Functions | 本地 pip 安装 | 本地进程 |
+| 入口 | `web/apps/web/` + `web/apps/api/` | `wyckoff`（无子命令） | `wyckoff-mcp` |
+| 工具数 | 14（TS 独立封装） | 26（含本地工具 / Skill / 委派） | 18（三层权限） |
+| 部署 | CF Pages + Hono Worker/Functions | 本地 pip 安装 | 本地进程 |
 | 对话能力 | ✓ maxSteps 多轮 | ✓ Agent Loop 多轮 | ✗ 单次工具调用 |
-| 后台任务 | ✗ | ✓ 长任务非阻塞 | ✗ |
-| 消息排队 | ✗ | ✓ Agent 忙时自动排队 | N/A |
-| Thinking | ✓ `reasoning_content` 透传 | ✓ 推理模型 reasoning 展示 | N/A |
+| 后台任务 | ✗（只查询或发起轻量 API） | ✓ 长任务非阻塞 | ✗ |
+| 消息排队 | ✓ 前端队列，最多 5 条等待当前回复完成 | ✓ Agent 忙时自动排队 | N/A |
+| Thinking | 取决于 provider stream；Gemini SSE 做归一化 | ✓ 推理模型 reasoning 展示 | N/A |
 | Agent 记忆 | ✗ | ✓ 跨会话记忆（SQLite） | ✗ |
 | 上下文压缩 | ✓ 最近对话压缩 | ✓ 按剩余窗口预算自动压缩 | N/A |
 | 可视化面板 | ✗ | ✓ `wyckoff dashboard` | ✗ |
@@ -128,12 +191,12 @@ React Web、CLI、MCP 共享核心金融引擎、行情/存储集成和部分业
 
 Streamlit 框架在 MVP 阶段支撑了产品验证，但主分支已全面下线 Streamlit：运行代码、依赖和 CI 路径均不再维护。历史代码保留在 `release/streamlit` 分支，MVP 产品架构和效果图归档在 [`STREAMLIT_MVP_ARCHITECTURE.md`](STREAMLIT_MVP_ARCHITECTURE.md)。
 
-当前主力 agent loop 收敛在 `cli/runtime.py::AgentRuntime`：它负责 provider 调用、工具执行、并发分批、上下文压缩、retry、doom-loop、scratchpad 和大结果落盘。TUI/CLI 只消费 runtime event；React Web 则以 CF Pages + Vercel AI SDK 承载在线读盘室。
+当前 CLI 主力 agent loop 收敛在 `cli/runtime.py::AgentRuntime`：它负责 provider 调用、工具执行、并发分批、上下文压缩、retry、doom-loop、scratchpad 和大结果落盘。React Web 读盘室则以 `web/apps/api` 的 Hono Worker + Vercel AI SDK 承载在线 agent loop。
 
-**CLI 专属工具**（Web / MCP 不可用）：`exec_command`、`read_file`、`write_file`、`web_fetch`、`check_background_tasks`、`ask_user`、`execute_skill`、`delegate_to_research`、`delegate_to_analysis`、`delegate_to_trading`
+**CLI 专属工具**（Web / MCP 不可用）：`exec_command`、`read_file`、`write_file`、`browser_research`、`check_background_tasks`、`ask_user`、`execute_skill`、`delegate_to_research`、`delegate_to_analysis`、`delegate_to_trading`
 
 **MCP 三层权限**：
-- Tier 1（无需凭证）：历史查询（`query_history`）— 纯本地 SQLite 读写
+- Tier 1（无需凭证）：历史查询（`query_history`）— 形态复盘、信号池和策略归因只读摘要
 - Tier 2（需 TUSHARE_TOKEN / TICKFLOW_API_KEY 等 env）：搜索、分析（`analyze_stock`）、大盘、扫描、回测、盘中结构和漏斗仿真
 - Tier 3（需 Supabase 用户认证或本地降级）：持仓管理（`portfolio` / `update_portfolio`）、AI 研报、攻防决策
 
@@ -173,15 +236,15 @@ Agent 采用 ReAct 范式：每一轮 LLM 先推理（Reason），再决定是�
 
 | 通道 | 当前工具 |
 |------|----------|
-| CLI / TUI（21） | `search_stock_by_name`、`analyze_stock`、`portfolio`、`get_market_overview`、`get_market_history`、`screen_stocks`、`generate_ai_report`、`generate_strategy_decision`、`query_history`、`update_portfolio`、`check_background_tasks`、`run_backtest`、`ask_user`、`execute_skill`、`delegate_to_research`、`delegate_to_analysis`、`delegate_to_trading`、`exec_command`、`read_file`、`write_file`、`web_fetch` |
-| Web（13） | `search_stock`、`view_portfolio`、`market_overview`、`market_history`、`query_recommendations`、`query_tail_buy`、`plan_portfolio_update`、`execute_portfolio_update`、`analyze_stock`、`screen_stocks`、`generate_ai_report`、`generate_strategy_decision`、`intraday_analysis` |
-| MCP（15） | `query_history`、`search_stock_by_name`、`analyze_stock`、`get_market_overview`、`screen_stocks`、`run_backtest`、`market_regime`、`wyckoff_diagnose`、`intraday_analysis`、`intraday_rescue_check`、`run_funnel_simulation`、`portfolio`、`update_portfolio`、`generate_ai_report`、`generate_strategy_decision` |
+| CLI / TUI（26） | 原有诊断、筛选、研报、组合、历史、后台、Skill 与委派工具，加 `evaluate_recommendation_events`、`research_hypothesis`、`reassess_profile`、`diagnose_backend`、`browser_research`（本机 Chrome CDP） |
+| Web（13+） | `search_stock`、`view_portfolio`、`market_overview`、`market_history`、`query_recommendations`、`query_attribution`、`plan_portfolio_update`、`execute_portfolio_update`、`analyze_stock`、`screen_stocks`、`generate_ai_report`、`generate_strategy_decision`、`intraday_analysis`；DeepSeek `deepseek-v4-flash` 另挂服务端 `web_search`（Responses API，非本机 CDP） |
+| MCP（18） | 原有行情、漏斗、诊断、组合、研报与决策工具，加 `research_hypothesis`、`reassess_profile`、`diagnose_backend` |
 
 CLI 中 `screen_stocks`、`generate_ai_report`、`generate_strategy_decision`、`run_backtest` 会提交到 `BackgroundTaskManager`（daemon Thread），不阻塞对话。Web 的 `screen_stocks` 读取最新漏斗结果，不在浏览器会话里启动本地后台漏斗。MCP 只返回单次工具调用结果。
 
 **调仓确认机制差异**：
 - CLI：仍使用单一 `update_portfolio` 工具，确认通过 TUI 弹窗实现（用户在终端确认操作）
-- Web（CF Pages）：拆为 `plan_portfolio_update` → 用户在聊天中确认 → `execute_portfolio_update`，通过 LLM 行为约束实现
+- Web：拆为 `plan_portfolio_update` → 用户在聊天中确认 → `execute_portfolio_update`，由 Vercel AI SDK approval parts 在协议层要求确认
 
 **Tool Schema 策略差异**：
 - CLI：OpenAI SDK 默认不开 `strict`，工具参数可用 Python `Optional[T]`（字段不在 required 中）
@@ -193,7 +256,7 @@ System Prompt 内建路由规则，LLM 自主判断调哪个工具：
 
 - "我有什么持仓" → `portfolio(mode="view")`（纯数据，秒回）
 - "持仓健康吗" → `portfolio(mode="diagnose")`（逐只诊断，较慢）
-- "帮我加/删持仓" → Web 使用 `plan_portfolio_update` → 用户确认 → `execute_portfolio_update`；CLI 使用 `update_portfolio` 并由 TUI 弹窗确认
+- "帮我加/删持仓" → Web 使用 `plan_portfolio_update` → 用户确认 → `execute_portfolio_update`；CLI 使用 `update_portfolio` 并由 TUI 弹窗确认；多只变更时 CLI/MCP 用 `items` 一次提交，避免多轮 LLM
 - "有什么机会" → `screen_stocks`（后台执行）
 
 **铁律：一个工具能回答的问题，绝不调两个。用户没要求分析，就不要分析。**
@@ -219,10 +282,12 @@ Agent 输出计划:
 最终综合结论
 ```
 
-当前 CLI 没有独立的 `/plan` 命令，也没有“先生成计划、等待用户确认、再执行工具”的交互式 Plan Mode（计划模式）状态机。运行时只在两类场景做确定性治理：
+当前 CLI 没有独立的 `/plan` 命令，也没有“先生成计划、等待用户确认、再执行工具”的交互式 Plan Mode（计划模式）状态机。运行时默认让模型负责自然语言理解、上下文恢复和任务拆分；代码在工具边界与回合续跑上做确定性治理：
 
-- 必需工具漏调时，`loop_guard` 会注入 retry message（重试消息），要求模型不要停留在计划文本，必须先调用对应工具拿真实数据。
-- 高风险工具（`update_portfolio`、`exec_command`、`write_file`）执行前由 TUI 弹窗确认，避免写操作直接落地。
+- **prepareToolCall**：工具真正执行前经 `cli/prepare_tool_call.py` + `ToolSurface.prepare_call` 做存在性 / schema / scope / 过早提问拦截；高风险工具（`update_portfolio`、`exec_command`、`write_file`）仍在 `ToolRegistry.execute` 里弹窗确认。
+- **auto-continuation**：`cli/agent_loop.py::decide_agent_loop` 与 Web `chat-agent-loop` 对齐——输出截断、单段工具轮次触顶、或必需工具仍未完成时，最多自动续跑 2 次。
+- **steering**：忙时 `!指令` 或 `/steer …` 注入本轮 `steering_queue`（下一跳 model 调用前生效）；普通输入仍进 `input_queue` 等本轮结束后再发。
+- 设置 `WYCKOFF_STRICT_TOOL_EXPECTATIONS=1` 或测试显式开启时，`loop_guard` 才会按旧式 turn expectation 注入 retry message（重试消息），用于诊断模型漏调工具；direct chat 默认也会开 expectation（见 `dispatch._direct_turn_expectations_default`）。
 
 ### 后台任务架构
 
@@ -246,18 +311,34 @@ Agent → "已提交后台，可继续提问"
 on_complete 回调 → TUI 显示通知 → 结果注入消息队列 → Agent 自动汇报
 ```
 
-### 消息排队
+### 消息排队与转向
+
+CLI/TUI 队列：
 
 ```
-用户输入 → Agent 忙? ─No→ 立即处理
-                      │
-                      Yes→ 入 deque 队列，显示 "⏳ 已排队 (N)"
-                              │
-                              ▼ （当前任务完成后）
-                         自动取队首消息 → 继续处理
+用户输入 → Agent 忙?
+            │
+            ├─ `!指令` / `/steer …` → steering_queue（本轮下一跳注入，不杀 turn）
+            ├─ 普通文本 → input_queue，显示 queued:N；当前任务完成后自动发送
+            └─ Ctrl+C → 硬取消 + checkpoint；可「继续」ResumeTurn
 ```
 
-`/new` 清对话时同步清空队列。
+`/new` 清对话时同步清空 `input_queue` 与 `steering_queue`。状态栏由 `TurnPhase` 驱动（如 `turn:streaming` / `steer:1`）。
+
+Web 读盘室队列：
+- 前端 `useMessageQueue()` 在当前回复未完成时把新输入排队，最多保留 5 条。
+- 当前 assistant message 完成后自动发送队首消息，并复用同一套 `/api/chat` transport。
+- 用户可手动清空队列；页面刷新会丢弃未发送队列，避免误把临时输入写进数据库。
+
+### Conversation Turn 状态机
+
+`cli/conversation/` — CLI 会话层一等公民：Turn 生命周期、「继续」仲裁、Resume 分层与 `input_queue`。TUI 只负责渲染。
+
+设计机制与取舍见独立 Wiki 篇
+[Conversation Turn 会话状态机](https://github.com/YoungCan-Wang/WyckoffTradingAgent/wiki/11_11_Conversation_Turn)；
+术语见 [GLOSSARY.md](../GLOSSARY.md) §14。
+
+要点：短「继续」在 Failed/Cancelled 时优先 **ResumeTurn**（重试原问题），显式 `workflow`/`wf_*` 才走 workflow；Runtime 终态为 `done` / `turn_cancelled` / `turn_failed`；`FallbackProvider` 与 ResumeTurn 分层。
 
 ### CLI Provider 层
 
@@ -272,7 +353,11 @@ LLMProvider (abstract)              cli/providers/base.py
 
 统一接口：`chat_stream(messages, tools, system_prompt) → Generator[chunk]`
 
-chunk 类型：`thinking_delta` | `text_delta` | `tool_calls` | `usage`
+chunk 类型：`thinking_delta` | `text_delta` | `tool_calls` | `usage` | `finish`
+
+`usage` 含 `input_tokens` / `output_tokens`；`cache_read_tokens` / `cache_write_tokens` 仅在 provider/网关实际回报 cache 字段时附带。Runtime 再附带 `generation_ms`、`output_tok_per_s`、`cache_hit_rate`。  
+**输出 tok/s** = `output_tokens / generation_seconds`（首个 text/thinking delta → 该轮 stream 结束；多步 tool 循环只累计模型生成窗口，不含工具时间）。  
+**缓存命中率** = `cache_read_tokens / input_tokens`（有 cache 字段时展示，含 0%）。Anthropic 的 `input_tokens` 不含 cache，CLI 会先归一化为 `input + cache_read + cache_write`。OpenAI 兼容通道优先读 DeepSeek 的 `prompt_cache_hit_tokens`，其次 `prompt_tokens_details.cached_tokens`。
 
 OpenAI provider 兼容所有 OpenAI API 格式端点（DeepSeek / Qwen / Kimi / LongCat / Minimax 等），支持推理模型的 `reasoning_content` thinking 流，以及 `<tool_call>` XML 标签兜底解析。
 
@@ -304,18 +389,21 @@ claude mcp add wyckoff -- wyckoff-mcp
 ### TUI 视觉层次
 
 ```
-❯ 用户问题                           ← cyan 粗体
+▌ 用户问题                           ← 品牌琥珀色竖条 + 粗体
 
-  💭 推理摘要…  (1234 字)             ← thinking：一行，dim italic
-  ⚙ 搜索股票  keyword=宁德           ← tool 执行：黄色
+  … 推理摘要  (1234 字)               ← thinking：一行，dim italic
+  ✓ 搜索股票  0.3s                   ← tool 完成：绿色（执行中的 spinner 显示在状态栏）
   ✓ 搜索股票  0.3s                   ← tool 完成：绿色
   ✗ 调取行情  1.2s 超时              ← tool 失败：红色
   ↗ 全市场扫描  已提交后台            ← 后台任务：cyan
   ───                                ← 分隔线
   最终 Markdown 输出...              ← Markdown 渲染
 
-  ↑1,234 ↓567 · 2.3s               ← token 统计：dim
+  ↑1,234 ↓567 · 175tok/s · cache 87% · 2.3s
+                                     ← token：生成速率 + 缓存命中 + 整轮耗时（含工具）
 ```
+
+Web 读盘室在每段 `streamText` 结束后下发 transient `data-llm-usage`（字段同 CLI），前端合并多段续跑后展示。
 
 ## Agent 记忆系统
 
@@ -339,7 +427,9 @@ LLM 从最近 40 条消息中提取 L1 原子记忆（≤300 字），当前只�
 
 系统不自动沉淀具体股票买卖事实、临时调仓记录或每日市场状态；这些信息应从持仓表、推荐表、行情表查询，避免旧观点污染当前判断。
 
-当 L1 `preference` / `decision` 总数达到 3 条以上，并且最近 L1 原子记忆相对上一轮蒸馏有足够新增时，系统会读取最近最多 30 条 L1 原子记忆，提炼 L2 `scenario` 和 L3 `persona`，用于下一轮更高密度召回。
+如果一条 L1 内容自身包含 6 位代码或明确股票名称，写入前会用本地股票名称缓存解析成 `codes`，用于后续确定性召回；没有明确股票的全局交易纪律保持 `codes=''`，避免被错误绑定到当前会话里出现过的所有股票。
+
+当 L1 `preference` / `decision` 总数达到 3 条以上，并且最近 L1 原子记忆相对上一轮蒸馏有足够新增时，系统会读取最近最多 30 条 L1 原子记忆，提炼 L2 `playbook` 和 L3 `persona`，用于下一轮更高密度召回。
 
 ### 分层与追溯
 
@@ -347,34 +437,37 @@ LLM 从最近 40 条消息中提取 L1 原子记忆（≤300 字），当前只�
 |------|------|------|---------|
 | L0 | `chat_log` / scratchpad / tool result 文件 | 原始对话与工具证据 | `source_ref=chat_log:<session_id>` 或 `result_ref` |
 | L1 | `agent_memory` 原子记忆 | 用户偏好、非显而易见的决策逻辑 | `wyckoff memory trace <id>` |
-| L2 | `scenario` | 可复用交易/复盘场景 | 关联 L1 原子记忆和股票代码 |
+| L2 | `playbook` | 条件化交易剧本：适用条件、动作、硬性禁忌或退出条件 | 关联 L1 原子记忆和股票代码 |
 | L3 | `persona` | 用户画像、稳定风险边界 | 需要细节时回查 L1/L0 |
+
+历史 `scenario` 记录仅做兼容召回；新生成的 L2 统一写入 `playbook`。
 
 `agent_memory` 新增 `memory_level`、`source_ref`、`confidence`、`metadata` 字段。TUI 在保存记忆时写入 `source_ref=chat_log:<session_id>`，CLI 可用 `wyckoff memory trace <id>` 查看来源会话片段。
 
 ### 自动清理
 
-TUI 启动时自动执行 `prune_memories()`，清理 90 天前的普通记忆；`preference` 和 `persona` 保留。
+TUI 启动时自动执行 `prune_memories()`，按类型清理旧记忆：L1 `decision` 保留 45 天，L2 `playbook` / legacy `scenario` 保留 60 天，`preference` 和 `persona` 长期保留。
 
 ### 检索注入
 
 每次用户提问前，Hybrid Search 综合检索 + 画像/偏好置顶：
 
-1. **FTS5 全文检索**（权重 1.0）：SQLite FTS5 索引，BM25 排序，精准匹配用户问题中的关键词
-2. **股票代码匹配**（权重 0.85）：正则提取 6 位代码，LIKE 匹配
-3. **中文关键词 LIKE**（权重 0.6）：2-gram 分词 + 停用词过滤，补充召回
-4. **时间衰减加权**：30 天半衰期，近期记忆得分更高，`preference` / `persona` 不衰减
-5. 始终拉取 L3 `persona` 和近期 `preference`，置顶显示
+1. **FTS5 全文检索**（权重 0.8）：SQLite FTS5 索引，BM25 排序，精准匹配用户问题中的关键词
+2. **股票实体匹配**（权重 1.2）：先解析 6 位代码，再用本地股票名称缓存把“宁德时代”“比亚迪”映射为确定性代码
+3. **中文关键词 LIKE**（权重 0.25）：2-gram 分词 + 停用词过滤，补充召回；“建仓”“买入”“止损”等泛交易词不作为独立召回依据
+4. **时间衰减加权**：默认半衰期 14 天；L1 `decision` 为 14 天，L2 `playbook` / `scenario` 为 21 天，`preference` / `persona` 不衰减
+5. **股票作用域过滤**：当前问题有明确股票时，只保留全局记忆和同代码记忆；当前问题没有明确股票时，带 `codes` 的单股记忆不参与召回
+6. 始终拉取 L3 `persona` 和近期 `preference`，置顶显示，但同样遵守股票作用域过滤
 
-拼成两段注入 system prompt 尾部：
+拼成两段注入当前 user 轮次的记忆上下文（CLI 挂在消息元数据 / 包装层；Web 走对应召回通道），**不要**为了展示时间或行情去改写静态 system 前缀：
 
 ```
 # 用户画像
 - 风险偏好中等，止损 -6%
 - 不要推荐 ST 股
 
-# 相关场景
-- #18 [2026-05-15] 当主线强度被短线漏斗卡掉时，先看 30-120 日主线池，再回到 L2/L3 做形态确认
+# 交易剧本
+- #18 [2026-05-15] 跨日确认买入：适用已 confirmed 候选；动作是次日开盘价附近买入前复核支撑和收位；硬性禁忌是跌破确认支撑或极端放量冲高回落。同日 SOS/JAC 突破不把突破前仍在原阻力下方的低点误判为跌破支撑。
 
 # 历史记忆
 - #12 [2026-05-15] 用户不希望消息面短线噪声替代可持续主线判断 | 源:chat_log:abc123
@@ -385,10 +478,10 @@ TUI 启动时自动执行 `prune_memories()`，清理 90 天前的普通记忆�
 | 类型 | 层级 | 来源 | 自动清理 |
 |------|------|------|---------|
 | `preference` | L1 | 会话摘要自动抽取：投资风格、禁忌、操作习惯 | 永不清理 |
-| `decision` | L1 | 会话摘要自动抽取：非显而易见的决策逻辑/原因 | 90 天 |
-| `scenario` | L2 | 从最近 L1 偏好/决策蒸馏出的可复用交易场景 | 90 天 |
+| `decision` | L1 | 会话摘要自动抽取：非显而易见的决策逻辑/原因 | 45 天 |
+| `playbook` | L2 | 从最近 L1 偏好/决策蒸馏出的条件化交易剧本 | 60 天 |
 | `persona` | L3 | 从最近 L1 偏好/决策蒸馏出的稳定用户画像 | 永不清理 |
-| `fact` / `stock_opinion` / `market_view` / `session` | L1 | 本地表兼容的历史/手动类型，当前自动摘要不主动生成 | 90 天 |
+| `scenario` / `fact` / `stock_opinion` / `market_view` / `session` | L1/L2 | 本地表兼容的历史/手动类型，当前自动摘要不主动生成 | 30-60 天 |
 
 ## 上下文压缩
 
@@ -421,6 +514,7 @@ threshold = context_window - reserve
 4. 工具结果做智能摘要而非粗暴截断：
    - `analyze_stock` 诊断模式 → 保留 `code`、`phase`、`health`、`trigger_signals` 等关键字段
    - `analyze_stock` 行情模式 → 保留最近 5 条数据
+   - `analyze_stock` 基本面模式 → 保留 `data_status`、`grade`、`action`、`score` 等关键字段
    - `portfolio` 诊断模式 → 保留 `diagnostics`、`successful_count` 等
    - `portfolio` 查看模式 → 保留 `positions`、`free_cash` 等
    - 通用工具 → 保留 `error`、`message`、`status` 等顶层键
@@ -435,15 +529,16 @@ threshold = context_window - reserve
 
 ### 工具确认机制
 
-高风险写操作工具需用户确认后才执行：
+高风险写操作工具需用户确认后才执行。CLI/TUI 使用本地确认弹窗；Web 读盘室使用 UIMessage approval parts，`execute_portfolio_update` 在前端确认前不会落库：
 
 | 工具 | 风险等级 |
 |------|---------|
 | `exec_command` | 高（执行任意命令） |
 | `write_file` | 高（写入文件） |
 | `update_portfolio` | 中（修改持仓或删除记录） |
+| `execute_portfolio_update` | 中（Web 修改持仓，协议层确认） |
 
-确认选项：允许一次 / 本次会话总是允许 / 修改后执行 / 不允许。
+CLI 确认选项：允许一次 / 本次会话总是允许 / 修改后执行 / 不允许。Web 确认选项：确认执行 / 拒绝。
 
 ### Doom Loop 防护
 
@@ -513,7 +608,7 @@ CREATE TABLE chat_log (
 
 | 文件 / 数据库 | 用途 |
 |-------------|------|
-| `wyckoff.json` | 模型配置（provider / api_key / model / base_url） |
+| `wyckoff.json` | 模型配置（provider / api_key / model / base_url）；可选超时：`stream_chunk_timeout_seconds`（默认 120，模型空闲/首 token）、`tool_timeout_seconds`（默认 60，单工具墙钟）。控制面板 Overview、TUI `/config set`、`wyckoff config` 均可改。 |
 | `session.json` | Supabase 登录态（access_token / refresh_token） |
 | `agent.log` | Agent 文件日志 |
 | `wyckoff.db` | SQLite 数据库（下方详述） |
@@ -522,18 +617,30 @@ CREATE TABLE chat_log (
 
 | 表 | 用途 |
 |---|------|
-| `schema_version` | 迁移版本管理（当前 v7） |
+| `schema_version` | 迁移版本管理（当前 v15） |
 | `agent_memory_fts` | FTS5 全文检索索引（自动同步） |
-| `recommendation_tracking` | 形态复盘镜像 |
-| `signal_pending` | 信号池镜像 |
+| `recommendation_tracking` | 形态复盘镜像；主线候选保存主题、阶段、角色与评分；`step3_verdict` 记录 LLM 三分类判定 |
+| `signal_pending` | 信号池镜像；跨日携带主线语义供 Step3/持仓诊断使用 |
+
+#### 待执行的 Supabase DDL
+
+Supabase schema 不在本仓库管理。`step3_verdict` 需手动执行一次后 LLM 判定才会落库（未执行时每日任务会在日志里记 ERROR 并给出该语句，不影响其他入库）：
+
+```sql
+ALTER TABLE recommendation_tracking ADD COLUMN IF NOT EXISTS step3_verdict text;
+```
+
+该字段取值 `invalidated` / `building` / `springboard`，是**纯观测数据，不参与任何交易决策**。它的用途是回答"LLM 拦对了吗"——此前只标记放行的 `is_ai_recommended`，被 LLM 否决的候选不留痕迹，导致 42 天内仅 4 条放行记录、`rag_vetoed` 全为 0，LLM 价值完全无法评估。积累 1-2 个月后即可对比三类判定各自的 `change_pct` / MFE / MAE，判断是否恢复其否决权（`STEP4_AI_CANDIDATE_POLICY=veto_only`）或彻底移除该链路。
 | `market_signal_daily` | 大盘信号镜像 |
 | `portfolio` | 持仓元数据镜像 |
 | `portfolio_position` | 持仓明细镜像 |
 | `agent_memory` | 跨会话 Agent 记忆 |
 | `sync_meta` | 同步元数据（每表最后同步时间） |
 | `chat_log` | 对话日志（用户输入 + LLM 输出 + token + metadata） |
-| `tail_buy_history` | 尾盘策略执行历史 |
 | `background_task_result` | 后台任务结果缓存 |
+| `research_hypothesis` | 策略研究假设、失效条件与生命周期状态 |
+| `research_evidence` | 假设关联的回测、归因、shadow、报告和观察证据 |
+| `research_transition` | 假设状态迁移原因、晋级清单和当时证据快照 |
 
 ### Supabase → SQLite 同步
 
@@ -548,25 +655,42 @@ CREATE TABLE chat_log (
 
 Supabase 不可达时静默跳过，使用本地陈旧数据。`wyckoff sync` 可手动触发。
 
-## 五层漏斗引擎
+## 主线漏斗引擎
 
-`core/wyckoff_engine.py`，~60 可调参数（`FunnelConfig`）。
+`core/wyckoff_engine.py` + `core/mainline_engine.py`，通过 `FunnelConfig` 和 `MainlineEngineConfig` 控制传统量价通道、主线发现和候选车道。
 
-| 层 | 名称 | 逻辑 |
+| 组件 | 名称 | 逻辑 |
 |----|------|------|
-| L1 | 剥离垃圾 | 剔除 ST / 北交 / 科创，市值 ≥ 35 亿，成交额 ≥ 5000 万 |
-| L2 | 六通道甄选 | 主升 / 点火 / 潜伏 / 吸筹 / 地量 / 护盘 |
+| L1 | 基础过滤 | 剔除 ST，默认纳入主板 / 创业板 / 科创板 / 北交所；股价 ≥ 2 元、市值通常 ≥ 25 亿、20 日均成交额 ≥ 4000 万。10–25 亿标的只有在 20 日均成交额 ≥ 8000 万时才按流动性旁路放行；可叠加财务软过滤 |
+| L2 | 八通道强度 | 主升 / 潜伏 / 吸筹 / 地量 / 暗中护盘 / 趋势延续 / 加速突破 / 点火破局 |
+| Mainline | 主线发现 | 基于概念热度、概念映射、主题雷达和财务质量构建 `主线买点候选 / 主线观察 / 过热不追`；主题雷达的 `rotation_watch` 仅作为短周期 Shadow 报告提示，不参与正式晋级 |
+| Candidate Lane | 候选车道 | L1 后的趋势回踩、平台突破、强承接等观察样本，避免只靠传统 Wyckoff 触发 |
 | L2.5 | Markup 识别 | MA50 上穿 MA200 + 角度验证 |
-| L3 | 板块共振 | L2 通过股票行业分布，保留 Top-N 行业 |
-| L4 | 微观狙击 | Spring / LPS / SOS / EVR / Compression 触发信号 |
-| L5 | 退出信号 | 初始止损 -6%、利润激活线 +15%、跟踪止损（高点回撤 -10% 或跌破 MA50）、派发警告（高位缩量 3 天） |
+| L3 | 行业/概念共振 | 过滤弱板块，同时允许强个股和主线概念绕过固定 Top-N 行业限制 |
+| L4 | 微观狙击 | Spring / LPS / SOS / EVR / Compression / Trend Pullback 等触发信号 |
+| L5 | 退出信号 | 初始止损、利润激活与跟踪止损；派发风险同时检测高位缩量和 Upthrust/UTAD 放量假突破回落 |
+
+正式推荐不是“过某一层就买”。传统 Wyckoff 候选、主线候选和候选车道会合并进统一候选池；漏斗 `selected_for_ai` 直接作为 Step3 的实际审判输入。默认 `STEP4_AI_CANDIDATE_POLICY=veto_only` 时，Step3 只剔除明确的逻辑破产，Step4 入口由跨日确认、市场许可和候选护栏确定；未确认候选即使被 AI 评为起跳板也只能观察。OMS 再把 AI 结构入场区间、涨幅与 ATR 防追高上限收敛为唯一允许买入区间，缺失或无交集就拒单。`shadow` 完全忽略 Step3 分类，只用于实验对照。
+
+`core/theme_radar.py` 同时输出中长线 `themes` 和短周期 `rotation_watch`。前者可进入主线候选构建，后者只用于回答“哪些主题正在加速”，即使检测到轮动也不能打开市场总闸、生成正式推荐或改变 OMS。英文主题别名按独立词边界匹配，避免短缩写嵌入其他概念名称时造成跨主题污染。
+
+日报按“一眼结论 → 主线与轮动 → 候选 → 详细市场证据”的顺序呈现。飞书卡片用状态色、分节和图标突出结论；这些仅是展示层级，不参与计算或门控。
+
+`tradeable_l4` 的送审入口采用质量优先：不再用 Trend/Accum 固定配额提前截断，而是让通过形态与损失护栏的候选、主线及主题补位共同排序，最后统一执行 8 只总上限和单行业 2 只上限。实盘和回测复用同一质量池及裁剪语义。
+
+`core/wyckoff_structure.py` 是 L4 的动态交易区间诊断组件，不是独立 V2 引擎。`workflows/funnel_layers.py`
+用它对 L3 幸存者生成 `structure_shadow`，比较 Spring、LPS、SOS、EVR 的 legacy/structure 一致与分歧。
+shadow 输出进入漏斗 metrics 供归因使用，但不写入正式 `triggers`，因此不能改变候选、BUY 或 OMS 门控。
+结构区间的宽度质量相对个股 ATR 评分，避免用固定百分比横跨 A/H/美股；测试次数达到三组支撑/阻力接触后
+不再继续抬分。结构诊断失败时按 `unavailable` 降级，不阻断正式 L4。正式 Spring 支撑复用 swing low
+中位数以降低单个极端值的影响，摆动点不足时保持原最低收盘价回退；正式 SOS 同时要求量比和历史量能分位。
 
 ## 信号确认状态机
 
 `core/signal_confirmation.py`，L4 信号经 1-3 天价格确认：
 
 ```
-pending ──(价格确认)──→ confirmed（可操作）
+pending ──(跨日未失效)──→ survived ──(需求确认)──→ confirmed（VALIDATED，仍需市场与 OMS 闸门）
    └──(超时)──→ expired（失效）
 ```
 
@@ -574,90 +698,151 @@ TTL：SOS 2 天、Spring 3 天、LPS 3 天、EVR 2 天、Compression 3 天。
 
 ## 信号反馈与动态策略闭环
 
-完整说明见 [`SIGNAL_FEEDBACK_LOOP.md`](SIGNAL_FEEDBACK_LOOP.md)。核心关系是：漏斗写观察样本，feedback 盘后验收，下一轮漏斗读取新的健康度和 registry。
+漏斗写 `signal_observations`，盘后 feedback 写 outcomes / health / registry，下一轮漏斗再读取新状态。
+架构层只保证这是错峰反馈而非同任务同步调用；`off / shadow / on` 的字段、归因展示、freshness 和晋级
+规则统一见 [`SIGNAL_FEEDBACK_LOOP.md`](SIGNAL_FEEDBACK_LOOP.md)，研究证据门槛见
+[`ITERATION_STRATEGY.md`](ITERATION_STRATEGY.md)。
 
-```mermaid
-flowchart LR
-  A["漏斗本轮运行<br/>Layer1-4 + AI + OMS"] --> B["signal_observations"]
-  B --> C["signal_feedback_job.py<br/>计算 outcomes"]
-  C --> D["signal_health_daily<br/>signal_registry"]
-  D --> E{"FUNNEL_DYNAMIC_POLICY"}
-  E -- "off" --> F["下一轮仍用静态配额"]
-  E -- "shadow" --> G["静态配额出结果<br/>动态配额写 shadow 差异"]
-  E -- "on" --> H["动态配额正式介入"]
-  F --> A
-  G --> A
-  H --> A
-```
+`workflows/recommendation_event_eval.py` 对 `signal_observations` 做稳定排序分页，避免 PostgREST 1000 行上限
+把已有上下文误报为 `unknown`。推荐事件优先使用 observation，缺失时降级到 tracking 行内的水温、信号、
+行业和轨道；覆盖状态与成熟样本覆盖率显式进入报告，查询失败不能伪装成历史缺口。
 
-| 模式 | 行为 |
-|------|------|
-| `off` | 默认静态 Trend / Accum 配额，不读取反馈权重。 |
-| `shadow` | 主流程保持静态配额，同时把动态策略候选差异写入 `signal_policy_shadow_runs`。 |
-| `on` | 正式使用 `signal_health_daily` 权重和 `signal_registry` 启停状态。 |
+## 持仓诊断
 
-## 尾盘策略
+`core/holding_diagnostic.py` + `scripts/holding_diagnosis_job.py`
 
-`core/tail_buy_strategy.py` + `scripts/tail_buy_intraday_job.py`
+基于日线的持仓健康诊断，替代了原尾盘分钟线监控。`confirmed` 候选的买入执行采用次日开盘价策略：日线报告会展示候选股的现价、参考止损位和「按次日开盘价附近买入」提示。GitHub Actions 通过 `holding_diagnosis.yml` 触发，输出 HOLD / ADD / TRIM 建议。
 
-策略设计用于盘中 14:00 附近执行，从前日 L4 信号中筛选尾盘买入标的；当前 GitHub Actions 工作流只保留手动触发，不再作为每日自动定时任务。
+持仓诊断默认以 -12% 为固定止损兜底；ATR 放宽需显式开启且受上限约束。非主线满 5 日进入时间复核，
+但 LLM 只有在 `CONFIRMED_BREAK` / `HARD_RISK` 且执行时机成立时才能给出 TRIM/EXIT，不能按持有天数机械卖出。
 
-### 两阶段评估
-
-```
-signal_pending (pending/confirmed)
-  │
-  ├─→ 获取 1 分钟盘中数据（TickFlow）
-  │
-  ├─→ 第一阶段：规则打分（15+ 特征）
-  │   VWAP 位置、尾盘量比、日内回撤、突破形态...
-  │   BUY ≥ 72 · WATCH ≥ 52 · SKIP < 52
-  │
-  ├─→ 第二阶段：LLM 复判（Top N 候选）
-  │   输入：规则特征 + 5 分钟摘要 + 信号上下文
-  │   输出：{"decision":"BUY|WATCH|SKIP","reason":"...","confidence":0.8}
-  │
-  ├─→ 规则 × LLM 合并 → 最终排序
-  │
-  └─→ 推送飞书 / Telegram
-```
-
-### 持仓监控
-
-同一任务还扫描当前持仓，输出 HOLD / ADD / TRIM 建议。
+Step4、持仓诊断和 Web 投研提示词共享证据契约：默认 `capital_scope=account_only`，账户现金与权重不代表
+用户全部可投资资产；单股先独立看基本面、估值、事件与趋势，再看账户角色。`confidence` 表示证据支持度，
+不是上涨概率；行情、基本面、估值、新闻缺失时必须显式标记。模型卖出同时携带 `signal_severity` 与
+`action_timing`，解析器把 WARNING 或 `WAIT/CLOSE_CONFIRM` 自动降级为 HOLD，系统硬止损仍可覆盖模型。
 
 ## Pipeline（定时任务）
+
+### 本地调度：常驻 daemon
+
+本机定时任务由 `cli/daemon.py` 常驻进程驱动，不再依赖 TUI 存活。三层分工：
+
+| 模块 | 职责 |
+|------|------|
+| `cli/scheduler.py` | 纯策略：cron 匹配、到期判定（`due_schedules`）、补跑窗口（`pending_check_minutes`）。无副作用，可独立测试 |
+| `cli/daemon.py` | 主循环 + `fcntl.flock` 单例 + SIGTERM 优雅退出 + 日志轮转 |
+| `cli/headless.py` | `run_once()` 无界面跑一轮 `AgentRuntime`：恢复 CLI 登录态后再注入无人监督工具闸门（否则 `set_stop_loss` 会写到 `USER_LIVE:local`） |
+
+由 launchd（`com.wyckoff.daemon`，`KeepAlive.SuccessfulExit=false`）保活，
+`scripts/daemon_install.sh` 安装。**不使用** `StartCalendarInterval` 逐条映射 cron ——
+保持单一常驻进程读 `schedules.json`，避免调度真相分裂成 launchd 和 JSON 两处。
+
+daemon 持锁时 TUI 的 `_check_schedules` 直接返回，让出调度权。两边同时跑会重复触发，
+并且都会 `save_schedules` 覆盖对方的 `last_fired`。
+
+### 无人监督的写操作边界
+
+`cli/approval_policy.classify()` 把高风险工具调用分三档：`auto` / `review` / `confirm`。
+daemon 只放行 `auto`，其余写入 `~/.wyckoff/approvals.db` 等人批准，12 小时过期。
+队列项绑定入队时的 `user_id`；`approve ok/no` 要求当前登录账户一致，防止换号后改到别人的持仓。
+`approve list` 展示脱敏后的完整参数；`approve ok` 原子认领一次后通过正常 ToolRegistry 执行并记录结果，
+执行失败不自动重试，避免真实成交或外部写入被重复提交。
+详见 [GLOSSARY.md](../GLOSSARY.md) 第 16 节。
+
+`auto` 按**工具身份**判定（目前仅 `set_stop_loss`），不按参数字段。原因是字段检查
+防不住批量 `items` —— 30 只股票的调仓在顶层只有一个 `items` 键。窄工具的安全性来自
+它的签名根本不接受股数、成本、现金，这是结构性的，不依赖调用方检查得对。
+
+`update_portfolio` 没有 `stop_loss` 参数，所以补录止损必须走 `set_stop_loss`；
+Step4 那条 `update_position_stops` 路径需要 `WYCKOFF_WRITE_CONTEXT=server_job`，
+agent 工具层碰不到。两条路写同一列但授权模型不同。
+
+闸门本身是既有机制（`ToolRegistry.set_confirm_callback`），daemon 只注入回调，
+不改执行语义。回执新增 `queued` 档，与 `deny` / `timeout` 分开 ——
+措辞混用会让模型把用户从未做过的决定写进回复。
+
+`ask_user_question` 在无回调时会回落读 stdin，daemon 必须注入超时哨兵，否则永久挂死。
+
+### MCP 入口：写操作默认拒绝
+
+MCP server 走 ToolSurface，没有确认弹窗也没有待批队列。`tools/write_guard.py`
+对 `WRITE_TOOLS` 默认拒绝，显式设 `WYCKOFF_MCP_ALLOW_WRITES=1` 才放行 ——
+否则任何 MCP 客户端（Claude Desktop、Cursor）都能绕过审批直接清仓。
+
+`tools/` 不能 import `cli/`（架构边界测试），所以工具名单在两处各存一份，
+由 `tests/test_mcp_write_guard.py` 断言两者一致。
+
+`market_regime` / `wyckoff_diagnose` / `intraday_analysis` / `intraday_rescue_check`
+的实现已收敛到 `agents/engine_tools.py`，MCP 与 Agent 共用一份；
+`run_funnel_simulation` 与 `screen_stocks` 底层同为 `workflows.wyckoff_funnel`，不再另立入口。
+
+### 客户端方向：接入外部 MCP server
+
+与上面相反的方向 —— 本项目作为客户端连第三方 server。三个模块：
+
+| 模块 | 职责 |
+|------|------|
+| `cli/mcp_config.py` | `~/.wyckoff/mcp_servers.json` 读写；自建 server 识别（`command` 与 `args` 中的路径都查） |
+| `cli/mcp_policy.py` | 读写启发式；未知一律按写 |
+| `cli/mcp_client.py` | 连接、发现、同步调用桥接、结果归一化 |
+
+外部工具在 **ToolRegistry 实例上**合并进 `schemas()`，不改模块级 `TOOL_SCHEMAS` ——
+后者会跨实例污染，测试对此有断言。`execute()` 按 `mcp__` 前缀分流，
+但**先过 `_confirm_high_risk_call`**：外部写工具必须能被闸门拦住，
+不能因为来自 MCP 就跳过分级。
+
+同步桥接只有一种正确写法（anyio portal + `wrap_async_context_manager`），
+原因见 [GLOSSARY.md](../GLOSSARY.md) 第 17 节。`mcp` 是可选依赖，
+未安装时外部功能静默关闭，原生工具不受影响。
+
+生命周期：TUI 启动时连、退出时断；headless 每轮结束在 `finally` 里回收 ——
+外部 server 是子进程，daemon 每次触发不回收就会累积泄漏。
+
+### 飞书报告卡片
+
+所有调用 `send_feishu_notification()` 的 Markdown 报告统一经过 `utils/feishu_report_card.py`：自动选择语义标题色、提取摘要区、按标题拆分段落、突出风险提示，并使用宽屏卡片。回测继续使用 `utils/feishu_backtest_card.py` 专用指标卡片；新版通用布局若被飞书拒绝，会自动回退到原单块 Markdown 卡片，避免样式升级影响定时通知可靠性。
 
 ### GitHub Actions 主要工作流
 
 | 工作流 | 时间（北京） | 说明 |
 |-------|-------------|------|
-| **CI** (`ci.yml`) | push/PR | pytest + compile + dry-run |
-| **盘前风控** (`premarket_risk.yml`) | 周一-周五 08:20 | A50 + VIX 预警 |
+| **CI** (`ci.yml`) | push/PR | 单次 coverage-instrumented pytest + Python compile + TypeScript check + Web/API tests + dry-run；同一次 Python 测试生成覆盖率 artifact，不重复执行全量套件 |
+| **Web 部署健康检查** (`web_deployment_health.yml`) | main CI 成功后 / 手动 | 从 GitHub runner 轮询 Worker `/api/health` 与 Pages `/chat`；不调用认证接口或创建沙箱 |
+| **盘前风控** (`premarket_risk.yml`) | 周一-周五 08:20 | Codex Automation 调用 `workflow_dispatch`；A50 + VIX 预警，Actions 可手动补跑。另有 UTC 02:20 的 `schedule` 兜底，带 `--backstop` 幂等短路，仅在当日盘前态缺失时补跑 |
 | **港股漏斗筛选** (`wyckoff_funnel_hk.yml`) | 周一-周五 16:35 | `market_funnel_job.py --market hk` |
-| **A 股漏斗筛选 + AI 研报 + 决策** (`wyckoff_funnel.yml`) | 周日-周四 17:17 | `daily_job.py` Step2→3→4，若次日非 A 股交易日则跳过，日频写入 `theme_radar_snapshot` |
-| **涨停复盘** (`review_list_replay.yml`) | 周一-周五 19:25 | 当日涨幅 ≥ 8% 回溯 |
+| **A 股漏斗筛选 + AI 研报 + 决策** (`wyckoff_funnel.yml`) | 周日-周四 17:17 | `daily_job.py` Step2→3→4；周日正常为周一实盘准备候选，若次日非 A 股交易日才跳过，日频写入 `theme_radar_snapshot` |
+| **板块连续性报告** (`sector_continuity.yml`) | 周一-周五 16:10 | 刷新概念热度历史，辅助主线引擎判断延续性 |
+| **强势股复盘** (`review_list_replay.yml`) | 周一-周五 19:25 | 用 Tushare 双日截面发现当日涨幅 > 7% 且前日 < 3% 的完整样本；下载前一交易日生产漏斗的压缩 as-run trace，同时列出逐层状态、跟踪/AI状态、次日开盘及盘中可交易口径，并输出结构化 JSON/Markdown artifact。三条影子召回车道只观察、不写推荐；历史验证严格以每日 trace 为 as-of 候选证据。快照缺失默认不重跑，手动触发可显式允许全市场 fallback |
 | **主线雷达周报** (`theme_radar.yml`) | 周五 21:10 | `theme_radar_job.py --with-news`，周频新闻增强复盘 |
-| **形态复盘重定价** (`recommendation_tracking_reprice.yml`) | 周一-周五 23:00 | 同步收盘价、计算收益 |
-| **信号反馈闭环** (`signal_feedback.yml`) | 周一-周五 23:30 | `signal_feedback_job.py` 刷新 outcomes / health / registry |
-| **策略反思 Shadow** (`strategy_reflection.yml`) | 周二-周六 00:10 | 读取 feedback / shadow 结果，写策略反思和候选策略 |
-| **美股漏斗筛选** (`wyckoff_funnel_us.yml`) | 周二-周六 05:35 | `market_funnel_job.py --market us` |
-| **美股推荐表现** (`us_recommendation_performance.yml`) | 周二-周六 06:15 | `us_recommendation_performance_job.py` |
-| **数据库维护** (`db_maintenance.yml`) | 周二-周六 06:20 | 清理过期行情、订单、信号、市场信号等滑动窗口数据 |
-| **回测网格** (`backtest_grid.yml`) | 每月 UTC 1 / 15 日 20:00，北京时间次日 04:00 | 3 阶段：快照→12 并行格（3 周期 × 4 job，每格产出 2 个 TP）→聚合通知 |
+| **形态复盘重定价** (`recommendation_tracking_reprice.yml`) | 周一-周五 23:00 | 同步 A 股、港股收盘价并计算收益；美股由美股漏斗收盘后续步处理 |
+| **信号反馈闭环** (`signal_feedback.yml`) | 周一-周五 23:30 | 只结算缺失/`pending` outcomes，同股共享一次 K 线；刷新 health / registry，周五续跑策略反思 Shadow |
+| **美股漏斗筛选 + 推荐表现** (`wyckoff_funnel_us.yml`) | 周二-周六 05:35 | `market_funnel_job.py --market us` 后续跑 `us_recommendation_performance_job.py` |
+| **数据库维护** (`db_maintenance.yml`) | 每周六 06:20 | 清理过期行情、订单、信号、市场信号等滑动窗口数据 |
+| **回测网格** (`backtest_grid.yml`) | 手动触发 | 多周期 × 多交易风格回放，同时输出参数邻域稳定性与按时间前推的 walk-forward 样本外验证 |
+| **策略消融** (`backtest_grid.yml: strategy_compare`) | 手动显式开启 | A/M/P 五窗口结论已稳定为不晋级，默认网格不再重复消耗五个全市场任务；仅在 `run_strategy_compare=true` 时复现历史证据。手动复跑仍按窗口共用一次信号台账、分别重放权重与现金组合；候选/触发规则不同的策略禁止共享。Q/N/O 与本轮 Q/R/S/T 形态门控均已否决，不改变生产漏斗 |
+| **触发阈值标定** (`backtest_trigger_calibration.yml`) | 手动触发 | 按周期 × 取值扇出，每个 job 完整重跑一次全市场漏斗；扫触发阈值时按目标触发器单信号均收做跨周期 walk-forward 选值，扫 `top_n` 时按全样本均收对比选择层增益；填 `grid_cells` 则改走共享台账的退出网格，在 `top_n=0` 原始池上取退出基准 |
+
+回测回放在每个历史区间开始时一次性预计算各股票在所有交易日的历史终点位置，日循环直接按整数位置切片；
+切片同时携带已按日期排序的内部标记，避免下游指标反复扫描日期单调性。该优化只替换数据访问方式，不改变
+候选、信号、成交或退出语义。
+
+### 已退役的截面因子组合回测
+
+合成价值分在完整连续历史和 `v2` 冷缓存复核中八格全部为负 alpha，新旧产物逐文件一致，已经满足预注册的
+冻结条件。该独立工作流及实现已删除，避免与当前形态信号回放混淆或继续消耗 Actions 算力。PIT 股票池、
+同频基准、一手补位、停牌估值和冷缓存等方法教训保留在 [`ITERATION_STRATEGY.md`](ITERATION_STRATEGY.md)，
+但不再属于当前系统架构。
 
 ### 手动触发工作流
 
 | 工作流 | 说明 |
 |-------|------|
-| **尾盘策略** (`tail_buy_1420.yml`) | `tail_buy_intraday_job.py`，当前只手动触发 |
-| **持仓诊断** (`holding_diagnosis.yml`) | `holding_diagnosis_job.py` |
-| **板块连续性报告** (`sector_continuity.yml`) | 计算概念 / 行业热度并持久化 |
+| **持仓诊断** (`holding_diagnosis.yml`) | `holding_diagnosis_job.py`，基于日线的持仓健康诊断 |
+| **板块连续性报告** (`sector_continuity.yml`) | 也可手动补跑概念 / 行业热度 |
 | **Step4 From Supabase** (`step4_from_supabase.yml`) | 从 Supabase 推荐记录补跑 Step4 |
 | **Web 后台任务** (`web_quant_jobs.yml`) | Web 发起的漏斗/研报任务 |
 | **输入预览** (`wyckoff_input_preview.yml`) | dry-run 模式查看漏斗输入 |
 | **单标的漏斗诊断** (`single_symbol_funnel_diagnosis.yml`) | 指定标的和区间做漏斗诊断 |
-| **美股回测网格** (`backtest_grid_us.yml`) | 美股历史区间回测 |
 
 ## 数据源
 
@@ -666,12 +851,28 @@ tickflow(★) → tushare → akshare → baostock → efinance   （A 股日线
 tickflow                                        （港股 / 美股日线、实时行情、分钟 K 线）
 tushare → akshare + 本地 24h 缓存              （A 股股票列表，代码⇄名字映射）
 data/market_universes/*.json                    （A 股 / 港股 / 美股 / ETF universe 与名称检索）
-tickflow                                        （1 分钟盘中数据，尾盘策略专用）
+tickflow                                        （1 分钟盘中数据，供个股盘中分析使用）
 ```
 
 日线行情通过统一仓库层 `integrations/stock_hist_repository.py` 直接从数据源拉取（TickFlow 优先，降级 tushare/akshare/baostock）。
 
-`integrations/rag_veto.py` — 新闻否决层：抓取东方财富个股新闻，命中负面关键词则拦截推荐。
+`integrations/rag_veto.py` — 新闻否决层：读取 AkShare/东方财富个股新闻，按 URL 或标准化标题去重后做相关性、关键词和语义检查；来源失败时 fail-open，不阻断 Step3。
+
+CLI 公开信息检索走 `browser_research`：Playwright 附着本机 Chrome CDP（默认 `http://127.0.0.1:9222`，可用 `WYCKOFF_BROWSER_CDP_URL` 覆盖），搜索后打开前几条结果并抽取正文；Web / MCP 不暴露该工具。`install.sh` / `wyckoff update` 默认安装 `youngcan-wyckoff-analysis[browser]` 并执行 `python -m playwright install chromium`（装进当前 `wyckoff` 解释器，通常是 `~/.wyckoff/venv`）。
+
+CDP 未就绪时，TUI 会弹窗请用户授权，同意后自动拉起**独立调试 Chrome**（专用 profile：`~/.wyckoff/chrome-cdp`，不碰日常浏览数据）；授权对本 TUI 会话有效。也可主动执行 `/browser start`。`/browser status|hint|stop` 查看状态或关闭提示。无 TUI 回调的环境不会静默开浏览器。
+
+Web 读盘室在用户选择 DeepSeek、模型为 `deepseek-v4-flash`、且 `base_url` origin 为 `https://api.deepseek.com` 时，改走 Responses API（`https://api.deepseek.com/responses`），并注入服务端执行的 `web_search`，用于 IPO/舆情/公告等公开网页检索；行情、持仓、形态复盘仍走本地工具。搜索结果仅当轮有效（SDK/无状态 API 不会跨轮回传完整 `web_search_call`）；切到 Chat Completions 模型或跨供应商 fallback 前会把历史中的 provider-executed `web_search` 部件折叠成短文本，避免悬空 `tool_calls` 导致 400。其它 DeepSeek 模型、非官方 origin（如 ark 代理）与其它供应商继续使用 Chat Completions；嵌套研报/诊断 LLM 调用始终保持 `/v1/chat/completions`。
+
+### ToolSurface 执行边界
+
+CLI、MCP 通过 `tools/tool_surface.py` 统一做参数校验、stock scope、结果截断、脱敏审计和超时处理。CLI 普通同步工具默认 30 秒；`ask_user_question` 与 `delegate_to_research` / `delegate_to_analysis` / `delegate_to_trading` 属于交互或长委派工具，不套用 ToolSurface 外层超时，由各自的用户等待或子 Agent deadline 管理。MCP 普通工具默认 60 秒，screen/backtest 为 250 秒。
+
+### 分析数据质量与历史 meta
+
+Web 个股、持仓和股票对抗分析保存历史时写入 `meta`：输入快照 hash、prompt 版本、实际模型、生成时间、价值面来源/报告期和 K 线行数。个股 K 线同时携带 `dataQuality`，用于区分完整数据、降级来源和缺口；meta 只记录可追溯口径，不参与交易评分。价值面复合风险可保留多条解释标签，但同一负现金流根因只在基础规则中扣分一次。
+
+个股、持仓和股票对抗统一按用户配置顺序重试当前模型并切换备用模型；一旦已经输出 token，为避免拼接不同模型内容，不再自动切换。
 
 ## 云端存储（Supabase）
 
@@ -679,12 +880,12 @@ tickflow                                        （1 分钟盘中数据，尾盘
 |----|------|
 | `portfolios` | 投资组合元数据 |
 | `portfolio_positions` | 持仓明细 |
-| `trade_orders` | AI 交易建议 |
+| `trade_orders` | AI 交易建议（**建议单，不是成交流水**；状态只有 APPROVED / NO_TRADE / CANCELLED） |
 | `user_settings` | 用户配置（API Key / Webhook / provider base_url / custom_providers JSON） |
 | `recommendation_tracking` | 威科夫形态复盘 |
 | `signal_pending` | 信号确认池 |
 | `market_signal_daily` | 大盘信号 |
-| `daily_nav` | 每日净值 |
+| `daily_nav` | 每日净值（记账户真实现金与持仓市值，不记 OMS「假设照单执行后」的模拟值） |
 | `concept_heat_history` | 板块连续性与概念热度历史 |
 | `signal_observations` | L4 信号观察样本 |
 | `signal_outcomes` | 信号后续收益 / 回撤结果 |
@@ -695,16 +896,64 @@ tickflow                                        （1 分钟盘中数据，尾盘
 | `strategy_reflections` | Actions 生成的策略反思快照，仅 shadow/review |
 | `strategy_policy_candidates` | 待人工复盘的候选策略，不自动晋级生产 |
 
+`llmdoc/` 与数据库记忆承担不同职责：前者保存经过代码审查的长期决策纪律和带有效期的案例注释，并在 Step4/持仓诊断中按股票代码选择性注入；后者保存用户对话中提取的偏好与决策。`llmdoc` 不存实时行情、持仓或用户私有设置，也没有权限覆盖确定性风控与 OMS。
+
 数据隔离：Web JWT → RLS，CLI access_token → RLS，脚本 service_role_key → 绕过 RLS。
+
+### 成交回填与执行审计
+
+持仓账本 `portfolio_positions` 由人工维护：OMS 只产出建议单，任何代码路径都不会因为发过 EXIT
+就自动减少股数。这意味着**成交必须回填，否则系统状态会停在成交前**——止损会对着早该卖掉的仓位
+每天重发一次，`daily_nav` 也会长期偏离真实账户。`code` 支持 A 股 6 位、港股 `NNNNN.HK`、美股 `TICKER.US`（TickFlow 标准码）；CLI/Web 写入前会规范化大小写与港股补零。
+
+- `core/trade_fill.py` 是纯计算：按成交增量摊薄成本价（含佣金）、扣双边费用、卖光时清仓、
+  给出已实现盈亏。`integrations.supabase_portfolio.record_fill` 负责落库，先读后写，需串行调用。
+- 入口：CLI `wyckoff portfolio fill`、MCP/Agent 工具 `record_trade_fill`。
+  `portfolio add` 仍是覆盖式录快照，两者语义不同，不要混用。
+- 任一持仓新增、覆盖、删除、现金修改或完整成交回填成功后，写入边界都会重新读取整个组合，
+  用 TickFlow 最新可用报价按市值计价，并把港股/美股按 ECB 最新参考汇率折算成人民币，随后同步更新
+  `portfolios.total_equity` 与 `updated_at`。Python/CLI、Web `/api/portfolio` 整表保存和 Web Agent
+  `execute_portfolio_update` 使用同一口径；批量修改与成交回填只在全部字段写完后刷新一次。
+- 估值必须覆盖全部非零持仓；任一行情或汇率缺失时，持仓修改仍视为成功，但旧 `total_equity` 不会被
+  成本价或部分市值覆盖，调用方会收到明确的估值警告。券商使用自定义结算汇率时，可设置
+  `PORTFOLIO_HKD_CNY_RATE` / `PORTFOLIO_USD_CNY_RATE` 覆盖 ECB 参考值。
+- 持仓写入后若现金写入失败，结果会显式标记 `position_committed`，Agent 不得因 JWT 文本重放整笔成交；
+  操作者必须先核对并修正现金，再决定是否重新回填。当前两次写入不具备数据库事务性。
+- Step4 先写本轮 `trade_orders`，再更新止损与真实净值，全部成功后才作废同日旧工单。后续持久化失败只按
+  本次 `run_id` 作废新工单，并按写入前快照恢复已改动的持仓止损；回滚失败必须显式报错。Telegram 推送失败则保留新工单作为幂等事实源，
+  禁止重跑 LLM/OMS，避免超时已送达时产生重复或冲突指令。当前跨表写入仍不具备数据库事务性。
+- LLM 若对同一代码输出多条决策，解析阶段按 `EXIT > TRIM > HOLD > PROBE > ATTACK` 折叠为一条；
+  OMS 引擎在通过卖单后同步扣减内存持仓股数，防止重复 EXIT/TRIM 超卖或虚增模拟现金。
+- `core/execution_audit.py` 检测「仍在持仓、却连续多个运行日被建议离场」的标的，
+  结果渲染在 Step4 工单顶部。连续性按 OMS 实际运行日计算，漏跑一天不会把告警清零。
+- 检测结果经两道收窄后喂给订单引擎作为**买入闸门**（`STEP4_BLOCK_BUY_ON_STALE_EXIT`，默认开）：
+  只有**现价已跌破持仓止损**的标的才进闸门集合——没落袋的止盈拖着只是少赚，跌破止损还拿着
+  才是风控失效；命中后只拦 `ATTACK` 重仓，小额 `PROBE` 放行，它自带硬止损且额度受限，
+  一刀切会让闸门在长期深套下变成永久停摆。EXIT/TRIM/HOLD 始终照常下发。
+- 拖延天数按可卖日计算：一字跌停（全天最高价未离开跌停价）当日卖不掉，不计入天数，但也不打断
+  连续段，否则中间夹一个跌停板就能把前面的拖延洗掉。仅收在跌停不算——盘中高于跌停价即存在卖出窗口。
+
+Web `/portfolio` 的数据库模式仅对白名单用户开放。浏览器把 Supabase JWT 发送给 `/api/portfolio`，API
+从已验证令牌取得 `user_id` 并固定映射到 `USER_LIVE:<user_id>`，请求体不能指定 `portfolio_id`。
+Cloudflare Pages 通过 `web/functions/api/portfolio/[[path]].ts` 将同域请求交给 Hono API，前端同时校验
+响应结构，避免 SPA fallback 的 HTML 或缺失字段被误当成持仓数据。
+API 响应同时返回 `total_equity`、`valuation_updated_at`；刷新失败时另带 `valuation_warning`，前端不得
+把旧值展示成刚刚成功刷新的实时净值。
+历史持仓允许 `buy_dt` 使用 `YYYYMMDD` 或空字符串；API 输出统一归一化为 `YYYY-MM-DD` 或 `null`，
+确保 Web 日期控件和诊断链路只消费一种日期格式。
+`portfolios` 与 `portfolio_positions` 已启用 RLS，SELECT/INSERT/UPDATE/DELETE 均要求
+`split_part(portfolio_id, ':', 2) = auth.uid()::text`；UPDATE 同时使用 `USING` 与 `WITH CHECK`。
+因此用户只能读取和修改自己的持仓。白名单用户可在页面编辑现金和持仓，选择“保存到云端”或
+“保存并诊断”；普通用户只使用浏览器内临时录入，不写 Supabase。
 写入边界：GitHub Actions / server job 必须设置 `WYCKOFF_WRITE_CONTEXT=server_job` 才能写共享信号、推荐、策略表。CLI 默认只能读取云端表；除持仓增删改和现金更新外，其它 CLI 结果只写本地 SQLite。
 
-`scripts/db_maintenance.py` 负责清理过期数据：形态复盘按表内最新 30 个入选日期保留，订单/信号/净值等短周期表保留 10-30 日区间，`external_seed_observations` 默认保留 180 日，避免数据库行数无限增长。
+`scripts/db_maintenance.py` 每周运行一次，负责清理过期数据：形态复盘按表内最新 30 个入选日期保留，订单/信号/净值等短周期表保留 10-30 日区间，`external_seed_observations` 默认保留 180 日，避免数据库行数无限增长。
 
 ## CLI 命令
 
 ```bash
 wyckoff                          # 启动 TUI 对话（默认）
-wyckoff update                   # 升级到最新版
+wyckoff update                   # 升级到最新版（含 [browser] + Chromium）
 wyckoff auth <email> <password>  # 登录
 wyckoff auth logout              # 登出
 wyckoff auth status              # 查看登录状态
@@ -713,6 +962,7 @@ wyckoff model add                # 交互式添加模型
 wyckoff model set <id> ...       # 非交互式设置模型
 wyckoff model rm <id>            # 删除模型
 wyckoff model default <id>       # 设置默认模型
+wyckoff model refresh            # 刷新 OpenRouter 模型目录（真实上下文窗口）
 wyckoff config                   # 查看数据源配置
 wyckoff config tushare <token>   # 配置 Tushare
 wyckoff config tickflow <key>    # 配置 TickFlow
@@ -720,6 +970,7 @@ wyckoff portfolio list           # 查看持仓（别名 pf）
 wyckoff portfolio add <code>     # 添加持仓
 wyckoff portfolio rm <code>      # 删除持仓
 wyckoff portfolio cash [--amount]# 查看/设置可用资金
+wyckoff portfolio fill <code>    # 回填真实成交（--side/--shares/--price）
 wyckoff signal [status]          # 查看信号池
 wyckoff recommend                # 查看复盘记录（别名 rec）
 wyckoff dashboard [--port N]     # 启动可视化面板（别名 dash）
@@ -741,11 +992,11 @@ wyckoff-mcp                      # 启动 MCP Server（供 Claude Code 等调用
 ## 目录结构
 
 ```
-mcp_server.py    MCP Server 入口（FastMCP，15 个工具）
+mcp_server.py    MCP Server 入口（FastMCP，18 个工具）
 agents/          CLI / MCP 复用的业务工具函数
 cli/             CLI 入口、TUI、AgentRuntime、Provider、Dashboard、Memory
   providers/     LLM Provider 实现（Gemini / Claude / OpenAI / Fallback）
-core/            漏斗引擎、诊断、策略、信号确认、尾盘策略、常量
+core/            漏斗引擎、诊断、策略、信号确认、常量
 integrations/    数据源集成、Supabase 模块、SQLite 本地层、同步引擎
 scripts/         定时任务脚本（GitHub Actions 调用）
 tools/           搜索、新闻否决等辅助工具
@@ -756,8 +1007,12 @@ Formula/         Homebrew formula
 web/             React Web App（CF Pages 部署）
   apps/web/      前端 SPA（React + Vite + Tailwind）
     src/routes/  页面组件（chat / analysis / portfolio / ...）
-    src/lib/     chat-agent（Vercel AI SDK）、supabase 客户端
+    src/lib/     supabase 客户端、行情/LLM 辅助工具
+    src/features/reading-room/  useChat、消息队列、工具渲染、对话历史
     src/stores/  Zustand 状态管理（auth）
+  apps/api/      Hono Worker API（/api/chat、/api/agent-runs、/api/portfolio、/api/settings）
+  packages/shared/  Web/Worker 共享工具、schema 与 SSE 归一化
   functions/     CF Pages Functions（边缘代理）
-    api/llm-proxy/  LLM API 反向代理
+    api/chat/       Pages 请求转发到 Hono app
+    api/llm-proxy/  LLM / 行情 API 兼容代理
 ```

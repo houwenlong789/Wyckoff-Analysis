@@ -6,8 +6,8 @@ from collections.abc import Callable, Generator
 from copy import deepcopy
 from typing import Any
 
-from cli.agent import run
 from cli.providers.base import LLMProvider
+from cli.workflows.dispatch import build_turn_runtime
 
 Chunk = dict[str, Any]
 RoundScript = list[Chunk] | Callable[[list[dict[str, Any]], list[dict[str, Any]], str], list[Chunk]]
@@ -62,18 +62,19 @@ class StubToolRegistry:
         tool_results: dict[str, Any] | None = None,
         concurrency_safe_tools: set[str] | None = None,
     ):
-        self._schemas = (
-            deepcopy(schemas)
-            if schemas is not None
-            else [
-                {
-                    "name": "portfolio",
-                    "description": "Mock portfolio tool",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            ]
-        )
         self._tool_results = tool_results or {}
+        if schemas is not None:
+            self._schemas = deepcopy(schemas)
+        else:
+            names = ["portfolio", *self._tool_results.keys()]
+            self._schemas = [
+                {
+                    "name": name,
+                    "description": f"Mock {name} tool",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+                for name in dict.fromkeys(names)
+            ]
         self._concurrency_safe_tools = (
             concurrency_safe_tools
             if concurrency_safe_tools is not None
@@ -95,6 +96,10 @@ class StubToolRegistry:
         allowed = set(allowed_tools)
         return [schema for schema in schemas if schema["name"] in allowed]
 
+    def has_tool(self, name: str) -> bool:
+        # Stub execute() accepts any name; mirror that for prepareToolCall.
+        return True
+
     def execute(self, name: str, args: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Any:
         self.calls.append({"name": name, "args": deepcopy(args)})
         result = self._tool_results.get(name, {"ok": True, "name": name, "args": deepcopy(args)})
@@ -107,16 +112,18 @@ class StubToolRegistry:
 
 
 class AgentLoopHarness:
-    """Run a single turn through cli.agent.run() with scripted dependencies."""
+    """Run a single turn through the canonical runtime with scripted dependencies."""
 
     def __init__(
         self,
         *,
         rounds: list[RoundScript],
         tool_results: dict[str, Any] | None = None,
+        enforce_turn_expectations: bool | None = None,
     ):
         self.provider = ScriptedProvider(rounds)
         self.tools = StubToolRegistry(tool_results=tool_results)
+        self.enforce_turn_expectations = enforce_turn_expectations
 
     def run_turn(
         self,
@@ -127,16 +134,37 @@ class AgentLoopHarness:
         working_messages = deepcopy(messages)
         observed_tool_calls: list[dict[str, Any]] = []
         observed_tool_results: list[dict[str, Any]] = []
-        result = run(
-            provider=self.provider,
-            tools=self.tools,
-            messages=working_messages,
-            system_prompt=system_prompt,
-            on_tool_call=lambda name, args: observed_tool_calls.append({"name": name, "args": deepcopy(args)}),
-            on_tool_result=lambda name, result: observed_tool_results.append(
-                {"name": name, "result": deepcopy(result)}
-            ),
+        user_text = next(
+            (message.get("content", "") for message in reversed(working_messages) if message.get("role") == "user"),
+            "",
         )
+        runtime, _ = build_turn_runtime(
+            self.provider,
+            self.tools,
+            session_id="",
+            user_text=str(user_text),
+            enforce_turn_expectations=self.enforce_turn_expectations,
+            routing_messages=working_messages,
+        )
+        result: dict[str, Any] | None = None
+        for event in runtime.run_stream(working_messages, system_prompt):
+            if event["type"] == "tool_start":
+                observed_tool_calls.append({"name": event["name"], "args": deepcopy(event["args"])})
+            elif event["type"] in {"tool_result", "tool_error"} and "result" in event:
+                observed_tool_results.append({"name": event["name"], "result": deepcopy(event["result"])})
+            elif event["type"] == "done":
+                result = {
+                    "text": event["text"],
+                    "streamed": event.get("streamed", False),
+                    "usage": event.get("usage", {}),
+                    "elapsed": event.get("elapsed", 0.0),
+                }
+        result = result or {
+            "text": "(Agent 未返回内容)",
+            "streamed": False,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "elapsed": 0.0,
+        }
         return {
             "result": result,
             "messages": working_messages,

@@ -1,4 +1,5 @@
 import { supabase } from './supabase'
+import { PROVIDER_BASE_URLS, PROVIDER_DEFAULT_MODELS, type Provider } from '@wyckoff/shared'
 
 export interface LLMConfig {
   api_key: string
@@ -26,6 +27,23 @@ export interface PreparedChatHistory {
   afterTokens: number
   beforeMessages: number
   afterMessages: number
+}
+
+type UserSettingsRow = {
+  chat_provider?: string | null
+  gemini_api_key?: string | null
+  gemini_model?: string | null
+  gemini_base_url?: string | null
+  openai_api_key?: string | null
+  openai_model?: string | null
+  openai_base_url?: string | null
+  deepseek_api_key?: string | null
+  deepseek_model?: string | null
+  deepseek_base_url?: string | null
+  anthropic_api_key?: string | null
+  anthropic_model?: string | null
+  anthropic_base_url?: string | null
+  custom_providers?: unknown
 }
 
 const MODEL_CONTEXT_WINDOWS: [string, number][] = [
@@ -196,44 +214,60 @@ function parseCustomProviders(raw: unknown): Record<string, Record<string, strin
 }
 
 export async function loadLLMConfig(userId: string): Promise<LLMConfig | null> {
+  const configs = await loadLLMConfigCandidates(userId)
+  return configs[0] || null
+}
+
+export async function loadLLMConfigCandidates(userId: string): Promise<LLMConfig[]> {
   const { data } = await supabase
     .from('user_settings')
     .select('chat_provider, gemini_api_key, gemini_model, gemini_base_url, openai_api_key, openai_model, openai_base_url, deepseek_api_key, deepseek_model, deepseek_base_url, anthropic_api_key, anthropic_model, anthropic_base_url, custom_providers')
     .eq('user_id', userId)
     .single()
 
-  if (!data) return null
+  if (!data) return []
 
-  const provider = data.chat_provider || '1route'
-  if (RETIRED_PROVIDERS.has(provider)) return null
-  let api_key = '', model = '', base_url = ''
-  let protocol: 'openai' | 'anthropic' = 'openai'
+  const settings = data as UserSettingsRow
+  const activeProvider = settings.chat_provider || '1route'
+  const custom = parseCustomProviders(settings.custom_providers)
+  const providers = Array.from(new Set([
+    activeProvider,
+    'openai',
+    'deepseek',
+    'gemini',
+    'anthropic',
+    ...Object.keys(custom),
+  ]))
+  return providers
+    .filter((provider) => !RETIRED_PROVIDERS.has(provider))
+    .map((provider) => buildProviderConfig(provider, settings))
+    .filter((config) => Boolean(config.api_key && config.model && config.base_url))
+}
 
-  if (provider === 'gemini') {
-    api_key = data.gemini_api_key || ''
-    model = data.gemini_model || 'gemini-2.0-flash'
-    base_url = data.gemini_base_url || 'https://generativelanguage.googleapis.com/v1beta/openai'
-  } else if (provider === 'openai') {
-    api_key = data.openai_api_key || ''
-    model = data.openai_model || 'gpt-4o'
-    base_url = data.openai_base_url || 'https://api.openai.com/v1'
-  } else if (provider === 'deepseek') {
-    api_key = data.deepseek_api_key || ''
-    model = data.deepseek_model || 'deepseek-chat'
-    base_url = data.deepseek_base_url || 'https://api.deepseek.com/v1'
-  } else if (provider === 'anthropic') {
-    api_key = data.anthropic_api_key || ''
-    model = data.anthropic_model || 'claude-sonnet-4-20250514'
-    base_url = data.anthropic_base_url || 'https://api.anthropic.com'
-    protocol = 'anthropic'
-  } else {
-    const custom = parseCustomProviders(data.custom_providers)
-    const info = custom[provider] || {}
-    api_key = info.apikey || info.api_key || ''
-    model = info.model || ''
-    base_url = info.baseurl || info.base_url || ''
+const BUILTIN_PROVIDER_OVERRIDES: Record<string, Partial<LLMConfig>> = {
+  gemini: { base_url: 'https://generativelanguage.googleapis.com/v1beta/openai', protocol: 'openai' },
+  anthropic: { base_url: 'https://api.anthropic.com', protocol: 'anthropic' },
+}
+
+function buildProviderConfig(provider: string, data: UserSettingsRow): LLMConfig {
+  const apiKey = data[`${provider}_api_key` as keyof UserSettingsRow]
+  if (typeof apiKey === 'string' && apiKey) {
+    const model = data[`${provider}_model` as keyof UserSettingsRow] as string | null | undefined
+    const baseUrl = data[`${provider}_base_url` as keyof UserSettingsRow] as string | null | undefined
+    const override = BUILTIN_PROVIDER_OVERRIDES[provider]
+    return {
+      api_key: apiKey,
+      model: model || PROVIDER_DEFAULT_MODELS[provider as Provider] || '',
+      base_url: baseUrl || override?.base_url || PROVIDER_BASE_URLS[provider as Provider] || '',
+      protocol: override?.protocol || 'openai',
+    }
   }
-
-  if (!api_key) return null
-  return { api_key, model, base_url, protocol }
+  const custom = parseCustomProviders(data.custom_providers)
+  const info = custom[provider] || {}
+  return {
+    api_key: info.apikey || info.api_key || '',
+    model: info.model || PROVIDER_DEFAULT_MODELS[provider as Provider] || '',
+    base_url: info.baseurl || info.base_url || PROVIDER_BASE_URLS[provider as Provider] || '',
+    protocol: 'openai',
+  }
 }

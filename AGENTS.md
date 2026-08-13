@@ -13,24 +13,24 @@ Streamlit is fully retired from `main`: do not add, restore, or maintain Streaml
 
 ```bash
 # Python
-python -m pytest tests/ -x -q           # run tests
-ruff check .                             # lint
-ruff format --check .                    # format check
-python scripts/quality_gate.py --ci      # function length + LOC trend
+.venv/bin/python -m pytest tests/ -x -q  # run tests
+.venv/bin/ruff check .                   # lint
+.venv/bin/ruff format --check .          # format check
+.venv/bin/python scripts/quality_gate.py --ci  # function length + LOC trend
+.venv/bin/python scripts/check_workflow_hygiene.py
+.venv/bin/python scripts/check_dependency_hygiene.py
 
 # Web (from web/ directory)
 pnpm dev                                 # dev server
 pnpm build                               # production build
 pnpm -r exec tsc --noEmit                # typecheck
+pnpm --filter @wyckoff/web test
+pnpm --filter @wyckoff/api test
 ```
 
 ## Hard Rules (CI enforced, will block merge)
 
-1. **No redundant code** — Every function, variable, and abstraction must earn its existence. Forbidden patterns:
-   - Wrapper functions whose body is a single forwarded call
-   - Variables that are assigned once and immediately returned
-   - Intermediate abstractions with only one caller and no reuse prospect
-   - Re-exports or re-declarations that add no value
+1. **Pass quality gate** — `.venv/bin/python scripts/quality_gate.py --ci` must pass function-length hard limits. LOC growth warnings are review signals, not automatic failures.
 
 2. **Pass ruff check** — All Python code must pass `ruff check .` with the project config in `pyproject.toml`.
 
@@ -40,17 +40,40 @@ pnpm -r exec tsc --noEmit                # typecheck
 
 5. **Pass pytest** — All tests must pass. Tests must not make real network calls.
 
-## Soft Rules (quality expectations)
+6. **Pass PR policy** — Every non-automated PR must have Markdown headings for both `Summary`/`变更摘要` and `Validation`/`验证`. It must not include secrets, local logs, traces, database dumps, or key material.
 
-1. **Function length ≤ 50 lines (hard fail)** — New functions exceeding 50 lines block merge. Whitelisted legacy functions must not grow longer (also blocks merge). Legacy violations tracked in `.metrics/func_whitelist.json`; whitelist values only ratchet down, never up.
+7. **Pass workflow hygiene** — Changes to `.github/workflows/` must retain least-privilege top-level permissions, concurrency for automation workflows, artifact upload when a job prepares logs, and environment indirection for shell inputs. The A-share funnel and Step4/OMS entrypoints must keep their shared concurrency group.
 
-2. **No code bloat** — If 30 lines can do the job, don't write 50. Code volume is tracked in `.metrics/loc.json`; growth >5% without corresponding feature additions will be flagged.
+8. **Pass dependency hygiene** — Dependency changes must preserve `uv.lock` and `web/pnpm-lock.yaml`, and the lockfile must be updated with its manifest. Do not introduce `latest`, wildcard, unpinned remote, or runtime-resolved dependencies.
 
-3. **No dead code** — Don't leave unused imports, commented-out blocks, or unreachable branches. Delete them.
+9. **Pass operational smoke checks** — A change that can affect daily jobs, funnel execution, data writes, or integrations must pass the CI smoke dry-run as well as its focused tests. A queued or in-progress run is not evidence of success.
 
-4. **Comments: only when WHY is non-obvious** — Don't explain what code does. Don't reference tickets or tasks. Only explain hidden constraints or surprising behavior.
+## Review Rules (strong expectations, not mechanically CI-enforced)
 
-5. **No debug artifacts** — Don't commit console.log, print(), breakpoint(), or TODO/FIXME comments.
+1. **Function length target ≤ 50 lines; hard limits by layer** — 50 lines remains the design target, not a mechanical wall. New functions block merge only when they exceed the layer hard limit enforced by `scripts/quality_gate.py`: default/core/agents/tools/integrations/workflows/shared packages ≤70 lines, scripts/CLI orchestration ≤100 lines, React route pages ≤120 lines, React components/app glue ≤90 lines. Whitelisted legacy functions are tracked as visible debt in `.metrics/func_whitelist.json`; they may remain temporarily over limit, but must not grow longer.
+
+2. **No redundant code** — Every function, variable, and abstraction must earn its existence. Review aggressively for wrapper functions whose body is a single forwarded call, variables assigned once and immediately returned, one-off abstractions with no clear reuse/design value, and re-exports that add no boundary clarity.
+
+3. **No code bloat** — If 30 lines can do the job, don't write 50. Code volume is tracked in `.metrics/loc.json`; growth >5% without corresponding feature additions is a warning that must be explained or paid down.
+
+4. **No dead code** — Don't leave unused imports, commented-out blocks, or unreachable branches. Delete them.
+
+5. **Comments: only when WHY is non-obvious** — Don't explain what code does. Don't reference tickets or tasks. Only explain hidden constraints or surprising behavior.
+
+6. **No debug artifacts** — Don't commit `console.log`, `breakpoint()`, `TODO/FIXME`, temporary dumps, or `print("debug")`-style traces. In `core/`, `integrations/`, `tools/`, and `agents/`, use logging instead of print-style diagnostics. In `scripts/` and `cli/`, user-facing progress/output via `print()` is allowed.
+
+## Gate Levels
+
+- **Fast gate (local/default)**: `.venv/bin/ruff check .`, `.venv/bin/ruff format --check .`, `.venv/bin/python scripts/quality_gate.py --check-functions`, and focused tests for touched code.
+- **Full gate (CI/release)**: fast gate plus `.venv/bin/python scripts/check_workflow_hygiene.py`, `.venv/bin/python scripts/check_dependency_hygiene.py`, full `pytest`, TypeScript strict mode, web and API tests, Pages-functions build, and dry-run jobs where relevant.
+
+## CI and Submission Contract
+
+- `.github/workflows/ci.yml` is the executable source of truth. `AGENTS.md` defines the contributor contract; if the two disagree, update this file in the same PR instead of treating stale instructions as an exception.
+- Do not claim a change is ready to merge from local checks alone. Required CI jobs must be successful; `queued`, `in_progress`, `skipped`, and `continue-on-error` coverage are not a green merge gate.
+- Run the full web gate for web changes from `web/`: `CI=true pnpm install --frozen-lockfile`, TypeScript check, both package test suites, and the Pages-functions build. Do not use an interactive dependency repair as validation.
+- The CI runner installs Ruff independently. Keep the local toolchain compatible, but when local and CI results differ, resolve against the CI version and record the successful CI run before merging.
+- For workflow, schedule, environment-variable, prompt, or operational-contract changes, update the affected documentation and the independent `wiki_repo_new/` checkout in the same delivery.
 
 ## Architecture Constraints
 
@@ -58,6 +81,15 @@ pnpm -r exec tsc --noEmit                # typecheck
 - **No Streamlit in main** — Streamlit is no longer maintained on `main`; route product work through CF Pages, CLI, MCP, or GitHub Actions.
 - **Data isolation: Route A** — Signals are shared; portfolio and settings are per-user.
 - **Python ≥ 3.11**, **Node ≥ 20**, **pnpm** for web workspace.
+- The standalone `wiki_repo_new/` checkout is intentionally hidden and independently versioned; keep it ignored and do not merge it into `docs/`.
+
+## Documentation Synchronization
+
+- Current code, workflow configuration, and live data contracts are the source of truth. Do not preserve documentation text that conflicts with implementation.
+- Every change to strategy semantics, report fields, prompts, scheduled workflows, environment variables, SQL tables, CLI/MCP/Web tools, or operational behavior must update the affected `README*`, `GLOSSARY.md`, and `docs/` pages in the same change.
+- The independent `wiki_repo_new/` repository must be reviewed for the same change and committed separately when affected. Keep its content aligned with code rather than copying stale prose from `docs/`.
+- Before submission, search documentation for renamed files, removed symbols, changed defaults, and old execution wording. In particular, keep research states (`pending`, `confirmed`, `起跳板`) distinct from executable decisions (`BUY` after market and OMS gates).
+- Do not commit one-off SQL migration files after the migration has been applied unless the repository explicitly adopts migration history as a maintained product artifact.
 
 ## Commit Messages
 
@@ -66,5 +98,5 @@ Use conventional prefixes: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chor
 ## Before Submitting Code
 
 ```bash
-ruff check . && ruff format --check . && python scripts/quality_gate.py --check-functions
+.venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/python scripts/quality_gate.py --check-functions
 ```

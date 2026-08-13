@@ -16,9 +16,16 @@ from cli.sub_agent_prompts import (
     ANALYSIS_AGENT_PROMPT,
     RESEARCH_AGENT_PROMPT,
     TRADING_AGENT_PROMPT,
+    WORKFLOW_TASK_AGENT_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _sub_agent_stream_chunk_timeout(sub_timeout_seconds: float) -> float:
+    from cli.auth import get_stream_chunk_timeout_seconds
+
+    return min(get_stream_chunk_timeout_seconds(), float(sub_timeout_seconds))
 
 
 @dataclass(frozen=True)
@@ -49,6 +56,7 @@ RESEARCH_AGENT = SubAgent(
         "get_market_overview",
         "get_market_history",
         "query_history",
+        "evaluate_recommendation_events",
         "screen_stocks",
         "run_backtest",
         "check_background_tasks",
@@ -91,11 +99,48 @@ TRADING_AGENT = SubAgent(
     ),
 )
 
+WORKFLOW_TASK_AGENT = SubAgent(
+    name="task",
+    description="动态任务：按模型脚本执行单个 workflow task",
+    system_prompt=WORKFLOW_TASK_AGENT_PROMPT,
+    timeout_seconds=180,
+    max_tool_rounds=8,
+    context_budget_tokens=20_000,
+    result_budget_chars=2_500,
+    tool_timeout_seconds=75,
+    tool_names=(
+        "search_stock_by_name",
+        "analyze_stock",
+        "portfolio",
+        "get_market_overview",
+        "get_market_history",
+        "query_history",
+        "evaluate_recommendation_events",
+        "screen_stocks",
+        "run_backtest",
+        "check_background_tasks",
+        "generate_ai_report",
+        "generate_strategy_decision",
+        "ask_user_question",
+    ),
+)
+
 _FALLBACK_TOOLS_BY_AGENT = {
     "research": ("get_market_overview", "query_history", "check_background_tasks"),
     "analysis": ("analyze_stock", "portfolio", "get_market_overview"),
     "trading": ("portfolio", "generate_strategy_decision", "get_market_overview"),
 }
+_WORKFLOW_EXPECTATION_TOOLS = frozenset(
+    {
+        "analyze_stock",
+        "portfolio",
+        "get_market_overview",
+        "screen_stocks",
+        "generate_ai_report",
+        "generate_strategy_decision",
+        "run_backtest",
+    }
+)
 
 _POLICY_BY_STATUS = {
     "completed": ("use_result", False, "使用子 Agent 返回的结论。"),
@@ -117,6 +162,13 @@ class SubAgentToolProxy:
 
     def schemas(self) -> list[dict[str, Any]]:
         return [s for s in self._registry.schemas() if s["name"] in self._allowed]
+
+    def has_tool(self, name: str) -> bool:
+        if name not in self._allowed:
+            return False
+        if hasattr(self._registry, "has_tool"):
+            return bool(self._registry.has_tool(name))
+        return any(schema.get("name") == name for schema in self.schemas())
 
     def execute(self, name: str, args: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Any:
         if name not in self._allowed:
@@ -173,22 +225,32 @@ def run_sub_agent(
     registry,
     on_progress=None,
     cancel_check: Callable[[], bool] | None = None,
+    tool_names: tuple[str, ...] | None = None,
+    enforce_turn_expectations: bool = False,
+    required_tool_names: tuple[str, ...] | None = None,
+    required_tool_args: dict[str, dict[str, str]] | None = None,
+    required_tool_arg_sets: dict[str, tuple[dict[str, Any], ...]] | None = None,
 ) -> dict[str, Any]:
     """启动一个 sub-agent mini loop，通过 on_progress 实时上报事件。"""
     from cli.runtime import AgentRuntime
 
     started_at = time.monotonic()
     deadline = started_at + max(1, sub.timeout_seconds)
+    allowed_tools = _sub_agent_tool_set(sub, tool_names)
     proxy = SubAgentToolProxy(
         registry,
-        set(sub.tool_names),
+        allowed_tools,
         tool_timeout_seconds=sub.tool_timeout_seconds,
         deadline=deadline,
     )
+    from core.prompts import append_beijing_time_context
+
     trimmed_context, context_truncated = _fit_context(context, sub.context_budget_tokens)
     user_content = f"{task}\n\n上下文:\n{trimmed_context}" if trimmed_context else task
-    messages: list[dict[str, Any]] = [{"role": "user", "content": user_content}]
+    # 时间挂 user，勿 prepend system，避免子 agent 多轮打爆 prompt cache。
+    messages: list[dict[str, Any]] = [{"role": "user", "content": append_beijing_time_context(user_content)}]
     tool_calls: list[str] = []
+    background_task_ids: list[str] = []
     cancelled = _sub_agent_cancel_check(cancel_check, deadline)
 
     runtime = AgentRuntime(
@@ -196,7 +258,16 @@ def run_sub_agent(
         proxy,
         max_tool_rounds=sub.max_tool_rounds,
         cancel_check=cancelled,
-        stream_chunk_timeout=min(60.0, float(sub.timeout_seconds)),
+        stream_chunk_timeout=_sub_agent_stream_chunk_timeout(sub.timeout_seconds),
+        allowed_tools=allowed_tools,
+        required_tools=required_tool_names if enforce_turn_expectations else None,
+        required_tool_args=required_tool_args if enforce_turn_expectations else None,
+        required_tool_arg_sets=required_tool_arg_sets if enforce_turn_expectations else None,
+        enforce_turn_expectations=_sub_agent_turn_expectations_enabled(
+            sub,
+            allowed_tools,
+            enforce_turn_expectations,
+        ),
     )
 
     return _run_sub_agent_loop(
@@ -205,10 +276,26 @@ def run_sub_agent(
         messages,
         started_at,
         tool_calls,
+        background_task_ids,
         context_truncated,
         cancelled,
         deadline,
         on_progress,
+    )
+
+
+def _sub_agent_tool_set(sub: SubAgent, tool_names: tuple[str, ...] | None) -> set[str]:
+    if tool_names is None:
+        return set(sub.tool_names)
+    default_tools = set(sub.tool_names)
+    return {name for name in tool_names if name in default_tools}
+
+
+def _sub_agent_turn_expectations_enabled(sub: SubAgent, allowed_tools: set[str], requested: bool) -> bool:
+    return (
+        requested
+        and sub.name == WORKFLOW_TASK_AGENT.name
+        and bool(allowed_tools.intersection(_WORKFLOW_EXPECTATION_TOOLS))
     )
 
 
@@ -218,36 +305,57 @@ def _run_sub_agent_loop(
     messages: list[dict[str, Any]],
     started_at: float,
     tool_calls: list[str],
+    background_task_ids: list[str],
     context_truncated: bool,
     cancelled: Callable[[], bool],
     deadline: float,
     on_progress=None,
 ) -> dict[str, Any]:
-    from core.prompts import with_current_time
-
     try:
-        for event in runtime.run_stream(messages, with_current_time(sub.system_prompt)):
+        for event in runtime.run_stream(messages, sub.system_prompt):
             if cancelled():
                 raise AgentCancelled()
             if event["type"] == "tool_start":
                 tool_calls.append(event["name"])
+            if event["type"] == "tool_result":
+                background_task_ids.extend(_background_task_ids(event.get("result")))
             if on_progress:
                 event["sub_agent"] = sub.name
                 on_progress(event)
             if event["type"] == "done":
-                return _sub_agent_result(sub, "completed", event, started_at, tool_calls, context_truncated)
+                return _sub_agent_result(
+                    sub, "completed", event, started_at, tool_calls, background_task_ids, context_truncated
+                )
     except AgentCancelled:
         status = "timeout" if time.monotonic() >= deadline else "cancelled"
         return _sub_agent_result(
-            sub, status, {}, started_at, tool_calls, context_truncated, error=f"sub-agent {status}"
+            sub,
+            status,
+            {},
+            started_at,
+            tool_calls,
+            background_task_ids,
+            context_truncated,
+            error=f"sub-agent {status}",
         )
     except TimeoutError as exc:
-        return _sub_agent_result(sub, "timeout", {}, started_at, tool_calls, context_truncated, error=str(exc))
+        return _sub_agent_result(
+            sub, "timeout", {}, started_at, tool_calls, background_task_ids, context_truncated, error=str(exc)
+        )
     except Exception as exc:
         logger.exception("Sub-agent %s failed", sub.name)
-        return _sub_agent_result(sub, "error", {}, started_at, tool_calls, context_truncated, error=str(exc))
+        return _sub_agent_result(
+            sub, "error", {}, started_at, tool_calls, background_task_ids, context_truncated, error=str(exc)
+        )
 
-    return _sub_agent_result(sub, "empty", {}, started_at, tool_calls, context_truncated)
+    return _sub_agent_result(sub, "empty", {}, started_at, tool_calls, background_task_ids, context_truncated)
+
+
+def _background_task_ids(result: Any) -> list[str]:
+    if not isinstance(result, dict) or result.get("status") != "background":
+        return []
+    task_id = str(result.get("task_id") or "").strip()
+    return [task_id] if task_id else []
 
 
 def _sub_agent_cancel_check(cancel_check: Callable[[], bool] | None, deadline: float) -> Callable[[], bool]:
@@ -293,6 +401,7 @@ def _sub_agent_result(
     event: dict[str, Any],
     started_at: float,
     tool_calls: list[str],
+    background_task_ids: list[str],
     context_truncated: bool,
     *,
     error: str = "",
@@ -309,6 +418,7 @@ def _sub_agent_result(
         "elapsed": elapsed,
         "rounds": event.get("rounds", 0),
         "tool_calls": tool_calls,
+        "background_task_ids": list(dict.fromkeys(background_task_ids)),
         "context_truncated": context_truncated,
         "result_truncated": result_truncated,
         "error": error,
@@ -338,6 +448,7 @@ def _sub_agent_start_error(sub: SubAgent) -> dict[str, Any]:
         "error",
         {},
         time.monotonic(),
+        [],
         [],
         False,
         error="provider/registry 未注入，无法启动 sub-agent",

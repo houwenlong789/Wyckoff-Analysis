@@ -1,3 +1,5 @@
+import { formatTimestampDate } from './format'
+
 export type ExportCell = string | number
 export type ExportRow = Record<string, ExportCell>
 
@@ -22,6 +24,12 @@ export function normalizeExportSymbol(raw: string): string {
   if (input.startsWith('0') || input.startsWith('1') || input.startsWith('2') || input.startsWith('3')) return `${input}.SZ`
   if (input.startsWith('4') || input.startsWith('8') || input.startsWith('9')) return `${input}.BJ`
   return `${input}.SH`
+}
+
+/** Resolve a typed/selected search hit into TickFlow export symbol (supports Chinese names via caller-provided stock). */
+export function exportSymbolFromStock(stock: { symbol?: string; analysisCode?: string } | null | undefined): string {
+  if (!stock) return ''
+  return normalizeExportSymbol(stock.symbol || stock.analysisCode || '')
 }
 
 export function parseExportSymbols(text: string): string[] {
@@ -182,12 +190,6 @@ function formatCompactDate(d: Date): string {
 
 function toMs(date: string): number {
   return new Date(date.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3')).getTime()
-}
-
-function formatTimestampDate(value: unknown): string {
-  const numeric = Number(value)
-  if (Number.isFinite(numeric) && numeric > 0) return new Date(numeric + 8 * 3600_000).toISOString().slice(0, 10)
-  return String(value || '').replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3').slice(0, 10)
 }
 
 function buildCrcTable(): Uint32Array {

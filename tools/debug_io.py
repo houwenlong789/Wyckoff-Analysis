@@ -7,22 +7,17 @@ step3 / step4 共用的 _dump_model_input 统一提取至此。
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from datetime import datetime
 
-DEBUG_MODEL_IO: bool = os.getenv("DEBUG_MODEL_IO", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-DEBUG_MODEL_IO_FULL: bool = os.getenv("DEBUG_MODEL_IO_FULL", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+from utils.env import env_flag
+
+logger = logging.getLogger(__name__)
+
+DEBUG_MODEL_IO: bool = env_flag("DEBUG_MODEL_IO")
+DEBUG_MODEL_IO_FULL: bool = env_flag("DEBUG_MODEL_IO_FULL")
 
 
 def dump_model_input(
@@ -84,5 +79,5 @@ def dump_model_input(
         body += f"\n===== SYSTEM PROMPT =====\n{system_prompt}\n\n===== USER MESSAGE =====\n{user_message}\n"
     with open(path, "w", encoding="utf-8") as f:
         f.write(body)
-    print(f"[{step_prefix}] 模型输入已落盘: {path}")
+    logger.info("[%s] 模型输入已落盘: %s", step_prefix, path)
     return path

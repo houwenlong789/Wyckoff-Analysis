@@ -19,6 +19,7 @@ class BackgroundTask:
     status: str = "pending"  # pending → running → completed | failed
     result: Any = None
     error: str = ""
+    result_summary: str = ""
     submitted_at: float = field(default_factory=time.monotonic)
     completed_at: float | None = None
     # progress fields
@@ -55,7 +56,7 @@ class BackgroundTaskManager:
             self._tasks[task_id] = task
 
         def _run():
-            from cli.progress import set_reporter
+            from utils.progress import set_reporter
 
             def _on_progress(stage, detail, progress):
                 with self._lock:
@@ -97,15 +98,54 @@ class BackgroundTaskManager:
         if task is None:
             return None
         elapsed = (task.completed_at or time.monotonic()) - task.submitted_at
-        return {
+        payload = {
             "task_id": task.id,
             "tool_name": task.tool_name,
             "status": task.status,
             "elapsed": f"{elapsed:.0f}s",
             "error": task.error or None,
         }
+        if task.status == "completed":
+            payload["result_summary"] = _background_result_summary(task)
+        return payload
 
     def list_tasks(self) -> list[dict[str, Any]]:
         with self._lock:
             tasks = list(self._tasks.values())
-        return [self.get_status(t.id) for t in tasks if self.get_status(t.id)]
+        statuses = [self.get_status(t.id) for t in tasks]
+        return [status for status in statuses if status]
+
+    def wait_for_tasks(
+        self,
+        task_ids: list[str],
+        *,
+        timeout_seconds: float,
+        poll_interval: float = 0.2,
+    ) -> list[dict[str, Any]]:
+        deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
+        ids = [task_id for task_id in dict.fromkeys(task_ids) if task_id]
+        while ids and time.monotonic() < deadline:
+            statuses = [self.get_status(task_id) for task_id in ids]
+            if all(status and status.get("status") in {"completed", "failed"} for status in statuses):
+                break
+            time.sleep(max(float(poll_interval), 0.01))
+        return [status for task_id in ids if (status := self.get_status(task_id))]
+
+    def completed_results(self) -> list[tuple[str, str, Any]]:
+        with self._lock:
+            return [
+                (task.id, task.tool_name, task.result)
+                for task in self._tasks.values()
+                if task.status == "completed" and task.result is not None
+            ]
+
+
+def _background_result_summary(task: BackgroundTask) -> str:
+    if task.result_summary:
+        return task.result_summary
+    if task.result is None:
+        return ""
+    from cli.tool_results import format_tool_result_for_context
+
+    task.result_summary = format_tool_result_for_context(task.tool_name, task.id, task.result, max_chars=3000)
+    return task.result_summary

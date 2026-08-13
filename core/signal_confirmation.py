@@ -1,4 +1,4 @@
-"""信号确认逻辑：pending → confirmed / expired。纯业务，不依赖 DB。"""
+"""信号确认逻辑：pending → survived / confirmed / expired。纯业务，不依赖 DB。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,23 @@ SIGNAL_TTL_DAYS: dict[str, int] = {
     "lps": 3,
     "evr": 2,
     "compression": 3,
+    # 趋势/主线缩短确认窗口，避免 3–5 日 alpha 被确认链吃掉。
+    "trend_pullback": 2,
+    "trend_breakout": 2,
+    "trend_lane_pullback": 2,
+    "main_force_entry": 2,
+    "sector_strength": 2,
+    "wyckoff_structure": 2,
+    "mainline": 2,
+}
+TREND_CONFIRM_SIGNALS = {
+    "trend_pullback",
+    "trend_breakout",
+    "trend_lane_pullback",
+    "sector_strength",
+    "wyckoff_structure",
+    "mainline",
+    "main_force_entry",
 }
 
 
@@ -21,25 +38,52 @@ def check_confirmation(
     today_ohlcv: dict[str, float],
     days_elapsed: int,
 ) -> tuple[str, str]:
-    """返回 (new_status, reason)，status ∈ {'pending', 'confirmed', 'expired'}。"""
+    """返回 (new_status, reason)，区分“未失效”和“正向确认”。"""
     ttl = SIGNAL_TTL_DAYS.get(signal_type, 3)
     if days_elapsed >= ttl:
         return "expired", f"TTL {ttl}天已到，未满足确认条件"
     fn = _CONFIRM_DISPATCH.get(signal_type)
     if fn is None:
         return "expired", f"未知信号类型: {signal_type}"
-    return fn(snap, today_ohlcv, days_elapsed)
+    status, reason = fn(snap, today_ohlcv, days_elapsed)
+    if status == "pending" and days_elapsed > 0:
+        return "survived", reason
+    return status, reason
+
+
+def _close_position(today: dict[str, float], reference_close: float = 0.0) -> float:
+    high = float(today.get("high", 0) or 0)
+    low = float(today.get("low", 0) or 0)
+    close = float(today.get("close", 0) or 0)
+    if high > low:
+        return (close - low) / (high - low)
+    if reference_close > 0 and close > reference_close:
+        return 1.0
+    if reference_close > 0 and close < reference_close:
+        return 0.0
+    return 0.5
 
 
 def _confirm_sos(snap: dict, today: dict, days_elapsed: int) -> tuple[str, str]:
+    # 实盘K线复算：SOS/EVR 点火类信号胜率仅 10-20%（trend_pullback/LPS(确认) 44-47%），
+    # 根因是"低乖离处的放量假突破"——仅"不跌破+缩量"就放行过于宽松，还需确认日
+    # 站稳 MA20 附近，验证点火后确有资金承接而非一日游脉冲。
     snap_low, snap_close, snap_vol = snap.get("snap_low", 0), snap.get("snap_close", 0), snap.get("snap_volume", 0)
+    ma20 = today.get("ma20", 0)
     if today["low"] < snap_low:
         return "expired", f"跌破信号日低点 {snap_low:.2f}"
     if snap_vol > 0 and today["volume"] > snap_vol * 0.8 and today["close"] < snap_close * 0.97:
         return "expired", "放量回落，非缩量确认"
-    if snap_vol > 0 and today["volume"] < snap_vol * 0.8 and today["low"] >= snap_low and today["close"] >= snap_close:
-        return "confirmed", f"缩量确认，收盘 {today['close']:.2f} 守住信号日收盘 {snap_close:.2f}"
-    return "pending", "等待缩量确认"
+    holds_ma20 = ma20 <= 0 or today["close"] >= ma20 * 0.99
+    if (
+        snap_vol > 0
+        and today["volume"] < snap_vol * 0.8
+        and today["low"] >= snap_low
+        and today["close"] >= snap_close
+        and holds_ma20
+    ):
+        return "confirmed", f"缩量确认，收盘 {today['close']:.2f} 守住信号日收盘且站稳MA20"
+    return "pending", "等待缩量+站稳MA20确认"
 
 
 def _confirm_spring(snap: dict, today: dict, days_elapsed: int) -> tuple[str, str]:
@@ -52,23 +96,37 @@ def _confirm_spring(snap: dict, today: dict, days_elapsed: int) -> tuple[str, st
 
 
 def _confirm_lps(snap: dict, today: dict, days_elapsed: int) -> tuple[str, str]:
-    snap_ma20, snap_vol = snap.get("snap_ma20", 0), snap.get("snap_volume", 0)
+    snap_ma20 = float(snap.get("snap_ma20", 0) or 0)
+    snap_close = float(snap.get("snap_close", 0) or 0)
+    snap_vol = float(snap.get("snap_volume", 0) or 0)
+    today_ma20 = float(today.get("ma20", 0) or 0)
     if today["low"] < snap_ma20 * 0.98:
         return "expired", f"跌破 MA20 {snap_ma20:.2f}"
     if snap_vol > 0 and today["volume"] > snap_vol * 1.5:
         return "expired", "异常放量，LPS 逻辑失效"
-    if today["close"] >= snap_ma20 and (snap_vol <= 0 or today["volume"] <= snap_vol * 1.2):
-        return "confirmed", f"站稳 MA20 {snap_ma20:.2f}，缩量确认"
-    return "pending", "等待站稳 MA20"
+    holds_support = today["close"] >= max(snap_ma20, today_ma20 * 0.995)
+    holds_signal_close = snap_close <= 0 or today["close"] >= snap_close * 0.995
+    dry = snap_vol <= 0 or today["volume"] <= snap_vol * 0.90
+    bullish = today["close"] >= today.get("open", today["close"])
+    strong_close = _close_position(today, snap_close) >= 0.60
+    if holds_support and holds_signal_close and strong_close and (dry or bullish):
+        return "confirmed", f"需求确认：高收守住信号区与当日MA20，收盘 {today['close']:.2f}"
+    if holds_support and (snap_vol <= 0 or today["volume"] <= snap_vol * 1.2):
+        return "pending", "结构未失效但缺少高收/需求证据"
+    return "pending", "等待守住当日MA20并出现高收需求确认"
 
 
 def _confirm_evr(snap: dict, today: dict, days_elapsed: int) -> tuple[str, str]:
+    # 同 _confirm_sos：EVR(二次确认) 实盘胜率仅 9.7%，比未确认样本更差，说明单纯
+    # "收盘不跌破事件低点"不足以过滤滞涨假企稳，补充站稳 MA20 的结构性要求。
     event_low, snap_close = snap.get("snap_support", 0), snap.get("snap_close", 0)
+    ma20 = today.get("ma20", 0)
     if today["close"] < event_low:
         return "expired", f"跌破事件日低点 {event_low:.2f}"
-    if today["close"] >= event_low and today["close"] >= snap_close * 0.98:
-        return "confirmed", f"守住 {event_low:.2f}，收盘 {today['close']:.2f}"
-    return "pending", "等待企稳确认"
+    holds_ma20 = ma20 <= 0 or today["close"] >= ma20 * 0.99
+    if today["close"] >= event_low and today["close"] >= snap_close * 0.98 and holds_ma20:
+        return "confirmed", f"守住 {event_low:.2f} 且站稳MA20，收盘 {today['close']:.2f}"
+    return "pending", "等待企稳+站稳MA20确认"
 
 
 def _confirm_compression(snap: dict, today: dict, days_elapsed: int) -> tuple[str, str]:
@@ -86,21 +144,45 @@ def _confirm_compression(snap: dict, today: dict, days_elapsed: int) -> tuple[st
     return "pending", "等待继续缩量确认"
 
 
+def _confirm_trend_candidate(snap: dict, today: dict, days_elapsed: int) -> tuple[str, str]:
+    support = snap.get("snap_support", 0) or snap.get("snap_ma20", 0) or snap.get("snap_low", 0)
+    snap_close = snap.get("snap_close", 0)
+    snap_vol = snap.get("snap_volume", 0)
+    snap_low = snap.get("snap_low", 0) or support
+    ma20 = today.get("ma20", 0) or snap.get("snap_ma20", 0)
+    if support > 0 and today["low"] < support * 0.985:
+        return "expired", f"跌破确认支撑 {support:.2f}"
+    if snap_vol > 0 and today["volume"] > snap_vol * 1.8 and today["close"] < max(support, snap_close) * 0.985:
+        return "expired", "放量跌破确认区，趋势候选失效"
+    # 0–1 日快速确认：守住信号低点 +（缩量或阳线），不必死等 MA20。
+    if days_elapsed <= 1 and snap_low > 0 and today["close"] >= snap_low and today["close"] >= snap_close * 0.985:
+        dry = snap_vol <= 0 or today["volume"] <= snap_vol * 1.05
+        bullish = today["close"] >= today.get("open", today["close"])
+        if dry or bullish:
+            return "confirmed", f"快速确认：守住信号区，收盘 {today['close']:.2f}"
+    if ma20 > 0 and today["close"] >= ma20 * 0.995 and today["close"] >= snap_close * 0.985:
+        return "confirmed", f"守住MA20/信号收盘，收盘 {today['close']:.2f}"
+    if support > 0 and today["close"] >= support and today["close"] >= snap_close:
+        return "confirmed", f"守住支撑并收回信号收盘 {snap_close:.2f}"
+    return "pending", "等待主线/趋势买点确认"
+
+
 _CONFIRM_DISPATCH = {
     "sos": _confirm_sos,
     "spring": _confirm_spring,
     "lps": _confirm_lps,
     "evr": _confirm_evr,
     "compression": _confirm_compression,
+    **{signal: _confirm_trend_candidate for signal in TREND_CONFIRM_SIGNALS},
 }
 
 
-def _compute_support_level(
+def compute_support_level(
     df: pd.DataFrame,
     signal_type: str,
     window: int = 60,
 ) -> float:
-    """根据信号类型计算支撑位。"""
+    """根据信号类型计算支撑位，可作为候选股的参考止损位。"""
     df_s = df.sort_values("date") if "date" in df.columns else df
     last = df_s.iloc[-1]
     if signal_type in ("spring", "compression"):
@@ -204,8 +286,9 @@ def score_springboard_abc(
     low = pd.to_numeric(df_s["low"], errors="coerce")
     volume = pd.to_numeric(df_s["volume"], errors="coerce")
     vol_ma20 = volume.rolling(20).mean()
-    vol_ratio = volume / vol_ma20.replace(0, pd.NA)
-    span = (high - low).replace(0, pd.NA)
+    vol_ratio = volume / vol_ma20.where(vol_ma20 != 0)
+    span = high - low
+    span = span.where(span != 0)
     close_pos = ((close - low) / span * 100).clip(lower=0, upper=100).fillna(50.0)
 
     tail5 = df_s.tail(5)
@@ -217,7 +300,7 @@ def score_springboard_abc(
     last_cp = _metric(close_pos.loc[last_idx])
     b = bool(last_vr is not None and last_cp is not None and last_vr >= 1.5 and last_cp > 70)
 
-    support = _compute_support_level(df, signal_type, window)
+    support = compute_support_level(df, signal_type, window)
     tol = support * 0.05
     touches, evidence = _springboard_evidence(df_s, vol_ratio, close_pos, low, support, tol, window)
     c = touches >= 2
@@ -253,8 +336,16 @@ def build_snap(
         snap["snap_support"] = float(zone["close"].min()) if len(zone) > 0 else float(last["low"])
     elif signal_type == "sos":
         snap["snap_support"] = float(df_s["high"].tail(21).iloc[:-1].max()) if len(df_s) >= 21 else float(last["high"])
-    elif signal_type == "lps":
+    elif signal_type in {
+        "lps",
+        "trend_pullback",
+        "trend_lane_pullback",
+        "mainline",
+        "main_force_entry",
+    }:
         snap["snap_support"] = ma20
+    elif signal_type in {"trend_breakout", "sector_strength", "wyckoff_structure"}:
+        snap["snap_support"] = max(float(last["low"]), ma20 * 0.985)
     else:
         snap["snap_support"] = float(last["low"])
 
@@ -280,11 +371,11 @@ def build_today_ohlcv(df: pd.DataFrame) -> dict[str, float]:
 
 def _confirmed_symbol_info(sig: dict, code_str: str, today: dict[str, float], trade_date: str, reason: str) -> dict:
     signal_type = sig["signal_type"]
-    return {
+    item = {
         "code": code_str,
         "name": sig.get("name", code_str),
-        "tag": f"{signal_type.upper()}(二次确认)",
-        "track": "Accum" if signal_type in ("spring", "lps") else "Trend",
+        "tag": f"{signal_type.upper()}(跨日确认)",
+        "track": "Accum" if signal_type in ("spring", "lps", "compression") else "Trend",
         "initial_price": today["close"],
         "score": sig.get("signal_score", 0),
         "signal_type": signal_type,
@@ -295,7 +386,38 @@ def _confirmed_symbol_info(sig: dict, code_str: str, today: dict[str, float], tr
         "signal_date": str(sig["signal_date"]),
         "confirm_date": trade_date,
         "confirm_reason": reason,
+        "support_level": sig.get("snap_support", today["close"]),
     }
+    _copy_candidate_fields(item, sig)
+    return item
+
+
+def _copy_candidate_fields(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key in (
+        "strategy_version",
+        "candidate_lane",
+        "entry_type",
+        "signal_key",
+        "candidate_status",
+        "candidate_timing",
+        "candidate_risk",
+        "candidate_reasons",
+        "candidate_metrics",
+        "mainline_score",
+        "theme_score",
+        "stock_role_score",
+        "quality_score",
+        "timing_score",
+    ):
+        if source.get(key) not in (None, "", [], {}):
+            target[key] = source[key]
+
+
+def _pending_code_key(code: Any) -> str:
+    """还原 PendingPool.write 存储的 df_map key：A 股数字代码补零，港股/美股代码原样保留。"""
+    if isinstance(code, int):
+        return f"{code:06d}"
+    return str(code)
 
 
 def run_confirmation_cycle(
@@ -312,7 +434,7 @@ def run_confirmation_cycle(
         if str(sig.get("signal_date", ""))[:10] == str(trade_date)[:10]:
             continue
 
-        code_str = f"{int(sig['code']):06d}"
+        code_str = _pending_code_key(sig["code"])
         df = df_map.get(code_str)
         if df is None or df.empty:
             continue
@@ -399,6 +521,8 @@ class PendingPool:
             else:
                 for sig in self._pool.values():
                     if sig["id"] == upd["id"]:
+                        sig["status"] = upd["status"]
                         sig["days_elapsed"] = upd["days_elapsed"]
+                        sig["confirm_reason"] = upd.get("confirm_reason", "")
                         break
         return confirmed

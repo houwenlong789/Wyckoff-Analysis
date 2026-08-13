@@ -10,6 +10,9 @@ concurrency:
   group: recommendation-reprice-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -44,12 +47,6 @@ jobs:
         run: |
           set -o pipefail
           python -u scripts/recommendation_tracking_reprice_job.py --market cn --logs ${{ github.workspace }}/logs/recommendation_reprice.log \
-            2>&1 | tee -a ${{ github.workspace }}/logs/recommendation_reprice.console.log
-
-      - name: Reprice US
-        run: |
-          set -o pipefail
-          python -u scripts/recommendation_tracking_reprice_job.py --market us --logs ${{ github.workspace }}/logs/recommendation_reprice.log \
             2>&1 | tee -a ${{ github.workspace }}/logs/recommendation_reprice.console.log
 
       - name: Reprice HK

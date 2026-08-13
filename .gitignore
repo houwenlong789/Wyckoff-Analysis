@@ -1,6 +1,9 @@
 .DS_Store
 .idea/
 .vscode/
+!.vscode/
+.vscode/*
+!.vscode/launch.json
 .pnpm-store/
 .codex/
 .agents/
@@ -26,7 +29,17 @@ dist/
 build/
 *.egg-info/
 
-data/
+data/*.csv
+# data/stock_list_cache.json
+data/trade_dates_cache.json
+data/sector_map_cache.json
+data/market_cap_cache.json
+data/float_share_cache.json
+data/concept_map_cache.json
+data/concept_heat_cache.json
+data/ths_hot_events_cache.json
+data/concept_heat_history.json
+data/funnel_snapshots/*
 !data/funnel_snapshots/.gitkeep
 data/strategy_shadow/
 logs/
@@ -74,7 +87,6 @@ config/profiles/*private*.yaml
 .wyckoff/
 .claude/settings.local.json
 
-
 # 回测产物与快照缓存（体积大，本地生成即可）
 analysis/backtest/
 analysis/
@@ -82,13 +94,3 @@ analysis/
 test-results/
 .traces/
 wiki_repo_new/
-.codex
-.codex-local-skills/
-
-
-.github/*
-.codex-run/*
-.kiro/*
-web/apps/web/node_modules/*
-web/node_modules/*
-web/pnpm-workspace.yaml

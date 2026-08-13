@@ -17,7 +17,7 @@ Streamlit MVP 的目标是快速验证“读盘室 + 单股诊断 + 选股复盘
 | 沙里淘金 | `pages/WyckoffScreeners.py` | 漏斗选股、候选池查看 | CF Pages `/chat`、CLI `wyckoff screen` |
 | 持仓管理 | `pages/Portfolio.py` | 持仓录入、收益查看、诊断 | CF Pages `/portfolio`、CLI `wyckoff portfolio` |
 | 形态复盘 | `pages/RecommendationTracking.py` | 推荐记录、后续涨跌跟踪 | CF Pages `/tracking`、CLI `wyckoff recommend` |
-| 尾盘记录 | `pages/TailBuyHistory.py` | 尾盘策略执行历史 | CF Pages `/tail-buy`、Dashboard |
+| 尾盘记录 | `pages/TailBuyHistory.py` | 尾盘策略执行历史 | Dashboard 任务记录；无独立 CF Pages 路由 |
 | 数据导出 | `pages/Export.py`、`pages/CustomExport.py` | 历史行情 CSV、批量导出 | CF Pages `/export` 保留单票导出；批量导出下线 |
 | 设置 | `pages/Settings.py` | API Key、数据源、通知配置 | CF Pages `/settings`、CLI `wyckoff config` |
 
@@ -49,7 +49,7 @@ MVP 架构的关键取舍：
 - `app/` 负责页面布局、导航、登录组件和后台任务入口。
 - `pages/` 负责每个 Streamlit 页面，页面内直接编排数据读取、表格展示和操作按钮。
 - `agents/wyckoff_chat_agent.py` 与 `agents/session_manager.py` 曾承载 Google ADK 对话运行时。
-- `agents/chat_tools.py` 是值得保留的资产，已经继续服务 CF Pages、CLI 和 MCP。
+- 历史 `agents/chat_tools.py` 在 MVP 阶段集中承载工具；主分支现已按职责拆分为 `agents/diagnosis_tools.py`、`agents/screen_tools.py`、`agents/report_tools.py`、`agents/strategy_tools.py` 等模块。图中路径仅描述 `release/streamlit` 的历史结构。
 - `integrations/supabase_client.py`、`core/token_storage.py` 等模块曾服务页面会话与用户配置，主分支下线后不再保留。
 
 ## 下线原因
@@ -90,4 +90,3 @@ Streamlit 适合快速验证，但在当前产品阶段，它带来的状态同�
 ### 设置
 
 ![Streamlit 设置](../attach/demo/streamlit-settings.png)
-

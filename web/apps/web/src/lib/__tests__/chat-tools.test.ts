@@ -3,21 +3,26 @@ import type { ToolDeps, KlineRow } from '@wyckoff/shared'
 import {
   buildValueAgentDigest,
   buildKlineDigest,
+  buildPortfolioWriteRecord,
   execSearchStock,
   execViewPortfolio,
   execMarketOverview,
   execQueryRecommendations,
-  execQueryTailBuy,
+  execQueryAttribution,
   execExecutePortfolioUpdate,
   execScreenStocks,
+  execStrategyDecision,
+  execGenerateAiReport,
   execAnalyzeStock,
   execMarketHistory,
+  SCREEN_RESULT_OUTPUT_SCHEMA,
+  STRATEGY_DECISION_OUTPUT_SCHEMA,
 } from '@wyckoff/shared'
 
 function createMockChain(resolvedData: unknown = null, error: unknown = null) {
   const chain: Record<string, unknown> = {}
   const terminal = () => Promise.resolve({ data: resolvedData, error })
-  for (const method of ['select', 'eq', 'ilike', 'order', 'limit', 'delete', 'update']) {
+  for (const method of ['select', 'eq', 'ilike', 'in', 'order', 'limit', 'delete', 'update']) {
     chain[method] = vi.fn().mockReturnValue(chain)
   }
   chain['insert'] = vi.fn().mockImplementation(terminal)
@@ -114,6 +119,26 @@ describe('buildValueAgentDigest', () => {
     expect(digest).toContain('ROE=18.20%')
     expect(digest).toContain('价值面评级：稳健')
     expect(digest).toContain('质量信号：')
+    expect(digest).toContain('规则版本：value-rules-v2')
+    expect(digest).not.toContain('严重风险')
+  })
+
+  it('appends a severe-risk warning for distressed fundamentals', () => {
+    const digest = buildValueAgentDigest({
+      symbol: '000002.SZ',
+      source: 'tickflow',
+      metrics: {
+        period_end: '2024-12-31',
+        roe: -5,
+        net_income_yoy: -45,
+        revenue_yoy: -25,
+        debt_to_asset_ratio: 88,
+        operating_cash_to_revenue: -3,
+      },
+    })
+
+    expect(digest).toContain('价值面评级：高危')
+    expect(digest).toContain('严重风险：')
   })
 })
 
@@ -122,7 +147,6 @@ describe('execSearchStock', () => {
     const deps = createMockDeps({
       recommendation_tracking: [],
       portfolio_positions: [],
-      tail_buy_history: [],
     })
     const result = await execSearchStock(deps, 'user1', '999999')
     expect(result).toContain('未找到匹配')
@@ -133,7 +157,6 @@ describe('execSearchStock', () => {
     const deps = createMockDeps({
       recommendation_tracking: stocks,
       portfolio_positions: [],
-      tail_buy_history: [],
     })
     const result = await execSearchStock(deps, 'user1', '贵州')
     expect(result).toContain('600519')
@@ -180,7 +203,8 @@ describe('execMarketOverview', () => {
       ],
     })
     const result = await execMarketOverview(deps)
-    expect(result).toContain('偏强')
+    expect(result).toContain('过热禁追')
+    expect(result).toContain('禁止新开仓')
     expect(result).toContain('3200')
   })
 })
@@ -230,28 +254,270 @@ describe('execQueryRecommendations', () => {
   it('returns no-data message when empty', async () => {
     const deps = createMockDeps({ recommendation_tracking: [] })
     const result = await execQueryRecommendations(deps, 10)
-    expect(result).toBe('暂无推荐记录')
+    expect(result).toBe('暂无形态复盘记录')
   })
 
   it('formats recommendation entries', async () => {
     const deps = createMockDeps({
       recommendation_tracking: [
         { code: 600519, name: '贵州茅台', recommend_date: 20240101, recommend_count: 3, initial_price: 1800, current_price: 1900, change_pct: 5.56, is_ai_recommended: true },
+        { code: 603039, name: '泛微网络', recommend_date: 20240615, recommend_count: 1, initial_price: 46.97, current_price: 44.2, change_pct: -5.9, is_ai_recommended: false },
       ],
+      signal_pending: [],
     })
     const result = await execQueryRecommendations(deps, 10)
     expect(result).toContain('600519')
-    expect(result).toContain('推荐3次')
+    expect(result).toContain('AI推荐')
+    expect(result).toContain('观察/信号复盘')
+    expect(result).toContain('入选3次')
     expect(result).toContain('+5.56%')
-    expect(result).toContain('[AI]')
+    expect(result).toContain('-5.90%')
+    expect(result).toContain('观察/信号复盘不等于买入')
+  })
+
+  it('includes signal_pending entries as pending signals', async () => {
+    const deps = createMockDeps({
+      recommendation_tracking: [],
+      signal_pending: [
+        { code: '002079', name: '苏州固锝', signal_date: '2026-06-30', status: 'pending', signal_type: 'lps', signal_score: 0.56, snap_close: 12.3 },
+        { code: '600483', name: '福能股份', signal_date: '2026-06-30', status: 'survived', signal_type: 'lps', signal_score: 0.72, snap_close: 10.8 },
+        { code: '603661', name: '恒林股份', signal_date: '2026-06-29', status: 'confirmed', signal_type: 'sos', signal_score: 0.9, snap_close: 33.2 },
+      ],
+    })
+    const result = await execQueryRecommendations(deps, 10)
+    expect(result).toContain('002079')
+    expect(result).toContain('待确认信号')
+    expect(result).toContain('600483')
+    expect(result).toContain('跨日存活信号')
+    expect(result).toContain('603661')
+    expect(result).toContain('已确认信号')
+    expect(result).toContain('信号日20260630')
   })
 })
 
-describe('execQueryTailBuy', () => {
+describe('execQueryAttribution', () => {
   it('returns no-data message when empty', async () => {
-    const deps = createMockDeps({ tail_buy_history: [] })
-    const result = await execQueryTailBuy(deps, 10)
-    expect(result).toBe('暂无尾盘买入记录')
+    const deps = createMockDeps({ strategy_attribution_reports: [] })
+    const result = await execQueryAttribution(deps, 1)
+    expect(result).toContain('暂无策略归因报告')
+    expect(result).toContain('Web 只读取远端 strategy_attribution_reports')
+    expect(result).toContain('query_history(source="attribution")')
+  })
+
+  it('formats execution state, latest shadow, and scoped actions', async () => {
+    const deps = createMockDeps({
+      strategy_attribution_reports: [
+        {
+          report_date: '2026-07-04',
+          window_start: '2026-05-05',
+          window_end: '2026-07-04',
+          shadow_diff_stats_json: {
+            policy_governor: {
+              status: 'candidate',
+              mode_recommendation: 'review_promote_dynamic_policy',
+              next_action: 'manual_review_dynamic_on',
+              next_action_summary: 'shadow 新增组已跑赢移除组；先完成晋级清单和回测复核，再人工决定 dynamic=on。',
+              promotion_status: 'manual_review_required',
+              promotion_checklist: [
+                { key: 'shadow_sample', status: 'pass', summary: 'sample ok' },
+                { key: 'backtest_confirmation', status: 'review', summary: 'need backtest' },
+              ],
+              auto_apply: false,
+              summary: 'shadow 新增组显著优于移除组',
+            },
+            policy_execution_state: {
+              funnel_dynamic_policy: 'shadow',
+              horizon: '5',
+              scope: 'funnel_shadow',
+              active_scope: '漏斗shadow',
+              funnel_shadow_weights_active: true,
+              funnel_formal_weights_active: false,
+              next_action: 'manual_review_dynamic_on',
+              next_action_summary: 'shadow 新增组已跑赢移除组；先完成晋级清单和回测复核，再人工决定 dynamic=on。',
+              promotion_status: 'manual_review_required',
+              promotion_checklist: [
+                { key: 'shadow_sample', status: 'pass', summary: 'sample ok' },
+                { key: 'backtest_confirmation', status: 'review', summary: 'need backtest' },
+              ],
+              signal_action_count: 1,
+              formal_dynamic_allowed: false,
+              formal_dynamic_block_reason: 'manual_review_required',
+              summary: 'h=5 调权会影响漏斗 shadow。',
+            },
+            policy_operations_brief: {
+              operator_summary:
+                '下一步=shadow 新增组已跑赢移除组；作用范围=funnel_shadow；Shadow=2026-07-03 RISK_ON 新增2 移除1；本期 1 个 scoped 调权：lps[regime=RISK_ON, lane=trend_pullback]×0.50',
+            },
+            latest: {
+              trade_date: '2026-07-03',
+              regime: 'RISK_ON',
+              selection_summary: {
+                base_count: 8,
+                shadow_count: 9,
+                diff_added_count: 2,
+                diff_removed_count: 1,
+                jaccard: 0.7,
+              },
+              diff_added_sample: ['300502', '688008'],
+              diff_removed_sample: ['002079'],
+            },
+          },
+          recommendations_json: [
+            {
+              type: 'downweight',
+              horizon: '5',
+              target: 'lps',
+              reason: {
+                weight_multiplier: 0.5,
+                scope: { regime: 'RISK_ON', lane: 'trend_pullback' },
+                evidence: { avg_return_pct: -3.0, win_rate_pct: 39.8, avg_drawdown_pct: -11.15 },
+              },
+            },
+          ],
+        },
+      ],
+    })
+
+    const result = await execQueryAttribution(deps, 1)
+
+    expect(result).toContain('策略归因报告 2026-07-04')
+    expect(result).toContain('数据来源：远端 strategy_attribution_reports')
+    expect(result).toContain('晋级=需人工复核')
+    expect(result).toContain('晋级检查：样本:通过；回测:待复核')
+    expect(result).toContain(
+      '执行态：shadow 对照(shadow) | 周期=h5 | 作用范围=漏斗shadow（底层=funnel_shadow） | 晋级=需人工复核 | 下一步=进入人工晋级评审（非正式生效） | 正式dynamic=未进正式漏斗(人工复核未完成) | 可执行调权=1',
+    )
+    expect(result).toContain('操作摘要：下一步=shadow 新增组已跑赢移除组')
+    expect(result).toContain('作用范围=漏斗shadow')
+    expect(result).toContain('最新 Shadow：2026-07-03 / RISK_ON | base=8 | shadow=9 | 新增=2 | 移除=1 | Jaccard=0.70')
+    expect(result).toContain('Shadow 新增样本：300502, 688008')
+    expect(result).toContain('lps[regime=RISK_ON, lane=trend_pullback] | downweight | h=5 | x0.50')
+    expect(result).toContain('avg=-3')
+  })
+
+  it('synthesizes an operator summary for older reports', async () => {
+    const deps = createMockDeps({
+      strategy_attribution_reports: [
+        {
+          report_date: '2026-07-04',
+          window_start: '2026-05-05',
+          window_end: '2026-07-04',
+          shadow_diff_stats_json: {
+            policy_governor: {
+              next_action: 'manual_review_dynamic_on',
+              next_action_summary: 'shadow 新增组已跑赢移除组。',
+              promotion_status: 'manual_review_required',
+            },
+            policy_execution_state: {
+              funnel_dynamic_policy: 'shadow',
+              horizon: '5',
+              scope: 'funnel_shadow',
+              next_action: 'manual_review_dynamic_on',
+              next_action_summary: 'shadow 新增组已跑赢移除组。',
+              promotion_status: 'manual_review_required',
+              signal_action_count: 1,
+            },
+            latest: {
+              trade_date: '2026-07-03',
+              regime: 'RISK_ON',
+              selection_summary: {
+                diff_added_count: 2,
+                diff_removed_count: 1,
+              },
+            },
+          },
+          recommendations_json: [
+            {
+              type: 'downweight',
+              horizon: '5',
+              target: 'lps',
+              reason: { weight_multiplier: 0.5 },
+            },
+          ],
+        },
+      ],
+    })
+
+    const result = await execQueryAttribution(deps, 1)
+
+    expect(result).toContain('操作摘要：下一步=shadow 新增组已跑赢移除组。')
+    expect(result).toContain('作用范围=漏斗shadow（底层=funnel_shadow）')
+    expect(result).toContain('作用范围=漏斗shadow')
+    expect(result).toContain('Shadow=2026-07-03 RISK_ON 新增2 移除1')
+    expect(result).toContain('调权=1项')
+  })
+
+  it('does not let older governor-only reports bypass the promotion checklist', async () => {
+    const deps = createMockDeps({
+      strategy_attribution_reports: [
+        {
+          report_date: '2026-07-04',
+          window_start: '2026-05-05',
+          window_end: '2026-07-04',
+          shadow_diff_stats_json: {
+            policy_governor: {
+              horizon: '5',
+              formal_dynamic_allowed: true,
+              promotion_status: 'manual_review_required',
+              next_action: 'manual_review_dynamic_on',
+            },
+          },
+          recommendations_json: [
+            {
+              type: 'upweight',
+              horizon: '5',
+              target: 'sos',
+              reason: { weight_multiplier: 1.15 },
+            },
+          ],
+        },
+      ],
+    })
+
+    const result = await execQueryAttribution(deps, 1)
+
+    expect(result).toContain('作用范围=漏斗shadow（底层=funnel_shadow）')
+    expect(result).toContain('正式dynamic=未进正式漏斗(晋级清单缺失)')
+    expect(result).not.toContain('正式dynamic=允许正式生效')
+  })
+
+  it('does not infer formal activation from governor-only reports even when checklist passed', async () => {
+    const deps = createMockDeps({
+      strategy_attribution_reports: [
+        {
+          report_date: '2026-07-04',
+          window_start: '2026-05-05',
+          window_end: '2026-07-04',
+          shadow_diff_stats_json: {
+            policy_governor: {
+              horizon: '5',
+              formal_dynamic_allowed: true,
+              promotion_checklist: [
+                { key: 'shadow_sample', status: 'pass', summary: 'sample ok' },
+                { key: 'backtest_confirmation', status: 'pass', summary: 'backtest ok' },
+              ],
+              promotion_status: 'manual_review_required',
+              next_action: 'manual_review_dynamic_on',
+            },
+          },
+          recommendations_json: [
+            {
+              type: 'upweight',
+              horizon: '5',
+              target: 'sos',
+              reason: { weight_multiplier: 1.15 },
+            },
+          ],
+        },
+      ],
+    })
+
+    const result = await execQueryAttribution(deps, 1)
+
+    expect(result).toContain('作用范围=漏斗shadow（底层=funnel_shadow）')
+    expect(result).toContain('正式dynamic=未进正式漏斗(缺少后端执行态)')
+    expect(result).toContain('缺少后端执行态，默认只按 shadow 展示')
+    expect(result).not.toContain('作用范围=正式漏斗（funnel_formal）')
   })
 })
 
@@ -288,13 +554,48 @@ describe('execExecutePortfolioUpdate', () => {
     expect(insertChain.insert).not.toHaveBeenCalled()
   })
 
-  it('inserts a position only when no existing row matches', async () => {
+  it('does not reset buy_dt or clear stop_loss when updating without a new stop', async () => {
+    const { deps, updateChain } = createPortfolioWriteDeps([{ id: 'pos-1' }])
+    const update = updateChain.update as ReturnType<typeof vi.fn>
+
+    await execExecutePortfolioUpdate(deps, 'user1', 'update', '600519', '贵州茅台', 200, 1810, null)
+
+    expect(update).toHaveBeenCalledWith(
+      expect.objectContaining({ code: '600519', shares: 200, cost_price: 1810 }),
+    )
+    const payload = update.mock.calls[0]?.[0] as Record<string, unknown>
+    expect(payload).not.toHaveProperty('buy_dt')
+    expect(payload).not.toHaveProperty('stop_loss')
+  })
+
+  it('sets buy_dt only when adding a new position', async () => {
     const { deps, insertChain } = createPortfolioWriteDeps([])
 
     const result = await execExecutePortfolioUpdate(deps, 'user1', 'add', '600519', '贵州茅台', 100, 1800, 1700)
 
     expect(result).toContain('已新增')
-    expect(insertChain.insert).toHaveBeenCalledWith(expect.objectContaining({ portfolio_id: 'USER_LIVE:user1', code: '600519' }))
+    expect(insertChain.insert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        portfolio_id: 'USER_LIVE:user1',
+        code: '600519',
+        buy_dt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
+        stop_loss: 1700,
+      }),
+    )
+  })
+})
+
+describe('buildPortfolioWriteRecord', () => {
+  it('keeps update payloads free of buy_dt and null stop_loss', () => {
+    const record = buildPortfolioWriteRecord('USER_LIVE:u', '600519', 'update', '贵州茅台', 200, 1810, null)
+    expect(record).not.toHaveProperty('buy_dt')
+    expect(record).not.toHaveProperty('stop_loss')
+  })
+
+  it('writes buy_dt and finite stop_loss on add', () => {
+    const record = buildPortfolioWriteRecord('USER_LIVE:u', '600519', 'add', '贵州茅台', 100, 1800, 1700)
+    expect(record.buy_dt).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+    expect(record.stop_loss).toBe(1700)
   })
 })
 
@@ -304,6 +605,229 @@ describe('execScreenStocks', () => {
     const result = await execScreenStocks(deps)
     expect(result.stocks).toEqual([])
     expect(result.meta.ai_count).toBe(0)
+  })
+
+  it('keeps optional strategy policy evidence in the output schema', () => {
+    const result = SCREEN_RESULT_OUTPUT_SCHEMA.parse({
+      date: '2026-07-05',
+      stocks: [],
+      meta: { ai_count: 0 },
+      strategy_policy: {
+        dynamic_mode: 'shadow',
+        policy_weight_active_scope: '漏斗shadow',
+        selection_action_count: 1,
+        selection_action_summary: '候选源治理 1 项：candidate_lane=trend_pullback 降级到 shadow/人工复核×0.75',
+        attribution_signal_weights: { lps: 0.5 },
+      },
+    })
+
+    expect(result.strategy_policy?.selection_action_count).toBe(1)
+    expect(result.strategy_policy?.selection_action_summary).toContain('candidate_lane=trend_pullback')
+  })
+
+  it('attaches latest strategy policy evidence from shadow attribution runs', async () => {
+    const deps = createMockDeps({
+      recommendation_tracking: [
+        {
+          code: 300502,
+          name: '新易盛',
+          recommend_date: '2026-07-05',
+          funnel_score: 0.9,
+          change_pct: 3.2,
+          candidate_lane: 'trend_pullback',
+          entry_type: 'mainline',
+          is_ai_recommended: true,
+        },
+      ],
+      signal_policy_shadow_runs: [
+        {
+          trade_date: '2026-07-04',
+          shadow_diff_stats_json: {
+            policy_governor: { horizon: '5', next_action: 'review_policy_actions' },
+            policy_execution_state: { funnel_dynamic_policy: 'shadow' },
+            policy_operations_brief: {
+              active_scope: '漏斗shadow',
+              selection_action_count: 1,
+              selection_action_summary: '候选源治理 1 项：candidate_lane=trend_pullback 降级到 shadow/人工复核×0.75',
+              formal_dynamic_allowed: false,
+            },
+          },
+          recommendations_json: [
+            {
+              type: 'selection_downweight',
+              horizon: '5',
+              target: 'trend_pullback',
+              reason: '{"weight_multiplier":0.75}',
+            },
+          ],
+        },
+      ],
+    })
+
+    const result = await execScreenStocks(deps)
+
+    expect(result.strategy_policy?.policy_weight_active_scope).toBe('漏斗shadow')
+    expect(result.strategy_policy?.selection_action_summary).toContain('candidate_lane=trend_pullback')
+    expect(result.strategy_policy?.attribution_signal_weights).toEqual({ trend_pullback: 0.75 })
+  })
+
+  it('keeps optional strategy policy evidence in strategy decision output schema', () => {
+    const result = STRATEGY_DECISION_OUTPUT_SCHEMA.parse({
+      summary: '组合保持轻仓',
+      market_regime: 'RISK_ON',
+      overall_position: '30%',
+      risk: '主线分歧日不追高',
+      position_actions: [],
+      strategy_policy: {
+        dynamic_mode: 'shadow',
+        selection_action_summary: '候选源治理 1 项：candidate_lane=lps 降级',
+        attribution_signal_weights: { lps: 0.5 },
+      },
+    })
+
+    expect(result.strategy_policy?.dynamic_mode).toBe('shadow')
+    expect(result.strategy_policy?.attribution_signal_weights).toEqual({ lps: 0.5 })
+  })
+})
+
+describe('execStrategyDecision', () => {
+  it('returns latest strategy policy evidence when portfolio is empty', async () => {
+    const deps = createMockDeps({
+      portfolio_positions: [],
+      market_signal_daily: { benchmark_regime: 'RISK_ON' },
+      signal_policy_shadow_runs: [
+        {
+          shadow_diff_stats_json: {
+            policy_governor: { horizon: '5', next_action: 'review_policy_actions' },
+            policy_execution_state: { funnel_dynamic_policy: 'shadow' },
+            policy_operations_brief: {
+              active_scope: '漏斗shadow',
+              selection_action_count: 1,
+              selection_action_summary: '候选源治理 1 项：candidate_lane=lps 降级到 shadow/人工复核×0.50',
+            },
+          },
+          recommendations_json: [
+            {
+              type: 'selection_downweight',
+              horizon: '5',
+              target: 'lps',
+              reason: '{"weight_multiplier":0.5}',
+            },
+          ],
+        },
+      ],
+    })
+
+    const result = await execStrategyDecision(deps, 'user1', {})
+
+    expect(result.overall_position).toBe('空仓')
+    expect(result.strategy_policy?.policy_weight_active_scope).toBe('漏斗shadow')
+    expect(result.strategy_policy?.attribution_signal_weights).toEqual({ lps: 0.5 })
+    expect(deps.generateText).not.toHaveBeenCalled()
+  })
+
+  it('adds strategy policy evidence to the decision prompt and output', async () => {
+    const deps = createMockDeps({
+      portfolio_positions: [{ code: '600519', name: '贵州茅台', shares: 100, cost_price: 1800, stop_loss: 1700 }],
+      market_signal_daily: { benchmark_regime: 'RISK_ON', main_index_close: 4000 },
+      signal_policy_shadow_runs: [
+        {
+          shadow_diff_stats_json: {
+            policy_governor: { horizon: '5', next_action: 'review_policy_actions' },
+            policy_execution_state: { funnel_dynamic_policy: 'shadow' },
+            policy_operations_brief: {
+              active_scope: '漏斗shadow',
+              selection_action_count: 1,
+              selection_action_summary: '候选源治理 1 项：candidate_lane=trend_pullback 降级',
+            },
+          },
+          recommendations_json: [
+            {
+              type: 'selection_downweight',
+              horizon: '5',
+              target: 'trend_pullback',
+              reason: '{"weight_multiplier":0.75}',
+            },
+          ],
+        },
+      ],
+    })
+    deps.generateText = vi.fn().mockResolvedValue({
+      output: {
+        summary: '持有为主',
+        market_regime: 'RISK_ON',
+        overall_position: '30%',
+        risk: '控制回撤',
+        position_actions: [],
+      },
+    }) as unknown as ToolDeps['generateText']
+
+    const result = await execStrategyDecision(deps, 'user1', {})
+
+    expect(result.strategy_policy?.attribution_signal_weights).toEqual({ trend_pullback: 0.75 })
+    expect(deps.generateText).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: expect.stringContaining('候选源治理 1 项：candidate_lane=trend_pullback 降级'),
+    }))
+    expect(deps.generateText).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: expect.stringContaining('下一步: 先复核调权治理项'),
+    }))
+    expect(deps.generateText).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: expect.stringContaining('归因调权: trend_pullback×0.75'),
+    }))
+  })
+})
+
+describe('execGenerateAiReport', () => {
+  it('adds strategy policy context to the report and prompt', async () => {
+    const deps = createMockDeps({
+      user_settings: { tickflow_api_key: ' tf-test ', tushare_token: '' },
+      signal_policy_shadow_runs: [
+        {
+          shadow_diff_stats_json: {
+            policy_governor: { horizon: '5', next_action: 'review_policy_actions' },
+            policy_execution_state: { funnel_dynamic_policy: 'shadow' },
+            policy_operations_brief: {
+              active_scope: '漏斗shadow',
+              selection_action_summary: '候选源治理 1 项：candidate_lane=sos 降级',
+            },
+          },
+          recommendations_json: [
+            {
+              type: 'selection_downweight',
+              horizon: '5',
+              target: 'sos',
+              reason: '{"weight_multiplier":0.8}',
+            },
+          ],
+        },
+      ],
+    })
+    deps.fetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({
+          data: [
+            { date: '2026-07-01', open: 10, high: 11, low: 9.8, close: 10.8, volume: 1000 },
+            { date: '2026-07-02', open: 10.8, high: 11.2, low: 10.6, close: 11, volume: 1200 },
+          ],
+        }),
+      })
+      .mockResolvedValue({ ok: false, json: () => Promise.resolve({}) }) as unknown as ToolDeps['fetch']
+
+    const result = await execGenerateAiReport(
+      deps,
+      'user1',
+      { api_key: 'llm-key', model: 'test-model', base_url: 'https://example.com/v1' },
+      {},
+      ['600519'],
+    )
+
+    expect(result).toContain('### 策略治理')
+    expect(result).toContain('下一步: 先复核调权治理项')
+    expect(result).toContain('候选源治理 1 项：candidate_lane=sos 降级')
+    expect(deps.generateText).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: expect.stringContaining('归因调权: sos×0.80'),
+    }))
   })
 })
 

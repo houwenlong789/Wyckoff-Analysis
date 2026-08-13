@@ -9,13 +9,13 @@ from __future__ import annotations
 import os
 
 from integrations.fetch_a_share_csv import (
-    _normalize_symbols,
     get_stocks_by_board,
+    normalize_symbols,
 )
-from tools.funnel_config import parse_int_env
+from utils.env import parse_int_env
 
 
-def _stock_name_map() -> dict[str, str]:
+def load_stock_name_map() -> dict[str, str]:
     """获取全部 A 股 + ETF 代码→名称映射（如失败返回空 dict）。"""
     try:
         from integrations.fetch_a_share_csv import get_all_stocks
@@ -24,35 +24,182 @@ def _stock_name_map() -> dict[str, str]:
         result = {x.get("code", ""): x.get("name", "") for x in items if isinstance(x, dict)}
     except Exception:
         result = {}
-    result.update(_etf_name_map())
+    from tools.market_universe_meta import load_etf_name_map
+
+    result.update(load_etf_name_map())
     return result
 
 
-def _etf_name_map() -> dict[str, str]:
-    """从结构化 ETF meta 加载 ETF 名称映射。"""
-    from contextlib import suppress
-    from pathlib import Path
+def _pool_stats(
+    mode: str,
+    *,
+    main: int,
+    chinext: int,
+    star: int,
+    bse: int,
+    merged: int,
+    st_excluded: int,
+    limit: int,
+) -> dict[str, int | str]:
+    return {
+        "pool_mode": mode,
+        "pool_main": main,
+        "pool_chinext": chinext,
+        "pool_star": star,
+        "pool_bse": bse,
+        "pool_merged": merged,
+        "pool_st_excluded": st_excluded,
+        "pool_limit": limit,
+    }
 
-    with suppress(Exception):
-        from integrations.data_source import load_symbol_name_map
 
-        meta_map = load_symbol_name_map(("etf_cn",))
-        out = {code: name for code, name in meta_map.items() if len(code) == 6 and code.isdigit()}
-        if out:
-            return out
+def _merge_code_to_name(items: list[dict[str, str]]) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    for item in items:
+        code = str(item.get("code", "")).strip()
+        if code and code not in merged:
+            merged[code] = str(item.get("name", "")).strip()
+    return merged
 
-    path = Path(__file__).resolve().parent.parent / "data" / "market_universes" / "etf_cn.txt"
-    if not path.is_file():
-        return {}
-    out: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        parts = line.split(None, 1)
-        if len(parts) == 2 and len(parts[0]) == 6 and parts[0].isdigit():
-            out[parts[0]] = f"{parts[1]}ETF"
-    return out
+
+def _symbols_from_map(
+    code_to_name: dict[str, str],
+    limit_count: int,
+) -> tuple[list[str], dict[str, str], int, int]:
+    merged_symbols = normalize_symbols(list(code_to_name.keys()))
+    st_set = _st_symbol_set(merged_symbols, code_to_name)
+    filtered_symbols = [sym for sym in merged_symbols if sym not in st_set]
+    symbols = filtered_symbols[:limit_count] if limit_count > 0 else filtered_symbols
+    return symbols, {code: code_to_name.get(code, "") for code in symbols}, len(merged_symbols), len(st_set)
+
+
+def _st_symbol_set(symbols: list[str], code_to_name: dict[str, str]) -> set[str]:
+    return {sym for sym in symbols if "ST" in code_to_name.get(sym, "").upper()}
+
+
+def _board_items(board: str) -> list[dict[str, str]]:
+    try:
+        return get_stocks_by_board(board)
+    except Exception:
+        return []
+
+
+def _board_counts() -> tuple[int, int, int, int]:
+    return (
+        len(_board_items("main")),
+        len(_board_items("chinext")),
+        len(_board_items("star")),
+        len(_board_items("bse")),
+    )
+
+
+def _resolve_board_pool(
+    board_name: str,
+    limit_count: int,
+) -> tuple[list[str], dict[str, str], dict[str, int | str]]:
+    if board_name in {"main_chinext", "main_chinext_star"}:
+        items = _board_items("main") + _board_items("chinext") + _board_items("star")
+    else:
+        items = get_stocks_by_board(board_name)
+    symbols, name_map, merged, st_excluded = _symbols_from_map(_merge_code_to_name(items), limit_count)
+    if board_name == "all":
+        main, chinext, star, bse = _board_counts()
+    else:
+        main = len(items) if board_name == "main" else 0
+        chinext = len(items) if board_name == "chinext" else 0
+        star = len(items) if board_name == "star" else 0
+        bse = len(items) if board_name == "bse" else 0
+        if board_name in {"main_chinext", "main_chinext_star"}:
+            main, chinext, star = (
+                len(_board_items("main")),
+                len(_board_items("chinext")),
+                len(_board_items("star")),
+            )
+            bse = 0
+    return (
+        symbols,
+        name_map,
+        _pool_stats(
+            "board",
+            main=main,
+            chinext=chinext,
+            star=star,
+            bse=bse,
+            merged=merged,
+            st_excluded=st_excluded,
+            limit=limit_count,
+        ),
+    )
+
+
+def _resolve_default_pool(limit_count: int) -> tuple[list[str], dict[str, str], dict[str, int | str]]:
+    main_items = get_stocks_by_board("main")
+    chinext_items = get_stocks_by_board("chinext")
+    star_items = get_stocks_by_board("star")
+    bse_items = _board_items("bse")
+    code_to_name = _merge_code_to_name(main_items + chinext_items + star_items + bse_items)
+    merged_symbols = normalize_symbols(list(code_to_name.keys()))
+    st_set = _st_symbol_set(merged_symbols, code_to_name)
+    all_symbols = [sym for sym in merged_symbols if sym not in st_set]
+    if limit_count > 0:
+        all_symbols = all_symbols[:limit_count]
+    stats = _pool_stats(
+        "default",
+        main=len(main_items),
+        chinext=len(chinext_items),
+        star=len(star_items),
+        bse=len(bse_items),
+        merged=len(merged_symbols),
+        st_excluded=len(st_set),
+        limit=limit_count,
+    )
+    return all_symbols, {code: code_to_name.get(code, "") for code in all_symbols}, stats
+
+
+def resolve_symbol_pool(
+    *,
+    pool_mode: str = "",
+    board_name: str = "",
+    manual_symbols: str = "",
+    limit_count: int = 0,
+) -> tuple[list[str], dict[str, str], dict[str, int | str]]:
+    """解析给定参数对应的股票池，避免调用方通过全局环境变量传参。"""
+    pool_mode = str(pool_mode or "").strip().lower()
+    board_name = str(board_name or "").strip().lower()
+    manual_raw = str(manual_symbols or "")
+    limit_count = max(int(limit_count or 0), 0)
+
+    if pool_mode == "manual":
+        all_name_map = load_stock_name_map()
+        symbols = normalize_symbols([x.strip() for x in manual_raw.replace(";", ",").replace("\n", ",").split(",")])
+        name_map = {code: all_name_map.get(code, "") for code in symbols}
+        return (
+            symbols,
+            name_map,
+            _pool_stats(
+                "manual",
+                main=0,
+                chinext=0,
+                star=0,
+                bse=0,
+                merged=len(symbols),
+                st_excluded=0,
+                limit=limit_count,
+            ),
+        )
+
+    if pool_mode == "board" and board_name in {
+        "main",
+        "chinext",
+        "star",
+        "bse",
+        "all",
+        "main_chinext",
+        "main_chinext_star",
+    }:
+        return _resolve_board_pool(board_name, limit_count)
+
+    return _resolve_default_pool(limit_count)
 
 
 def resolve_symbol_pool_from_env() -> tuple[list[str], dict[str, str], dict[str, int | str]]:
@@ -62,88 +209,9 @@ def resolve_symbol_pool_from_env() -> tuple[list[str], dict[str, str], dict[str,
 
     返回: (symbols, name_map, pool_stats)
     """
-    pool_mode = str(os.getenv("FUNNEL_POOL_MODE", "") or "").strip().lower()
-    limit_count = max(parse_int_env("FUNNEL_POOL_LIMIT_COUNT", 0), 0)
-
-    if pool_mode == "manual":
-        manual_raw = str(os.getenv("FUNNEL_POOL_MANUAL_SYMBOLS", "") or "")
-        all_name_map = _stock_name_map()
-        symbols = _normalize_symbols([x.strip() for x in manual_raw.replace(";", ",").replace("\n", ",").split(",")])
-        name_map = {code: all_name_map.get(code, "") for code in symbols}
-        return (
-            symbols,
-            name_map,
-            {
-                "pool_mode": "manual",
-                "pool_main": 0,
-                "pool_chinext": 0,
-                "pool_merged": len(symbols),
-                "pool_st_excluded": 0,
-                "pool_limit": limit_count,
-            },
-        )
-
-    board_name = str(os.getenv("FUNNEL_POOL_BOARD", "") or "").strip().lower()
-    if pool_mode == "board" and board_name in {"main", "chinext", "all"}:
-        if board_name == "all":
-            items = get_stocks_by_board("main") + get_stocks_by_board("chinext")
-        else:
-            items = get_stocks_by_board(board_name)
-        merged_code_to_name: dict[str, str] = {}
-        for item in items:
-            code = str(item.get("code", "")).strip()
-            if not code:
-                continue
-            if code not in merged_code_to_name:
-                merged_code_to_name[code] = str(item.get("name", "")).strip()
-        symbols = _normalize_symbols(list(merged_code_to_name.keys()))
-        if limit_count > 0:
-            symbols = symbols[:limit_count]
-        return (
-            symbols,
-            {code: merged_code_to_name.get(code, "") for code in symbols},
-            {
-                "pool_mode": "board",
-                "pool_main": len(items)
-                if board_name == "main"
-                else len(get_stocks_by_board("main"))
-                if board_name == "all"
-                else 0,
-                "pool_chinext": len(items)
-                if board_name == "chinext"
-                else len(get_stocks_by_board("chinext"))
-                if board_name == "all"
-                else 0,
-                "pool_merged": len(symbols),
-                "pool_st_excluded": 0,
-                "pool_limit": limit_count,
-            },
-        )
-
-    main_items = get_stocks_by_board("main")
-    chinext_items = get_stocks_by_board("chinext")
-    merged_code_to_name: dict[str, str] = {}
-    for item in main_items + chinext_items:
-        code = str(item.get("code", "")).strip()
-        if not code:
-            continue
-        if code not in merged_code_to_name:
-            merged_code_to_name[code] = str(item.get("name", "")).strip()
-    merged_symbols = _normalize_symbols(list(merged_code_to_name.keys()))
-    st_symbols = [sym for sym in merged_symbols if "ST" in merged_code_to_name.get(sym, "").upper()]
-    st_set = set(st_symbols)
-    all_symbols = [sym for sym in merged_symbols if sym not in st_set]
-    if limit_count > 0:
-        all_symbols = all_symbols[:limit_count]
-    return (
-        all_symbols,
-        {code: merged_code_to_name.get(code, "") for code in all_symbols},
-        {
-            "pool_mode": "default",
-            "pool_main": len(main_items),
-            "pool_chinext": len(chinext_items),
-            "pool_merged": len(merged_symbols),
-            "pool_st_excluded": len(st_symbols),
-            "pool_limit": limit_count,
-        },
+    return resolve_symbol_pool(
+        pool_mode=os.getenv("FUNNEL_POOL_MODE", ""),
+        board_name=os.getenv("FUNNEL_POOL_BOARD", ""),
+        manual_symbols=os.getenv("FUNNEL_POOL_MANUAL_SYMBOLS", ""),
+        limit_count=parse_int_env("FUNNEL_POOL_LIMIT_COUNT", 0),
     )

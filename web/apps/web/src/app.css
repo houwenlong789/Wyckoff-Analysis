@@ -1,0 +1,133 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-background: #ffffff;
+  --color-foreground: #1a1a2e;
+  --color-muted: #f0f2f8;
+  --color-muted-foreground: #6b7194;
+  --color-border: #e2e5f1;
+  --color-card: #ffffff;
+  --color-popover: #ffffff;
+  --color-primary: #4f46e5;
+  --color-primary-foreground: #ffffff;
+  --color-accent: #eef0ff;
+  --color-accent-foreground: #4f46e5;
+  --color-destructive: #ef4444;
+  --color-success: #16a34a;
+  --color-warning: #f59e0b;
+  --color-ring: #4f46e5;
+  --color-up: #ef4444;
+  --color-down: #10b981;
+  --color-sidebar: #f8f9fc;
+  --radius: 0.625rem;
+  --font-sans: "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+@layer base {
+  html.dark {
+    --color-background: #0d1117;
+    --color-foreground: #e6edf3;
+    --color-muted: #1f2937;
+    --color-muted-foreground: #9aa4b2;
+    --color-border: #303946;
+    --color-card: #111827;
+    --color-popover: #111827;
+    --color-primary: #8aa4ff;
+    --color-primary-foreground: #09111f;
+    --color-accent: #1b2740;
+    --color-accent-foreground: #b8c7ff;
+    --color-destructive: #fb7185;
+    --color-success: #22c55e;
+    --color-warning: #fbbf24;
+    --color-ring: #8aa4ff;
+    --color-sidebar: #111827;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-sans);
+    font-feature-settings: "kern", "tnum";
+  }
+
+  input,
+  select,
+  textarea {
+    @apply bg-background text-foreground;
+  }
+
+  :where(button, a, input, select, textarea):focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--color-background), 0 0 0 4px var(--color-ring);
+  }
+}
+
+@layer utilities {
+  .text-up { color: var(--color-up); }
+  .text-down { color: var(--color-down); }
+  .bg-up\/10 { background-color: color-mix(in srgb, var(--color-up) 10%, transparent); }
+  .bg-down\/10 { background-color: color-mix(in srgb, var(--color-down) 10%, transparent); }
+
+  /* Glassmorphism Panel */
+  .glass-panel {
+    background-color: color-mix(in srgb, var(--color-card) 75%, transparent);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1px solid color-mix(in srgb, var(--color-border) 50%, transparent);
+    box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.04);
+  }
+
+  /* Segmented Control Track */
+  .segmented-track {
+    background-color: color-mix(in srgb, var(--color-muted) 60%, transparent);
+    border: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
+    border-radius: 9999px;
+    padding: 2px;
+  }
+
+  /* Glowing Indicator */
+  .pulse-dot {
+    position: relative;
+    display: inline-flex;
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+  }
+  .pulse-dot::after {
+    content: '';
+    position: absolute;
+    inset: -2px;
+    border-radius: 9999px;
+    background-color: currentColor;
+    opacity: 0.4;
+    animation: pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  /* Animations */
+  @keyframes pulse-ring {
+    0%, 100% {
+      transform: scale(1);
+      opacity: 0.4;
+    }
+    50% {
+      transform: scale(1.6);
+      opacity: 0.05;
+    }
+  }
+
+  .animate-fade-in-up {
+    animation: fadeInUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+
+  @keyframes fadeInUp {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+}

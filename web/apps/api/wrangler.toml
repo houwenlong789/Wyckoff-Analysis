@@ -1,8 +1,43 @@
 name = "wyckoff-api"
 main = "src/index.ts"
 compatibility_date = "2024-12-18"
+compatibility_flags = ["nodejs_compat"]
 
 [vars]
 ENVIRONMENT = "production"
 CHAT_DAILY_LIMIT_PER_USER = "80"
 CHAT_MIN_INTERVAL_MS = "2500"
+AGENT_SANDBOX_ENABLED = "true"
+AGENT_SANDBOX_TIMEOUT_MS = "60000"
+AGENT_RUN_TTL_SECONDS = "3600"
+AGENT_RUN_DAILY_LIMIT_PER_USER = "20"
+AGENT_RUN_DAILY_CPU_LIMIT_MS = "120000"
+AGENT_RUN_MIN_INTERVAL_MS = "10000"
+SANDBOX_BRIDGE_URL = "https://wyckoff-agent-sandbox.vercel.app/api/sandbox-run"
+
+[[durable_objects.bindings]]
+name = "AGENT_RUN_NOTIFIER"
+class_name = "AgentRunNotifier"
+
+# SQLite-backed classes are the only Durable Objects available on the free plan.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["AgentRunNotifier"]
+
+[[queues.producers]]
+queue = "wyckoff-agent-runs"
+binding = "AGENT_RUN_QUEUE"
+
+[[queues.consumers]]
+queue = "wyckoff-agent-runs"
+max_batch_size = 1
+max_batch_timeout = 1
+max_concurrency = 1
+max_retries = 3
+dead_letter_queue = "wyckoff-agent-runs-dlq"
+
+[[queues.consumers]]
+queue = "wyckoff-agent-runs-dlq"
+max_batch_size = 1
+max_batch_timeout = 1
+max_retries = 3

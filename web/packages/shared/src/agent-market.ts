@@ -23,6 +23,7 @@ export interface ValueSnapshot {
   source: 'tickflow' | 'tushare' | 'none'
   metrics: FundamentalMetric | null
   reason?: ValueSnapshotReason
+  fetched_at?: string
 }
 
 export const TICKFLOW_PURCHASE = 'https://tickflow.org/auth/register?ref=5N4NKTCPL4'
@@ -30,7 +31,7 @@ export const TICKFLOW_PURCHASE = 'https://tickflow.org/auth/register?ref=5N4NKTC
 type Fetcher = typeof globalThis.fetch
 
 export function normalizeCode(code: string | number): string {
-  const raw = String(code || '').trim().toUpperCase()
+  const raw = String(code ?? '').trim().toUpperCase()
   return /^\d+$/.test(raw) && raw.length < 6 ? raw.padStart(6, '0') : raw
 }
 
@@ -45,6 +46,26 @@ export function isTickFlowMarketSymbol(code: string): boolean {
 
 export function isSupportedKlineCode(code: string): boolean {
   return isCnSymbol(code) || isTickFlowMarketSymbol(code)
+}
+
+/** Normalize holdings codes: CN 6-digit, HK NNNNN.HK, US TICKER.US. Empty if unsupported.
+ * Does not pad short digit strings into fake A-share codes (e.g. "6881" stays invalid). */
+export function normalizePortfolioCode(raw: string | number): string {
+  const c = String(raw ?? '').trim().toUpperCase()
+  if (!c) return ''
+  if (isCnSymbol(c)) return c
+  const hk = c.match(/^(\d{1,5})\.HK$/)
+  if (hk) return `${hk[1]!.padStart(5, '0')}.HK`
+  if (isTickFlowMarketSymbol(c)) return c
+  if (/^[A-Z][A-Z0-9.-]{0,15}$/.test(c)) {
+    const withUs = `${c}.US`
+    return isTickFlowMarketSymbol(withUs) ? withUs : ''
+  }
+  return ''
+}
+
+export function isSupportedPortfolioCode(code: string | number): boolean {
+  return Boolean(normalizePortfolioCode(code))
 }
 
 export function detectMarket(code: string): 'cn' | 'hk' | 'us' {
@@ -77,13 +98,14 @@ export async function fetchValueSnapshotWithFetch(
   keys: { tickflow: string | null; tushare: string | null },
 ): Promise<ValueSnapshot> {
   const symbol = isCnSymbol(code) ? normalizeTickFlowSymbol(code) : code.trim().toUpperCase()
-  if (!isCnSymbol(code)) return { symbol, source: 'none', metrics: null, reason: 'unsupported-market' }
-  if (!keys.tickflow && !keys.tushare) return { symbol, source: 'none', metrics: null, reason: 'missing-source' }
+  const fetched_at = new Date().toISOString()
+  if (!isCnSymbol(code)) return { symbol, source: 'none', metrics: null, reason: 'unsupported-market', fetched_at }
+  if (!keys.tickflow && !keys.tushare) return { symbol, source: 'none', metrics: null, reason: 'missing-source', fetched_at }
   const tickflow = keys.tickflow ? await tryTickFlowSnapshot(fetcher, code, keys.tickflow) : null
-  if (tickflow) return { symbol, source: 'tickflow', metrics: tickflow }
+  if (tickflow) return { symbol, source: 'tickflow', metrics: tickflow, fetched_at }
   const tushare = keys.tushare ? await tryTushareSnapshot(fetcher, code, keys.tushare) : null
-  if (tushare) return { symbol, source: 'tushare', metrics: tushare }
-  return { symbol, source: 'none', metrics: null, reason: 'not-found' }
+  if (tushare) return { symbol, source: 'tushare', metrics: tushare, fetched_at }
+  return { symbol, source: 'none', metrics: null, reason: 'not-found', fetched_at }
 }
 
 async function tryTickFlowSnapshot(fetcher: Fetcher, code: string, apiKey: string): Promise<FundamentalMetric | null> {
@@ -153,7 +175,7 @@ function normalizeFinancialRecord(record: Record<string, unknown>, fallbackSymbo
   return hasNumericMetric(metrics) ? metrics : null
 }
 
-function pickMetricValue(row: Record<string, unknown>, aliases: string[]): unknown {
+export function pickMetricValue(row: Record<string, unknown>, aliases: string[]): unknown {
   for (const alias of aliases) {
     if (Object.prototype.hasOwnProperty.call(row, alias)) return row[alias]
     const upper = alias.toUpperCase()
@@ -164,7 +186,7 @@ function pickMetricValue(row: Record<string, unknown>, aliases: string[]): unkno
   return undefined
 }
 
-function normalizeReportDate(value: unknown): string | undefined {
+export function normalizeReportDate(value: unknown): string | undefined {
   const raw = String(value || '').trim()
   if (!raw) return undefined
   if (/^\d{8}$/.test(raw)) return raw.replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3')
@@ -173,7 +195,7 @@ function normalizeReportDate(value: unknown): string | undefined {
   return raw.slice(0, 10)
 }
 
-function finiteNumber(value: unknown): number | undefined {
+export function finiteNumber(value: unknown): number | undefined {
   if (value == null || value === '') return undefined
   const numeric = Number(value)
   return Number.isFinite(numeric) ? numeric : undefined
@@ -184,14 +206,14 @@ function hasNumericMetric(metrics: FundamentalMetric): boolean {
     key !== 'symbol' && key !== 'period_end' && key !== 'announce_date' && typeof value === 'number')
 }
 
-function firstFinancialObject(value: unknown): Record<string, unknown> | null {
+export function firstFinancialObject(value: unknown): Record<string, unknown> | null {
   if (!value) return null
   if (Array.isArray(value)) return value.find((row): row is Record<string, unknown> => Boolean(row) && typeof row === 'object' && !Array.isArray(row)) ?? null
   if (typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>
   return null
 }
 
-function looksLikeFinancialRecord(row: Record<string, unknown>): boolean {
+export function looksLikeFinancialRecord(row: Record<string, unknown>): boolean {
   return [
     'roe', 'ROE', 'roe_weighted', 'ROE_WEIGHTED',
     'net_income_yoy', 'NET_INCOME_YOY', 'netprofit_yoy',
@@ -200,7 +222,7 @@ function looksLikeFinancialRecord(row: Record<string, unknown>): boolean {
   ].some((field) => Object.prototype.hasOwnProperty.call(row, field))
 }
 
-function findFinancialRecord(payload: unknown, symbol: string): Record<string, unknown> | null {
+export function findFinancialRecord(payload: unknown, symbol: string): Record<string, unknown> | null {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null
   const root = payload as Record<string, unknown>
   const data = root.data ?? root

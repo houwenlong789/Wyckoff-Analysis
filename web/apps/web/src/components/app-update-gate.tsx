@@ -18,7 +18,7 @@ export function AppUpdateGate() {
       checking = true
       try {
         const remoteVersion = await fetchRemoteVersion()
-        if (!disposed && shouldReload(remoteVersion)) reloadForVersion(remoteVersion)
+        if (!disposed && shouldReload(remoteVersion) && !isReadingRoomStreaming()) reloadForVersion(remoteVersion)
       } finally {
         checking = false
       }
@@ -59,14 +59,19 @@ function shouldReload(remoteVersion: string | null): remoteVersion is string {
   return remoteVersion !== null && remoteVersion !== APP_VERSION
 }
 
+function isReadingRoomStreaming(): boolean {
+  return window.location.pathname === '/chat'
+    && document.querySelector('[data-reading-room-streaming="true"]') !== null
+}
+
 function reloadForVersion(remoteVersion: string): void {
-  let canReload = true
+  let shouldReload = true
   try {
     const marker = `${APP_VERSION}->${remoteVersion}`
-    canReload = window.sessionStorage.getItem(RELOAD_SESSION_KEY) !== marker
-    window.sessionStorage.setItem(RELOAD_SESSION_KEY, marker)
+    shouldReload = window.sessionStorage.getItem(RELOAD_SESSION_KEY) !== marker
+    if (shouldReload) window.sessionStorage.setItem(RELOAD_SESSION_KEY, marker)
   } catch {
-    canReload = true
+    // Keep the default reload path when sessionStorage is unavailable.
   }
-  if (canReload) window.location.reload()
+  if (shouldReload) window.location.reload()
 }

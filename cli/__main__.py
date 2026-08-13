@@ -19,6 +19,7 @@
     wyckoff model list/add/rm       # 模型管理
     wyckoff config                  # 数据源配置
     wyckoff portfolio list/add/rm   # 持仓管理
+    wyckoff portfolio fill          # 回填真实成交
     wyckoff signal                  # 信号确认池
     wyckoff recommend               # 威科夫形态复盘
     wyckoff sync                    # 同步 Supabase → SQLite
@@ -29,19 +30,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
-
-from dotenv import load_dotenv
+from typing import Any
 
 _PACKAGE_ROOT = str(Path(__file__).resolve().parents[1])
 if _PACKAGE_ROOT in sys.path:
     sys.path.remove(_PACKAGE_ROOT)
 sys.path.insert(0, _PACKAGE_ROOT)
-
-# 加载 .env（项目根目录）
-load_dotenv()
 
 import logging as _logging
 
@@ -60,7 +58,8 @@ _logging.basicConfig(level=_logging.CRITICAL)
 # ---------------------------------------------------------------------------
 
 
-from cli._provider_factory import _create_provider, provider_config_kwargs  # noqa: F401
+from cli.bootstrap import build_provider_state, init_local_services, load_config_env
+from cli.provider_factory import create_provider, provider_config_kwargs  # noqa: F401
 
 
 def _get_version() -> str:
@@ -70,6 +69,21 @@ def _get_version() -> str:
         return version("youngcan-wyckoff-analysis")
     except Exception:
         return "dev"
+
+
+def _version_sort_key(value: str) -> tuple[int, ...]:
+    """把版本号转成可比较的整数元组，无法解析时返回空元组。
+
+    原先直接对每一段做 int()，PyPI 一旦出现 1.0.0rc1 / 0.9.235.post1 这类非纯数字版本就抛
+    ValueError，被外层 except 吞掉——升级提示从此静默失效，且正好在最需要提示的大版本上失效。
+    """
+    parts: list[int] = []
+    for chunk in str(value).strip().split("."):
+        match = re.match(r"^\d+", chunk)
+        if not match:
+            break
+        parts.append(int(match.group()))
+    return tuple(parts)
 
 
 def _check_update_async() -> None:
@@ -90,8 +104,10 @@ def _check_update_async() -> None:
             latest = data.get("info", {}).get("version", "")
             if not latest or latest == local_ver:
                 return
-            local_parts = tuple(int(x) for x in local_ver.split("."))
-            latest_parts = tuple(int(x) for x in latest.split("."))
+            local_parts = _version_sort_key(local_ver)
+            latest_parts = _version_sort_key(latest)
+            if not local_parts or not latest_parts:
+                return
             if latest_parts > local_parts:
                 print(f"\033[33m⬆ 新版本可用: {latest}（当前 {local_ver}），运行 wyckoff update 升级\033[0m")
         except Exception:
@@ -123,18 +139,29 @@ def _set_terminal_title(title: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _cmd_update(_args):
+_PACKAGE_WITH_BROWSER = "youngcan-wyckoff-analysis[browser]"
+
+
+def _upgrade_package_cmd() -> list[str]:
     import shutil
 
-    print("正在升级 youngcan-wyckoff-analysis ...")
-    pkg = "youngcan-wyckoff-analysis"
     uv = shutil.which("uv")
     if uv:
-        cmd = [uv, "pip", "install", "--python", sys.executable, "--upgrade", pkg]
-    else:
-        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", pkg]
+        return [uv, "pip", "install", "--python", sys.executable, "--upgrade", _PACKAGE_WITH_BROWSER]
+    return [sys.executable, "-m", "pip", "install", "--upgrade", _PACKAGE_WITH_BROWSER]
+
+
+def _ensure_playwright_chromium() -> None:
+    print("正在安装 Playwright Chromium（browser_research 依赖）...")
+    subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+
+
+def _cmd_update(_args):
+    print(f"正在升级 {_PACKAGE_WITH_BROWSER} ...")
+    print(f"  目标解释器: {sys.executable}")
     try:
-        subprocess.check_call(cmd)
+        subprocess.check_call(_upgrade_package_cmd())
+        _ensure_playwright_chromium()
         url = "https://wyckoff-analysis.pages.dev/"
         try:
             subprocess.run(["pbcopy"], input=url.encode(), check=True)
@@ -144,13 +171,14 @@ def _cmd_update(_args):
             except FileNotFoundError:
                 logger.debug("no clipboard tool available", exc_info=True)
         print(f"\n✓ 升级完成！请重新运行 wyckoff。\n  Web 版已复制到剪切板: {url}")
+        print("  浏览器搜索：TUI 首次使用时会弹窗授权并自动拉起调试 Chrome（/browser start）")
     except subprocess.CalledProcessError as e:
         print(f"\n✗ 升级失败: {e}")
         sys.exit(1)
 
 
 def _cmd_auth(args):
-    from cli.auth import _load_session, login, logout, restore_session
+    from cli.auth import load_session, login, logout, restore_session
 
     sub = args.auth_cmd
 
@@ -160,7 +188,7 @@ def _cmd_auth(args):
         return
 
     if sub == "status":
-        session = _load_session()
+        session = load_session()
         if not session:
             print("未登录")
             return
@@ -190,6 +218,25 @@ def _cmd_auth(args):
         else:
             print(f"✗ 登录失败: {err}")
         sys.exit(1)
+
+
+def _model_refresh():
+    """重新拉取 OpenRouter 模型目录，刷新真实上下文窗口。"""
+    from cli.auth import load_model_configs
+    from cli.model_catalog import CACHE_PATH, looks_like_openrouter, refresh_catalog
+    from cli.model_registry import infer_model_info
+
+    catalog = refresh_catalog()
+    if not catalog:
+        print("✗ 无法获取 OpenRouter 模型目录（网络或接口异常），继续使用缓存/名称推断")
+        sys.exit(1)
+    print(f"✓ 已刷新 {len(catalog)} 个模型的上下文窗口 -> {CACHE_PATH}")
+    for cfg in load_model_configs():
+        model = str(cfg.get("model", "") or "")
+        if not looks_like_openrouter(str(cfg.get("base_url", "") or "")):
+            continue
+        info = infer_model_info(cfg)
+        print(f"  {cfg['id']:<22} {model:<44} ctx={info.context_window:>9,}  ({info.window_source})")
 
 
 def _model_list():
@@ -335,6 +382,8 @@ def _cmd_model(args):
         save_model_entry(updated)
         print(f"✓ 模型 {args.model_id} 的成本/上下文元数据已保存")
         return
+    if sub == "refresh":
+        return _model_refresh()
     if sub == "usage":
         from cli.model_registry import summarize_model_usage
 
@@ -369,26 +418,41 @@ def _cmd_model(args):
 
 
 def _cmd_config(args):
-    from cli.auth import load_config, save_config_key
+    from cli.auth import (
+        get_stream_chunk_timeout_seconds,
+        get_tool_timeout_seconds,
+        load_config,
+        save_config_key,
+    )
 
     CONFIG_KEYS = {
-        "tushare": ("tushare_token", "Tushare Token", "TUSHARE_TOKEN"),
-        "tickflow": ("tickflow_api_key", "TickFlow API Key", "TICKFLOW_API_KEY"),
+        "tushare": ("tushare_token", "Tushare Token", "TUSHARE_TOKEN", "secret"),
+        "tickflow": ("tickflow_api_key", "TickFlow API Key", "TICKFLOW_API_KEY", "secret"),
+        "stream_timeout": ("stream_chunk_timeout_seconds", "模型空闲/首token超时(秒)", "", "timeout"),
+        "tool_timeout": ("tool_timeout_seconds", "工具执行超时(秒)", "", "timeout"),
     }
 
     sub = args.config_cmd
 
     if not sub:
-        # 显示所有配置
         cfg = load_config()
-        print("数据源配置 (~/.wyckoff/wyckoff.json)")
+        print("本地配置 (~/.wyckoff/wyckoff.json)")
         print()
-        for _alias, (key, label, _) in CONFIG_KEYS.items():
+        for _alias, (key, label, _, kind) in CONFIG_KEYS.items():
+            if kind == "timeout":
+                current = (
+                    get_stream_chunk_timeout_seconds(cfg)
+                    if key == "stream_chunk_timeout_seconds"
+                    else get_tool_timeout_seconds(cfg)
+                )
+                mark = "自定义" if key in cfg else "默认"
+                print(f"  {label}: \033[32m{int(current)}\033[0m ({mark})")
+                continue
             val = str(cfg.get(key, "") or "").strip()
             status = f"\033[32m{_mask(val)}\033[0m" if val else "\033[90m未配置\033[0m"
             print(f"  {label}: {status}")
         print()
-        print("使用 wyckoff config tushare <token> 或 wyckoff config tickflow <key> 配置")
+        print("用法: wyckoff config tushare|tickflow|stream_timeout|tool_timeout <value>")
         return
 
     if sub not in CONFIG_KEYS:
@@ -396,17 +460,23 @@ def _cmd_config(args):
         print(f"可选: {', '.join(CONFIG_KEYS)}")
         sys.exit(1)
 
-    key, label, env_key = CONFIG_KEYS[sub]
+    key, label, env_key, kind = CONFIG_KEYS[sub]
     value = args.value
     if not value:
         import getpass
 
-        value = getpass.getpass(f"{label}: ").strip()
+        prompt = f"{label}: "
+        value = getpass.getpass(prompt).strip() if kind == "secret" else input(prompt).strip()
     if not value:
         print("已取消")
         return
-    save_config_key(key, value)
-    os.environ[env_key] = value
+    try:
+        save_config_key(key, value)
+    except ValueError as exc:
+        print(f"✗ {exc}")
+        sys.exit(1)
+    if kind == "secret" and env_key:
+        os.environ[env_key] = value
     print(f"✓ {label} 已保存")
 
 
@@ -444,8 +514,12 @@ def _cmd_portfolio(args):
             print("暂无持仓记录")
             if state:
                 print(f"可用资金: {state.get('free_cash', 0):,.2f}")
+                if state.get("total_equity") is not None:
+                    print(f"最新总权益: {state['total_equity']:,.2f}")
             return
         print(f"持仓 ({len(state['positions'])} 只)  可用资金: {state.get('free_cash', 0):,.2f}")
+        if state.get("total_equity") is not None:
+            print(f"最新总权益: {state['total_equity']:,.2f}  估值时间: {state.get('updated_at', '-')}")
         print(f"{'代码':<8} {'名称':<10} {'股数':>6} {'成本':>8} {'买入日期':<10} {'止损':>8}")
         print("-" * 60)
         for p in state["positions"]:
@@ -502,15 +576,49 @@ def _cmd_portfolio(args):
         print(f"{'✓' if ok else '✗'} {msg}")
         return
 
+    if sub == "fill":
+        _cmd_portfolio_fill(args)
+        return
+
     print(f"未知子命令: {sub}")
-    print("用法: wyckoff portfolio [list|add|rm|cash]")
+    print("用法: wyckoff portfolio [list|add|rm|cash|fill]")
     sys.exit(1)
+
+
+def _cmd_portfolio_fill(args):
+    """回填一笔真实成交：按增量更新持仓与现金，而不是覆盖快照。"""
+    from datetime import datetime
+
+    from core.trade_fill import Fill
+    from integrations.supabase_portfolio import record_fill
+    from utils.trading_clock import CN_TZ
+
+    if not args.code or not args.side or not args.shares or not args.price:
+        print("用法: wyckoff portfolio fill <code> --side buy|sell --shares N --price P [--date YYYYMMDD] [--name X]")
+        sys.exit(1)
+    client, _uid, pid = _get_session_client()
+    try:
+        fill = Fill(
+            code=args.code,
+            side=str(args.side).lower(),
+            shares=int(args.shares),
+            price=float(args.price),
+            trade_date=args.date or datetime.now(CN_TZ).strftime("%Y%m%d"),
+            name=args.name or "",
+        )
+    except ValueError as exc:
+        print(f"✗ {exc}")
+        sys.exit(1)
+    result = record_fill(pid, fill, client=client)
+    print(f"{'✓' if result.ok else '✗'} {result.message}")
+    if not result.ok:
+        sys.exit(1)
 
 
 def _cmd_signal(args):
     status = args.status or "all"
     limit = args.limit or 30
-    from agents.chat_tools import query_history
+    from agents.history_tools import query_history
 
     result = query_history(source="signal", status=status, limit=limit)
     if result.get("error"):
@@ -536,7 +644,7 @@ def _cmd_signal(args):
 
 def _cmd_recommend(args):
     limit = args.limit or 20
-    from agents.chat_tools import query_history
+    from agents.history_tools import query_history
 
     result = query_history(source="recommendation", limit=limit)
     if result.get("error"):
@@ -570,28 +678,35 @@ def _cmd_recommend(args):
 
 def _cmd_screen(args):
     from integrations.local_db import init_db
+    from utils.tool_result_preview import tool_result_brief_lines
 
     init_db()
     board = args.board or "all"
-    print(f"正在执行全市场漏斗筛选 (board={board}) ...")
-    from scripts.wyckoff_funnel import run_funnel_job
+    limit_note = "全量" if args.limit == 0 else f"前{args.limit}只" if args.limit is not None else "默认范围"
+    style_note = f", style={args.style}" if args.style else ""
+    print(f"正在执行全市场漏斗筛选 (board={board}, {limit_note}{style_note}) ...")
+    from agents.screen_tools import screen_stocks
 
-    try:
-        triggers, metrics = run_funnel_job()
-    except Exception as e:
-        print(f"✗ 筛选失败: {e}")
+    result = screen_stocks(
+        board=board,
+        limit=args.limit,
+        style=args.style or None,
+        financial_metrics=args.financial_metrics,
+    )
+    if result.get("error"):
+        print(f"✗ 筛选失败: {result['error']}")
         sys.exit(1)
-    total = sum(len(v) for v in triggers.values())
-    print(f"\n✓ 筛选完成  命中 {total} 只")
-    for signal_type, items in triggers.items():
-        if items:
-            print(f"\n  [{signal_type}] ({len(items)} 只)")
-            for code, score in items[:10]:
-                print(f"    {code}  score={score:.2f}")
-    if metrics:
-        from tools.funnel_public import public_funnel_metrics
-
-        print(f"\n  指标: {json.dumps(public_funnel_metrics(metrics), ensure_ascii=False, default=str)}")
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    total_scanned = int(summary.get("total_scanned", 0) or 0)
+    report_count = int(summary.get("report_candidates", 0) or 0)
+    watch_count = len(result.get("watch_candidates") or [])
+    print(f"\n✓ 筛选完成  扫描 {total_scanned} 只，研报候选 {report_count} 只，观察 {watch_count} 只")
+    lines = tool_result_brief_lines("screen_stocks", result, max_lines=8)
+    for line in lines:
+        print(f"  {line}")
+    if not lines:
+        payload = {"scan_scope": result.get("scan_scope"), "summary": summary}
+        print(f"  {json.dumps(payload, ensure_ascii=False, default=str)}")
 
 
 # ---------------------------------------------------------------------------
@@ -609,20 +724,22 @@ def _cmd_backtest(args):
     end_dt = date.today() - timedelta(days=1)
     start_dt = end_dt - timedelta(days=args.months * 30)
     print(f"正在回测 {start_dt} → {end_dt}  hold_days={args.hold_days} ...")
-    from scripts.backtest_runner import run_backtest
+    from workflows.backtest import BacktestWorkflowRequest, run_backtest_request
 
     try:
-        df, summary = run_backtest(
-            start_dt=start_dt,
-            end_dt=end_dt,
-            hold_days=args.hold_days,
-            top_n=args.top_n,
-            board="all",
-            sample_size=0,
-            trading_days=60,
-            max_workers=4,
-            cash_portfolio=True,
-            portfolio_styles="confirmation_only",
+        df, summary = run_backtest_request(
+            BacktestWorkflowRequest(
+                start_dt=start_dt,
+                end_dt=end_dt,
+                hold_days=args.hold_days,
+                top_n=args.top_n,
+                board="all",
+                sample_size=0,
+                trading_days=60,
+                max_workers=4,
+                cash_portfolio=True,
+                portfolio_styles="confirmation_only",
+            )
         )
     except Exception as e:
         print(f"✗ 回测失败: {e}")
@@ -663,9 +780,13 @@ def _cmd_report(args):
         if ek and mc.get("api_key"):
             os.environ.setdefault(ek, mc["api_key"])
 
-    symbols_info = [{"code": c, "name": "", "tag": ""} for c in codes]
+    from agents.stock_data_helpers import code_to_name
+
+    symbols_info = [
+        {"code": c, "name": code_to_name(c), "tag": "", "selection_source": "explicit_report_input"} for c in codes
+    ]
     print(f"正在生成 AI 研报 ({len(codes)} 只) ...")
-    from scripts.step3_batch_report import run as run_report
+    from workflows.step3_batch_report import run as run_report
 
     try:
         result = run_report(
@@ -677,16 +798,42 @@ def _cmd_report(args):
             provider=cfg.get("provider_name", "gemini"),
             llm_base_url=cfg.get("base_url", ""),
         )
+        ok, reason, report_text = _report_command_result(result)
+        if not ok:
+            print(f"✗ 研报生成失败: {reason or 'unknown'}")
+            sys.exit(1)
         print("✓ 研报生成完成")
-        if isinstance(result, dict):
-            for camp, stocks in result.items():
-                if stocks:
-                    print(f"\n  [{camp}]")
-                    for s in stocks[:5]:
-                        print(f"    {s}")
+        if report_text:
+            print("\n--- 研报正文 ---")
+            print(_clip_report_output(report_text))
     except Exception as e:
         print(f"✗ 研报生成失败: {e}")
         sys.exit(1)
+
+
+def _report_command_result(result) -> tuple[bool, str, str]:
+    if isinstance(result, tuple) and len(result) >= 3:
+        return bool(result[0]), str(result[1] or ""), str(result[2] or "").strip()
+    if isinstance(result, dict):
+        return True, "", _legacy_report_dict_text(result)
+    return bool(result), "", ""
+
+
+def _legacy_report_dict_text(result: dict) -> str:
+    lines: list[str] = []
+    for camp, stocks in result.items():
+        if not stocks:
+            continue
+        lines.append(f"[{camp}]")
+        lines.extend(f"- {stock}" for stock in stocks[:5])
+    return "\n".join(lines).strip()
+
+
+def _clip_report_output(text: str, limit: int = 6000) -> str:
+    clean = str(text or "").strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[:limit].rstrip() + "\n\n[研报正文已截断，可在 agent 对话里继续要求展开]"
 
 
 # ---------------------------------------------------------------------------
@@ -874,7 +1021,7 @@ def _add_memory_parser(sub) -> None:
     p_mem.add_argument("keyword", nargs="?", default="", help="搜索关键词 (search 时)")
     p_mem.add_argument("memory_id", nargs="?", default="", help="记忆 ID (delete 时)")
     p_mem.add_argument(
-        "--type", default="", help="过滤类型 (preference/persona/scenario/stock_opinion/decision/market_view)"
+        "--type", default="", help="过滤类型 (preference/playbook/persona/scenario/decision/market_view)"
     )
     p_mem.add_argument("--level", default="", help="过滤层级 (L1/L2/L3)")
     p_mem.add_argument("--since", default="", help="仅显示该时间之后的记忆，支持 ISO 或 7d/24h/30m")
@@ -960,8 +1107,146 @@ def _cmd_workflow_show(run_id: str) -> None:
         return
     print(f"{run['run_id']}  {run['status']}  {run['label']}")
     print(f"用户输入: {run.get('user_text', '')}")
+    if script_line := _workflow_script_cli_line(run.get("plan", {})):
+        print(script_line)
     for idx, step in enumerate(run.get("plan", {}).get("steps", []), start=1):
-        print(f"  {idx}. [{step.get('status', '')}] {step.get('title', '')}  {step.get('summary', '')}")
+        print(f"  {idx}. {_workflow_step_cli_line(step)}")
+
+
+def _workflow_script_cli_line(plan: dict[str, Any]) -> str:
+    runtime = _workflow_plan_runtime(plan)
+    parts: list[str] = []
+    planner = str(runtime.get("planner") or "").strip()
+    if planner:
+        parts.append(f"source={_workflow_script_source_label(runtime, planner)}")
+    if runtime.get("tool_contract_repair") == "model":
+        parts.append(_workflow_tool_contract_repair_label(runtime))
+    if runtime.get("adaptation") == "model_phase":
+        parts.append(_workflow_adaptation_label(runtime))
+    if truncated := _workflow_runtime_int(runtime, "truncated_step_count"):
+        original = _workflow_runtime_int(runtime, "original_step_count")
+        parts.append(f"trimmed={truncated}/{original}")
+    return f"脚本: {' '.join(parts)}" if parts else ""
+
+
+def _workflow_script_source_label(runtime: dict[str, Any], planner: str) -> str:
+    if planner == "fallback_script" and runtime.get("fallback_kind") == "stock_selection":
+        return "stock_selection_fallback"
+    return planner
+
+
+def _workflow_plan_runtime(plan: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(plan, dict):
+        return {}
+    script = plan.get("script") if isinstance(plan.get("script"), dict) else {}
+    runtime = script.get("runtime") if isinstance(script.get("runtime"), dict) else {}
+    return runtime
+
+
+def _workflow_tool_contract_repair_label(runtime: dict[str, Any]) -> str:
+    count = _workflow_runtime_int(runtime, "unscoped_step_count_before_repair")
+    suffix = f":{count}" if count > 0 else ""
+    return f"tool_contract_repair=model{suffix}"
+
+
+def _workflow_adaptation_label(runtime: dict[str, Any]) -> str:
+    count = _workflow_runtime_int(runtime, "adaptation_count")
+    parts = [f"adaptation=model:{count}" if count > 0 else "adaptation=model"]
+    for field, label in (
+        ("adapted_kept_step_count", "kept"),
+        ("adapted_removed_step_count", "removed"),
+        ("adapted_added_step_count", "added"),
+        ("adapted_skipped_step_count", "skipped"),
+    ):
+        value = _workflow_runtime_int(runtime, field)
+        if value > 0:
+            parts.append(f"{label}={value}")
+    if detail := _workflow_adapted_step_detail(runtime):
+        parts.append(detail)
+    return ",".join(parts)
+
+
+def _workflow_adapted_step_detail(runtime: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for field, label in (
+        ("adapted_removed_steps", "removed"),
+        ("adapted_added_steps", "added"),
+    ):
+        titles = _workflow_adapted_step_titles(runtime.get(field))
+        if titles:
+            parts.append(f"{label}_titles={'|'.join(titles)}")
+    return ",".join(parts)
+
+
+def _workflow_adapted_step_titles(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    titles: list[str] = []
+    for item in value[:3]:
+        if isinstance(item, dict):
+            title = str(item.get("title") or item.get("id") or "").strip()
+            if title:
+                titles.append(_clip_workflow_detail(title)[:32])
+    return titles
+
+
+def _workflow_runtime_int(runtime: dict[str, Any], field: str) -> int:
+    try:
+        return int(runtime.get(field, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _workflow_step_cli_line(step: dict) -> str:
+    status = step.get("status", "")
+    title = step.get("title", "")
+    agent = step.get("agent", "") or "agent"
+    summary = step.get("summary", "")
+    tools = _workflow_step_tool_label(step)
+    detail = _workflow_step_detail_label(step)
+    return f"[{status}] {title}  {agent}{tools}{detail}  {summary}"
+
+
+def _workflow_step_tool_label(step: dict) -> str:
+    tools = [str(item) for item in step.get("tool_scope", []) if str(item)]
+    label = "tools"
+    if not tools:
+        tools = [str(item) for item in step.get("effective_tool_scope", []) if str(item)]
+        label = "optional_tools"
+    elif str(step.get("tool_scope_source") or "") == "semantic_inference":
+        label = "inferred_tools"
+    if not tools:
+        return ""
+    visible = ",".join(tools[:4])
+    suffix = f",+{len(tools) - 4}" if len(tools) > 4 else ""
+    return f" {label}={visible}{suffix}"
+
+
+def _workflow_step_detail_label(step: dict) -> str:
+    parts = [
+        f"goal={_clip_workflow_detail(step.get('rationale'))}",
+        f"done={_clip_workflow_detail(step.get('success_criteria'))}",
+        f"guard={_clip_workflow_detail(step.get('risk_guard'))}",
+        f"args={_clip_workflow_detail(_workflow_step_args_hint(step))}",
+    ]
+    visible = [part for part in parts if not part.endswith("=")]
+    return f" {' '.join(visible)}" if visible else ""
+
+
+def _workflow_step_args_hint(step: dict) -> str:
+    if value := str(step.get("args_hint") or "").strip():
+        return value
+    text = str(step.get("context") or "")
+    marker = "tool args hint:"
+    if marker not in text:
+        return ""
+    value = text.split(marker, 1)[1].strip()
+    return value.split("\n\n", 1)[0].strip()
+
+
+def _clip_workflow_detail(value: object) -> str:
+    text = str(value or "").strip()
+    return text[:80] if text else ""
 
 
 def _cmd_workflow_events(run_id: str, limit: int) -> None:
@@ -1226,6 +1511,192 @@ def _cmd_sync(_args=None):
     print("同步完成")
 
 
+def _cmd_mcp_add(args):
+    from cli.mcp_config import Server, is_builtin_duplicate, upsert_server
+
+    env: dict[str, str] = {}
+    for pair in args.env or []:
+        key, _, value = str(pair).partition("=")
+        if key and not _:
+            value = os.getenv(key, "")
+        if not key or not value:
+            print(f"跳过无效的 --env 项: {pair}（使用 KEY 或 KEY=VALUE；KEY 模式从当前环境读取）")
+            continue
+        env[key] = value
+
+    server = Server(name=args.name, command=args.command, args=list(args.args or []), env=env)
+    if is_builtin_duplicate(server):
+        print(f"拒绝添加 {args.name}：这是本项目自建的 MCP server，工具已内置。")
+        print("再接一遍会让模型看到两份同名工具，且 MCP 路径不过审批闸门。")
+        raise SystemExit(1)
+
+    upsert_server(server)
+    print(f"已添加 {args.name}（默认未启用）")
+    print(f"启用：wyckoff mcp-enable {args.name}")
+    print(f"先试连：wyckoff mcp-test {args.name}")
+
+
+def _cmd_mcp_list(args):
+    from cli.mcp_config import is_builtin_duplicate, load_servers
+
+    servers = load_servers()
+    if not servers:
+        print("未配置外部 MCP server")
+        print("添加：wyckoff mcp-add <name> --command <cmd> --args <arg> ...")
+        return
+    for server in servers:
+        state = "已启用" if server.enabled else "未启用"
+        note = " · 自建重复项（不会连接）" if is_builtin_duplicate(server) else ""
+        print(f"  {server.name:<16} [{state}]{note}")
+        print(f"    {server.command} {' '.join(server.args)}")
+        if server.env:
+            print(f"    env: {', '.join(sorted(server.env))}")
+
+
+def _cmd_mcp_toggle(args, enabled: bool):
+    from cli.mcp_config import find_server, is_builtin_duplicate, set_enabled
+
+    server = find_server(args.name)
+    if server is None:
+        print(f"未找到 server: {args.name}")
+        raise SystemExit(1)
+    if enabled and is_builtin_duplicate(server):
+        print(f"{args.name} 是自建 server，工具已内置，不能启用。")
+        raise SystemExit(1)
+    set_enabled(args.name, enabled)
+    print(f"{args.name} 已{'启用' if enabled else '停用'}")
+
+
+def _cmd_mcp_remove(args):
+    from cli.mcp_config import remove_server
+
+    if not remove_server(args.name):
+        print(f"未找到 server: {args.name}")
+        raise SystemExit(1)
+    print(f"已移除 {args.name}")
+
+
+def _cmd_mcp_test(args):
+    from cli.mcp_client import McpClientManager, mcp_available
+    from cli.mcp_config import find_server
+
+    if not mcp_available():
+        print("未安装 mcp 依赖。安装：uv pip install -e '.[mcp]'")
+        raise SystemExit(1)
+    server = find_server(args.name)
+    if server is None:
+        print(f"未找到 server: {args.name}")
+        raise SystemExit(1)
+
+    print(f"连接 {server.name}: {server.command} {' '.join(server.args)}")
+    manager = McpClientManager([server])
+    try:
+        manager.start()
+        status = manager.status()[0] if manager.status() else {}
+        if not status.get("available"):
+            print(f"连接失败: {status.get('error') or '未知错误'}")
+            print(f"日志: ~/.wyckoff/logs/mcp-{server.name}.log")
+            raise SystemExit(1)
+        tools = manager.tools()
+        print(f"连接成功，发现 {len(tools)} 个工具：\n")
+        for tool in tools:
+            kind = "写" if tool.is_write else "读"
+            print(f"  [{kind}] {tool.name}")
+        print("\n写工具需经审批后执行；读工具直接调用。")
+    finally:
+        manager.stop()
+
+
+def _cmd_run(args):
+    """无界面跑一轮 Agent，写操作按无人策略分级。"""
+    from cli.headless import run_once
+
+    result = run_once(args.action, source="cli")
+    if result.text:
+        print(result.text)
+    if result.queued:
+        print(f"\n已提交 {len(result.queued)} 项待批准：{', '.join(result.queued)}")
+        print("用 `wyckoff approve list` 查看，`wyckoff approve ok <id>` 批准")
+    if not result.ok:
+        print(f"执行失败: {result.error}")
+        raise SystemExit(1)
+
+
+def _cmd_daemon(args):
+    from cli.daemon import main_loop, setup_logging, status
+
+    if args.status:
+        info = status()
+        state = "运行中" if info["running"] else "未运行"
+        print(f"daemon: {state}")
+        if info["pid"]:
+            print(f"  pid:  {info['pid']}")
+        print(f"  lock: {info['lock']}")
+        print(f"  log:  {info['log']}")
+        return
+
+    setup_logging(verbose=args.verbose)
+    if not args.foreground:
+        print("daemon 需要由 launchd 托管运行。")
+        print("安装：scripts/daemon_install.sh")
+        print("前台调试：wyckoff daemon --foreground")
+        return
+    raise SystemExit(main_loop())
+
+
+def _cmd_approve(args):
+    from cli import approval_queue as aq
+
+    action = args.action
+    if action == "list":
+        pending = aq.list_pending()
+        if not pending:
+            print("无待批准项")
+            return
+        print(f"{len(pending)} 项待批准：\n")
+        for item in pending:
+            tier = {"confirm": "需二次确认", "review": "待审"}.get(item.risk, item.risk)
+            print(f"  {item.id}  [{tier}]  {item.tool_name}")
+            print(f"           {item.summary or '(无摘要)'}")
+            print(f"           参数 {json.dumps(aq.sanitized_args(item.args), ensure_ascii=False, default=str)}")
+            print(f"           来自 {item.source} {item.schedule_id} · {item.created_at}")
+        print("\n批准：wyckoff approve ok <id>    拒绝：wyckoff approve no <id>")
+        return
+
+    if not args.id:
+        print(f"用法: wyckoff approve {action} <id>")
+        raise SystemExit(2)
+
+    from cli.auth import load_session
+
+    pending = aq.get(args.id)
+    current_user = str((load_session() or {}).get("user_id") or "")
+    if pending is not None and not aq.owner_matches(pending, current_user):
+        print(f"{args.id} 所属账户与当前登录不一致，拒绝处理（防止改到别人的持仓）。")
+        raise SystemExit(1)
+
+    record = aq.decide(args.id, approved=(action == "ok"))
+    if record is None:
+        print(f"{args.id} 无法处理：不存在、已决策，或已超过 {aq.DEFAULT_TTL_HOURS} 小时过期。")
+        print("过期项不可批准——隔夜的调仓会按旧价成交。")
+        raise SystemExit(1)
+    if record.status != aq.APPROVED:
+        print(f"已拒绝: {record.summary or record.tool_name}")
+        return
+
+    from cli.approval_executor import execute_approved
+
+    print(f"已批准，正在执行: {record.summary or record.tool_name}")
+    result = execute_approved(record.tool_name, record.args, expected_user_id=record.user_id)
+    succeeded = not (isinstance(result, dict) and result.get("error"))
+    aq.record_execution(record.id, result, succeeded=succeeded)
+    print(json.dumps(result, ensure_ascii=False, default=str, indent=2))
+    if not succeeded:
+        print("执行失败；该批准项不会自动重试，避免重复成交。")
+        raise SystemExit(1)
+    print("✓ 已执行")
+
+
 def _cmd_cleanup(args):
     from integrations.local_db import cleanup_old_records, init_db
 
@@ -1247,18 +1718,11 @@ def _cmd_cleanup(args):
 # ---------------------------------------------------------------------------
 
 
-def _cmd_tui(_args=None):
-    _check_update_async()
-
-    from cli.tools import ToolRegistry
-
-    tools = ToolRegistry()
-
-    session_expired = False
+def _restore_tui_session(tools) -> bool:
     try:
-        from cli.auth import _load_session, restore_session
+        from cli.auth import load_session, restore_session
 
-        had_session = _load_session() is not None
+        had_session = load_session() is not None
         session = restore_session()
         if session:
             tools.state.update(
@@ -1270,69 +1734,13 @@ def _cmd_tui(_args=None):
                 }
             )
         elif had_session:
-            session_expired = True
+            return True
     except Exception:
         logger.warning("session restore failed", exc_info=True)
+    return False
 
-    # 初始化本地 SQLite + 后台同步
-    try:
-        from integrations.local_db import init_db, prune_memories
 
-        init_db()
-        prune_memories()
-        from integrations.sync import sync_all_background
-
-        sync_all_background()
-    except Exception:
-        logger.warning("local db init or sync failed", exc_info=True)
-
-    from core.prompts import CHAT_AGENT_SYSTEM_PROMPT
-
-    system_prompt = CHAT_AGENT_SYSTEM_PROMPT
-
-    state = {"provider": None, "provider_name": "", "model": "", "api_key": "", "base_url": ""}
-
-    try:
-        from cli.auth import load_config
-
-        _cfg = load_config()
-        for _k, _env in [("tushare_token", "TUSHARE_TOKEN"), ("tickflow_api_key", "TICKFLOW_API_KEY")]:
-            _v = str(_cfg.get(_k, "") or "").strip()
-            if _v:
-                os.environ.setdefault(_env, _v)
-    except Exception:
-        logger.debug("config env vars load failed", exc_info=True)
-
-    try:
-        from cli.auth import load_default_model_id, load_model_configs
-
-        configs = load_model_configs()
-        default_id = load_default_model_id()
-        if configs and default_id:
-            env_map = {"gemini": "GEMINI_API_KEY", "claude": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
-            for cfg in configs:
-                ek = env_map.get(cfg.get("provider_name", ""))
-                if ek and cfg.get("api_key"):
-                    os.environ.setdefault(ek, cfg["api_key"])
-            default_cfg = next((c for c in configs if c["id"] == default_id), configs[0])
-            if len(configs) == 1:
-                provider, err = _create_provider(**provider_config_kwargs(default_cfg))
-                if not err:
-                    state.update(default_cfg)
-                    state["provider"] = provider
-            else:
-                from cli.auth import load_fallback_model_id
-                from cli.providers.fallback import FallbackProvider
-
-                state.update(default_cfg)
-                state["provider"] = FallbackProvider(configs, default_id, fallback_id=load_fallback_model_id())
-    except Exception:
-        logger.warning("model provider init failed", exc_info=True)
-
-    if state["provider"]:
-        tools.set_provider(state["provider"])
-
-    # 后台启动 dashboard 并打开浏览器
+def _start_tui_dashboard() -> None:
     import threading
     import webbrowser
 
@@ -1347,6 +1755,24 @@ def _cmd_tui(_args=None):
     threading.Thread(target=_dash_bg, daemon=True).start()
     webbrowser.open("http://127.0.0.1:8765")
 
+
+def _cleanup_tui_runtime() -> None:
+    try:
+        import baostock as bs
+
+        bs.logout()
+    except (Exception, KeyboardInterrupt):
+        logger.debug("baostock logout failed", exc_info=True)
+    try:
+        _devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(_devnull, 1)
+        os.dup2(_devnull, 2)
+        os.close(_devnull)
+    except Exception:
+        logger.debug("devnull redirect failed", exc_info=True)
+
+
+def _run_tui_app(tools, state: dict[str, Any], system_prompt: str, session_expired: bool) -> None:
     from cli.tui import WyckoffTUI
 
     app = WyckoffTUI(
@@ -1361,19 +1787,27 @@ def _cmd_tui(_args=None):
     except KeyboardInterrupt:
         logger.debug("TUI interrupted by user", exc_info=True)
     finally:
-        try:
-            import baostock as bs
+        _cleanup_tui_runtime()
 
-            bs.logout()
-        except (Exception, KeyboardInterrupt):
-            logger.debug("baostock logout failed", exc_info=True)
-        try:
-            _devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(_devnull, 1)
-            os.dup2(_devnull, 2)
-            os.close(_devnull)
-        except Exception:
-            logger.debug("devnull redirect failed", exc_info=True)
+
+def _cmd_tui(_args=None):
+    _check_update_async()
+
+    from cli.tools import ToolRegistry
+    from core.prompts import CHAT_AGENT_SYSTEM_PROMPT
+
+    tools = ToolRegistry()
+    session_expired = _restore_tui_session(tools)
+    init_local_services()
+    try:
+        load_config_env()
+    except Exception:
+        logger.debug("config env vars load failed", exc_info=True)
+    state = build_provider_state()
+    if state["provider"]:
+        tools.set_provider(state["provider"])
+    _start_tui_dashboard()
+    _run_tui_app(tools, state, CHAT_AGENT_SYSTEM_PROMPT, session_expired)
 
 
 # ---------------------------------------------------------------------------
@@ -1426,13 +1860,29 @@ def _dispatch_command(args) -> None:
         _cmd_sync(args)
     elif args.cmd == "cleanup":
         _cmd_cleanup(args)
+    elif args.cmd == "run":
+        _cmd_run(args)
+    elif args.cmd == "daemon":
+        _cmd_daemon(args)
+    elif args.cmd == "approve":
+        _cmd_approve(args)
+    elif args.cmd == "mcp-add":
+        _cmd_mcp_add(args)
+    elif args.cmd == "mcp-list":
+        _cmd_mcp_list(args)
+    elif args.cmd == "mcp-enable":
+        _cmd_mcp_toggle(args, True)
+    elif args.cmd == "mcp-disable":
+        _cmd_mcp_toggle(args, False)
+    elif args.cmd == "mcp-remove":
+        _cmd_mcp_remove(args)
+    elif args.cmd == "mcp-test":
+        _cmd_mcp_test(args)
     else:
         _cmd_tui(args)
 
 
-def main():
-    _set_terminal_title("Wyckoff-Analysis")
-
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="wyckoff",
         description="威科夫终端读盘室 — Wyckoff 量价分析 Agent",
@@ -1440,17 +1890,24 @@ def main():
     parser.add_argument("-v", "--version", action="version", version=f"wyckoff {_get_version()}")
     sub = parser.add_subparsers(dest="cmd")
 
-    # wyckoff update
     sub.add_parser("update", help="升级到最新版")
+    _add_auth_model_config_parsers(sub)
+    _add_portfolio_history_parsers(sub)
+    _add_analysis_job_parsers(sub)
+    _add_session_debug_parsers(sub)
+    _add_maintenance_parsers(sub)
+    return parser
 
-    # wyckoff auth
+
+def _add_auth_model_config_parsers(sub) -> None:
     p_auth = sub.add_parser("auth", help="登录/登出/状态")
     p_auth.add_argument("auth_cmd", help="email 或 logout/status")
     p_auth.add_argument("password", nargs="?", default="", help="密码（可省略，交互输入）")
 
-    # wyckoff model
     p_model = sub.add_parser("model", help="模型管理")
-    p_model.add_argument("model_cmd", nargs="?", default="list", help="list/add/set/rm/default/fallback/cost/usage")
+    p_model.add_argument(
+        "model_cmd", nargs="?", default="list", help="list/add/set/rm/default/fallback/cost/refresh/usage"
+    )
     p_model.add_argument("model_id", nargs="?", default="", help="模型 ID")
     p_model.add_argument("provider", nargs="?", default="", help="供应商 (set 时)")
     p_model.add_argument("api_key", nargs="?", default="", help="API Key (set 时)")
@@ -1462,36 +1919,62 @@ def main():
     p_model.add_argument("--days", type=int, default=7, help="usage 统计天数")
 
     # wyckoff config
-    p_config = sub.add_parser("config", help="数据源配置")
-    p_config.add_argument("config_cmd", nargs="?", default="", help="tushare/tickflow")
+    p_config = sub.add_parser("config", help="本地配置（数据源/超时）")
+    p_config.add_argument(
+        "config_cmd",
+        nargs="?",
+        default="",
+        help="tushare/tickflow/stream_timeout/tool_timeout",
+    )
     p_config.add_argument("value", nargs="?", default="", help="值（可省略，交互输入）")
 
-    # wyckoff portfolio
+
+def _add_portfolio_history_parsers(sub) -> None:
     p_port = sub.add_parser("portfolio", help="持仓管理", aliases=["pf"])
-    p_port.add_argument("portfolio_cmd", nargs="?", default="list", help="list/add/rm/cash")
-    p_port.add_argument("code", nargs="?", default="", help="股票代码 (add/rm 时)")
+    p_port.add_argument("portfolio_cmd", nargs="?", default="list", help="list/add/rm/cash/fill")
+    p_port.add_argument("code", nargs="?", default="", help="股票代码 (add/rm/fill 时)")
     p_port.add_argument("--name", default="", help="股票名称")
-    p_port.add_argument("--shares", type=int, default=0, help="持仓数量")
+    p_port.add_argument("--shares", type=int, default=0, help="持仓数量 / 成交股数")
     p_port.add_argument("--cost", type=float, default=0, help="成本价")
     p_port.add_argument("--buy-dt", dest="buy_dt", default="", help="买入日期 YYYYMMDD")
     p_port.add_argument("--amount", type=float, default=None, help="可用资金金额 (cash 时)")
+    p_port.add_argument("--side", default="", choices=["", "buy", "sell"], help="成交方向 (fill 时)")
+    p_port.add_argument("--price", type=float, default=0, help="成交价 (fill 时)")
+    p_port.add_argument("--date", default="", help="成交日期 YYYYMMDD，默认今天 (fill 时)")
 
     # wyckoff signal
     p_signal = sub.add_parser("signal", help="信号确认池")
-    p_signal.add_argument("status", nargs="?", default="all", help="all/pending/confirmed/expired")
+    p_signal.add_argument("status", nargs="?", default="all", help="all/pending/survived/confirmed/expired")
     p_signal.add_argument("-n", "--limit", type=int, default=30, help="返回条数")
 
     # wyckoff recommend
     p_rec = sub.add_parser("recommend", help="威科夫形态复盘", aliases=["rec"])
     p_rec.add_argument("-n", "--limit", type=int, default=20, help="返回条数")
 
-    # wyckoff dashboard / dash
+
+def _add_analysis_job_parsers(sub) -> None:
     p_dash = sub.add_parser("dashboard", help="启动本地可视化面板", aliases=["dash"])
     p_dash.add_argument("--port", type=int, default=8765, help="HTTP 端口 (默认 8765)")
 
     # wyckoff screen
     p_screen = sub.add_parser("screen", help="全市场漏斗筛选")
-    p_screen.add_argument("--board", default="all", help="板块 (all/main/gem/star)")
+    p_screen.add_argument("--board", default="all", help="板块 (all/main/chinext/gem/star/bse)")
+    p_screen.add_argument("--limit", type=int, default=None, help="扫描数量上限；0 表示全量")
+    p_screen.add_argument("--style", default="", help="候选风格偏好 (trend/pullback/quality，或中文强势/低吸/稳健)")
+    financial_group = p_screen.add_mutually_exclusive_group()
+    financial_group.add_argument(
+        "--financial-metrics",
+        dest="financial_metrics",
+        action="store_true",
+        default=None,
+        help="启用财务指标过滤",
+    )
+    financial_group.add_argument(
+        "--no-financial-metrics",
+        dest="financial_metrics",
+        action="store_false",
+        help="跳过财务指标过滤以加快扫描",
+    )
 
     # wyckoff backtest
     p_bt = sub.add_parser("backtest", help="策略历史回测", aliases=["bt"])
@@ -1506,6 +1989,8 @@ def main():
     # wyckoff mcp
     sub.add_parser("mcp", help="启动 MCP Server")
 
+
+def _add_session_debug_parsers(sub) -> None:
     _add_memory_parser(sub)
 
     # wyckoff log
@@ -1549,6 +2034,8 @@ def main():
     p_diag.add_argument("--out", default="", help="输出路径；默认 ~/.wyckoff/diagnostics/")
     p_diag.add_argument("--format", choices=["zip", "json"], default="zip", help="输出格式")
 
+
+def _add_maintenance_parsers(sub) -> None:
     # wyckoff sync
     p_sync = sub.add_parser("sync", help="同步 Supabase → 本地 SQLite")
     p_sync.add_argument("sync_cmd", nargs="?", default="", help="status: 查看同步状态")
@@ -1557,6 +2044,40 @@ def main():
     p_cleanup = sub.add_parser("cleanup", help="清理过期本地数据")
     p_cleanup.add_argument("--days", type=int, default=30, help="保留天数 (默认 30)")
 
+    p_run = sub.add_parser("run", help="无界面跑一轮 Agent")
+    p_run.add_argument("action", help="要执行的指令或问题")
+
+    p_daemon = sub.add_parser("daemon", help="常驻定时调度进程")
+    p_daemon.add_argument("--foreground", action="store_true", help="前台运行 (launchd 用这个)")
+    p_daemon.add_argument("--status", action="store_true", help="查看运行状态")
+    p_daemon.add_argument("--verbose", action="store_true", help="调试日志")
+
+    p_approve = sub.add_parser("approve", help="查看和处理待批准的写操作")
+    p_approve.add_argument("action", choices=["list", "ok", "no"], help="list 查看 / ok 批准 / no 拒绝")
+    p_approve.add_argument("id", nargs="?", default="", help="待批准项编号")
+
+    p_mcp_add = sub.add_parser("mcp-add", help="添加外部 MCP server")
+    p_mcp_add.add_argument("name", help="server 名称，用作工具前缀")
+    p_mcp_add.add_argument("--command", required=True, help="启动命令，如 npx")
+    p_mcp_add.add_argument("--args", nargs="*", default=[], help="命令参数")
+    p_mcp_add.add_argument("--env", nargs="*", default=[], help="环境变量 KEY（从当前环境读取）或 KEY=VALUE")
+
+    sub.add_parser("mcp-list", help="列出外部 MCP server")
+    for cmd, help_text in [
+        ("mcp-enable", "启用外部 MCP server"),
+        ("mcp-disable", "停用外部 MCP server"),
+        ("mcp-remove", "移除外部 MCP server"),
+        ("mcp-test", "试连并列出工具，不进入会话"),
+    ]:
+        sub.add_parser(cmd, help=help_text).add_argument("name", help="server 名称")
+
+
+def main():
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    _set_terminal_title("Wyckoff-Analysis")
+    parser = _build_parser()
     args = parser.parse_args()
     _dispatch_command(args)
 

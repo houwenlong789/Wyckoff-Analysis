@@ -2,47 +2,85 @@
 
 from __future__ import annotations
 
-import os
+import logging
+import math
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 import pandas as pd
 
-STRUCTURAL_L4_TRIGGERS = {"spring", "lps", "compression", "compress", "trend_pullback"}
+from core.signal_confirmation import compute_support_level, score_springboard_abc
+
+logger = logging.getLogger(__name__)
+
+STRUCTURAL_L4_TRIGGERS = {"spring", "lps", "compression", "compress", "trend_pullback", "volatile_pullback"}
 NAKED_RIGHT_SIDE_TRIGGERS = {"sos", "evr"}
-DEFENSIVE_REGIMES = {"RISK_OFF", "BEAR_REBOUND", "PANIC_REPAIR", "CRASH", "BLACK_SWAN"}
-DEFAULT_POSITION_RATIO_BY_REGIME: dict[str, float] = {
-    "NEUTRAL": 0.5,
-    "RISK_ON": 0.25,
-    "BEAR_REBOUND": 0.25,
-    "PANIC_REPAIR": 0.0,
-    "RISK_OFF": 0.0,
-    "CRASH": 0.0,
-    "BLACK_SWAN": 0.0,
+TREND_CANDIDATE_TRIGGERS = {
+    "main_force_entry",
+    "trend_breakout",
+    "trend_lane_pullback",
+    "sector_strength",
+    "wyckoff_structure",
 }
+DEFENSIVE_REGIMES = {
+    "RISK_OFF",
+    "BEAR_REBOUND",
+    "PANIC_REPAIR",
+    "PANIC_REPAIR_CONFIRMED",
+    "CRASH",
+    "BLACK_SWAN",
+}
+WEAK_PULLBACK_REGIMES = DEFENSIVE_REGIMES | {"RISK_ON"}
 
 
-def _env_bool(name: str, default: str = "1") -> bool:
-    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+@dataclass(frozen=True)
+class CandidatePolicyConfig:
+    loss_guard_enabled: bool = True
+    alpha_block_risk_on_early_breakout: bool = True
+    alpha_risk_on_early_breakout_min_score: float = 70.0
+    # 下面三个阈值 2026-08-10 从「结构上不可达」修正为可达值。
+    #
+    # 根因：各 detector 返回的是不同物理量，而这组阈值按"量比"量级设定：
+    #   _detect_trend_pullback 返回 float(1.0 - vol_ratio)，vol_ratio > 0
+    #       → score < 1.0 恒成立（实测 163 笔 max=0.601）
+    #   _detect_lps 返回 float(vol_ratio) 且 vol_ratio > lps_vol_dry_ratio(0.65) 即弃用
+    #       → score ∈ (0, 0.65]（实测 9 笔 max=0.649）
+    # 而原阈值 10.0 / 6.0 / 12.0 分别是上界的 10 倍、9.2 倍、12 倍以上，
+    # 意味着这三条判据【永远为真】：
+    #   主线 trend_pullback / lps 候选 100% 被拦（"主线跳过仅观察"这条快速通道
+    #   对它们实际是关闭的）；含 trend_pullback 的【共振组合】在五种弱回踩市况下
+    #   被无条件拦掉——共振组合没有 observe_only 兜底，本该是质量更高的一批。
+    #
+    # 取 0.05 而非样本分位：trendpb/lps 的样本仅 163/9 笔且分数按周期分层
+    #   （recent_6m 全在某阈值上、sideways_2023 全在其下），用分位数会把周期差异
+    #   当成分数差异——据此算出的 Welch t=+4.01 实为周期间比较，不可用。
+    # 0.05 的语义是"几乎不拦"：本阶段只消除不可达，把真正的判别权留给后续的
+    # 类内相对判据（绝对阈值跨量纲比较的问题无法靠调数值根治）。
+    mix_trendpb_min_score: float = 0.05
+    pure_lps_observe_only: bool = True
+    pure_lps_min_score: float = 0.05
+    pure_trendpb_observe_only: bool = True
+    pure_trendpb_min_score: float = 0.05
+    pure_sos_min_score: float = 6.0
+    pure_sos_observe_only: bool = True
+    pure_spring_observe_only: bool = True
+    pure_evr_observe_only: bool = True
+    pure_evr_min_score_default: float = 3.0
+    pure_evr_min_score_hot: float = 5.0
+    weak_confirmation_min_abc: int = 2
+    pure_sos_min_abc: int = 3
+    risk_on_pre5_ret: float = 35.0
+    risk_on_range_pos: float = 85.0
+    risk_on_vol_ratio: float = 1.8
+    defensive_high_range_pos: float = 78.0
+    defensive_high_20d_ret: float = 18.0
+    # NEUTRAL 放宽高位中继误杀，主升段常见 20 日涨幅 >35%。
+    neutral_high_range_pos: float = 95.0
+    neutral_high_20d_ret: float = 45.0
+    max_structure_stop_pct: float = 12.0
 
 
-def _env_float(name: str, default: str) -> float:
-    try:
-        return float(os.getenv(name, default))
-    except ValueError:
-        return float(default)
-
-
-def _position_ratio_for_regime(regime_norm: str) -> float:
-    default = DEFAULT_POSITION_RATIO_BY_REGIME.get(regime_norm, DEFAULT_POSITION_RATIO_BY_REGIME["NEUTRAL"])
-    for prefix in ("FUNNEL_REGIME", "BACKTEST_REGIME"):
-        raw = os.getenv(f"{prefix}_{regime_norm}_POSITION_RATIO")
-        if raw is None:
-            continue
-        try:
-            return min(max(float(raw), 0.0), 1.0)
-        except ValueError:
-            return default
-    return default
+DEFAULT_CANDIDATE_POLICY_CONFIG = CandidatePolicyConfig()
 
 
 def trigger_sets_by_code(triggers: dict[str, list[tuple[str, float]]]) -> dict[str, set[str]]:
@@ -67,19 +105,6 @@ def is_tradeable_l4_trigger_combo(trigger_keys: Iterable[str]) -> bool:
     return not keys <= NAKED_RIGHT_SIDE_TRIGGERS
 
 
-def apply_regime_position_filter(ranked_codes: list[str], regime: str) -> list[str]:
-    if not ranked_codes:
-        return []
-    regime_norm = str(regime or "NEUTRAL").strip().upper() or "NEUTRAL"
-    ratio = _position_ratio_for_regime(regime_norm)
-    if ratio <= 0:
-        return []
-    if ratio >= 1.0:
-        return ranked_codes
-    keep_n = max(1, int(len(ranked_codes) * ratio + 0.5))
-    return ranked_codes[:keep_n]
-
-
 def rerank_selected_codes(codes: list[str], score_map: dict[str, float]) -> list[str]:
     seen: set[str] = set()
     deduped = []
@@ -88,7 +113,48 @@ def rerank_selected_codes(codes: list[str], score_map: dict[str, float]) -> list
         if code_s and code_s not in seen:
             deduped.append(code_s)
             seen.add(code_s)
-    return sorted(deduped, key=lambda c: (-float(score_map.get(c, 0.0) or 0.0), c))
+    return sorted(deduped, key=lambda c: (-candidate_score_value(score_map.get(c)), c))
+
+
+def cap_quality_candidates(
+    codes: list[str],
+    score_map: dict[str, float],
+    sector_map: dict[str, str] | None,
+    *,
+    total_cap: int,
+    max_per_sector: int,
+    rank_by_score: bool = True,
+) -> tuple[list[str], list[str], list[str]]:
+    """Rank qualified candidates, then apply one global and sector cap."""
+    ranked = rerank_selected_codes(codes, score_map) if rank_by_score else list(dict.fromkeys(codes))
+    if total_cap <= 0:
+        return [], ranked, []
+    selected: list[str] = []
+    cap_dropped: list[str] = []
+    sector_dropped: list[str] = []
+    sector_counts: dict[str, int] = {}
+    for code in ranked:
+        sector = str((sector_map or {}).get(code) or "").strip()
+        if sector and max_per_sector > 0 and sector_counts.get(sector, 0) >= max_per_sector:
+            sector_dropped.append(code)
+            continue
+        if len(selected) >= total_cap:
+            cap_dropped.append(code)
+            continue
+        selected.append(code)
+        if sector:
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+    return selected, cap_dropped, sector_dropped
+
+
+def candidate_score_value(raw: object) -> float:
+    if raw is None or isinstance(raw, bool):
+        return 0.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) else 0.0
 
 
 def _normalize_keys(trigger_keys: Iterable[str]) -> set[str]:
@@ -106,7 +172,7 @@ def _is_pure_momentum_channel(channel: str) -> bool:
     return bool(tags <= {"主升通道", "趋势延续", "加速突破"})
 
 
-def _recent_overheat(df: pd.DataFrame | None) -> bool:
+def _recent_overheat(df: pd.DataFrame | None, config: CandidatePolicyConfig) -> bool:
     if df is None or df.empty or len(df) < 21:
         return False
     work = _numeric_ohlcv(df)
@@ -119,10 +185,43 @@ def _recent_overheat(df: pd.DataFrame | None) -> bool:
     vol20 = float(work["volume"].tail(20).mean())
     vol_ratio = float(work["volume"].tail(5).mean()) / vol20 if vol20 > 0 else 0.0
     return (
-        pre5_ret >= _env_float("FUNNEL_LOSS_GUARD_RISK_ON_PRE5_RET", "25.0")
-        and range_pos >= _env_float("FUNNEL_LOSS_GUARD_RISK_ON_RANGE_POS", "85.0")
-        and vol_ratio >= _env_float("FUNNEL_LOSS_GUARD_RISK_ON_VOL_RATIO", "1.8")
+        pre5_ret >= config.risk_on_pre5_ret
+        and range_pos >= config.risk_on_range_pos
+        and vol_ratio >= config.risk_on_vol_ratio
     )
+
+
+def _recent_position_stats(df: pd.DataFrame | None) -> dict[str, float] | None:
+    if df is None or df.empty or len(df) < 21:
+        return None
+    work = _numeric_ohlcv(df)
+    if work is None:
+        return None
+    high20, low20 = float(work["high"].max()), float(work["low"].min())
+    close = float(work.iloc[-1]["close"])
+    base = float(work.iloc[0]["close"])
+    range_pos = (close - low20) / (high20 - low20) * 100.0 if high20 > low20 else 0.0
+    ret20 = (close / base - 1.0) * 100.0 if base > 0 else 0.0
+    return {"range_pos": range_pos, "ret20": ret20}
+
+
+def _late_stage_high_reason(
+    regime_norm: str,
+    keys: set[str],
+    df: pd.DataFrame | None,
+    config: CandidatePolicyConfig,
+) -> str:
+    if not keys or "spring" in keys or "volatile_pullback" in keys:
+        return ""
+    stats = _recent_position_stats(df)
+    if not stats:
+        return ""
+    defensive = regime_norm in DEFENSIVE_REGIMES
+    range_cut = config.defensive_high_range_pos if defensive else config.neutral_high_range_pos
+    ret_cut = config.defensive_high_20d_ret if defensive else config.neutral_high_20d_ret
+    if stats["range_pos"] >= range_cut and stats["ret20"] >= ret_cut:
+        return f"{regime_norm}20日高位追涨"
+    return ""
 
 
 def _numeric_ohlcv(df: pd.DataFrame) -> pd.DataFrame | None:
@@ -142,28 +241,133 @@ def loss_guard_reason(
     trigger_score: float,
     channel: str,
     df_map: dict[str, pd.DataFrame],
+    *,
+    config: CandidatePolicyConfig | None = None,
+    mainline_codes: set[str] | None = None,
 ) -> str:
-    if not _env_bool("FUNNEL_LOSS_GUARD_ENABLED", "1"):
+    policy = config or DEFAULT_CANDIDATE_POLICY_CONFIG
+    if not policy.loss_guard_enabled:
         return ""
     keys = _normalize_keys(trigger_keys)
     regime_norm = str(regime or "NEUTRAL").strip().upper() or "NEUTRAL"
+    if keys == {"early_breakout"} and regime_norm == "RISK_ON":
+        if policy.alpha_block_risk_on_early_breakout and trigger_score < policy.alpha_risk_on_early_breakout_min_score:
+            return "RISK_ON低分早期突破"
+    high_reason = _late_stage_high_reason(regime_norm, keys, df_map.get(code), policy)
+    if high_reason:
+        return high_reason
+    weak_reason = _weak_confirmation_reason(keys, df_map.get(code), policy)
+    if weak_reason:
+        return weak_reason
+    stop_reason = _structure_stop_reason(keys, df_map.get(code), policy)
+    if stop_reason:
+        return stop_reason
+    is_mainline = bool(mainline_codes and code in mainline_codes)
+    if keys == {"spring"} and policy.pure_spring_observe_only and not is_mainline:
+        # 跨周期回测（2026-08-08，run 31237549718：bear_2022 / bull_2020 /
+        # recent_6m 三周期、696 条 spring 成交）：spring 均收 -3.93%、胜率 22.4%，
+        # 对照非 spring -0.24%／33.4%，Welch t=-6.70（合并）；分周期 bear_2022
+        # t=-4.82、bull_2020 t=-6.57 均显著。三个周期方向一致为负，是唯一在全部
+        # 周期都一致为负的信号，与市场环境无关。
+        return "单Spring仅观察"
     if "lps" in keys and not (keys & {"sos", "evr", "spring"}):
-        return _pure_lps_reason(regime_norm, trigger_score)
-    if "trend_pullback" in keys and regime_norm in DEFENSIVE_REGIMES | {"RISK_ON"}:
-        if trigger_score < _env_float("FUNNEL_LOSS_GUARD_LOW_SCORE", "1.0"):
-            return f"{regime_norm}低分回踩"
+        return _pure_lps_reason(regime_norm, trigger_score, policy, is_mainline)
+    if keys == {"trend_pullback"}:
+        return _pure_trend_pullback_reason(regime_norm, trigger_score, policy, is_mainline)
+    if "trend_pullback" in keys and regime_norm in WEAK_PULLBACK_REGIMES:
+        if trigger_score < policy.mix_trendpb_min_score:
+            return f"{regime_norm}弱趋势回踩"
     if keys and keys <= NAKED_RIGHT_SIDE_TRIGGERS:
-        reason = _naked_right_side_reason(regime_norm, keys, trigger_score, channel, df_map.get(code))
+        reason = _naked_right_side_reason(
+            regime_norm, keys, trigger_score, channel, df_map.get(code), policy, is_mainline
+        )
         if reason:
             return reason
     return ""
 
 
-def _pure_lps_reason(regime_norm: str, trigger_score: float) -> str:
-    if trigger_score < _env_float("FUNNEL_LOSS_GUARD_LOW_SCORE", "1.0"):
+def _structure_stop_reason(
+    keys: set[str],
+    df: pd.DataFrame | None,
+    config: CandidatePolicyConfig,
+) -> str:
+    if not keys or df is None or df.empty or config.max_structure_stop_pct <= 0:
+        return ""
+    if "close" not in df.columns:
+        return ""
+    close_series = pd.to_numeric(df["close"], errors="coerce").dropna()
+    close = candidate_score_value(close_series.iloc[-1]) if not close_series.empty else 0.0
+    if close <= 0:
+        return ""
+    levels = []
+    for signal_type in sorted(keys):
+        try:
+            support = candidate_score_value(compute_support_level(df, signal_type))
+        except Exception:
+            continue
+        if 0 < support < close:
+            levels.append(support)
+    if not levels:
+        return ""
+    risk_pct = (close - max(levels)) / close * 100.0
+    return "结构止损超出风险上限" if risk_pct > config.max_structure_stop_pct else ""
+
+
+def _weak_confirmation_reason(keys: set[str], df: pd.DataFrame | None, config: CandidatePolicyConfig) -> str:
+    if not keys:
+        return ""
+    if not (keys <= NAKED_RIGHT_SIDE_TRIGGERS or keys & TREND_CANDIDATE_TRIGGERS):
+        return ""
+    if df is None:
+        # 调用方本就没有接入K线数据（如部分回测/诊断的轻量路径），无法评判，交给其余分支处理。
+        return ""
+    # df 存在但历史长度不足/字段缺失时按最保守值(0)处理，绝不能因为"算不出来"而放行——
+    # 历史上 legacy_layered 策略版本未计算 springboard，就是靠这个空子把大量弱确认
+    # SOS/EVR 放进了正式候选，是信号胜率被拖累的主因之一。
+    met_count = _springboard_met_count(df, keys)
+    if met_count >= config.weak_confirmation_min_abc:
+        return ""
+    if keys <= NAKED_RIGHT_SIDE_TRIGGERS:
+        return "右侧信号ABC不足"
+    return "趋势候选ABC不足"
+
+
+def _springboard_met_count(df: pd.DataFrame, keys: set[str]) -> int:
+    if df.empty or not {"open", "high", "low", "close", "volume"}.issubset(df.columns):
+        return 0
+    if len(df) < 60:
+        return 0
+    counts = []
+    for signal_type in sorted(keys):
+        try:
+            counts.append(int(score_springboard_abc(df, signal_type).get("met_count") or 0))
+        except Exception:
+            logger.warning("score_springboard_abc failed for signal_type=%s", signal_type, exc_info=True)
+            continue
+    return max(counts) if counts else 0
+
+
+def _pure_lps_reason(
+    regime_norm: str, trigger_score: float, config: CandidatePolicyConfig, is_mainline: bool = False
+) -> str:
+    if config.pure_lps_observe_only and not is_mainline:
+        return "单LPS仅观察"
+    if trigger_score < config.pure_lps_min_score:
         return "低分LPS"
     if regime_norm in DEFENSIVE_REGIMES | {"RISK_ON"}:
         return f"{regime_norm}禁用LPS"
+    return ""
+
+
+def _pure_trend_pullback_reason(
+    regime_norm: str, trigger_score: float, config: CandidatePolicyConfig, is_mainline: bool = False
+) -> str:
+    if config.pure_trendpb_observe_only and not is_mainline:
+        return "单TrendPB仅观察"
+    if trigger_score < config.pure_trendpb_min_score:
+        return "低分TrendPB"
+    if regime_norm in WEAK_PULLBACK_REGIMES:
+        return f"{regime_norm}禁用TrendPB"
     return ""
 
 
@@ -173,14 +377,34 @@ def _naked_right_side_reason(
     trigger_score: float,
     channel: str,
     df: pd.DataFrame | None,
+    config: CandidatePolicyConfig,
+    is_mainline: bool = False,
 ) -> str:
-    if regime_norm in {"RISK_ON", "BEAR_REBOUND"} and _is_pure_momentum_channel(channel):
+    if regime_norm == "BEAR_REBOUND" and _is_pure_momentum_channel(channel):
         return f"{regime_norm}纯趋势追涨"
-    if "sos" in keys and trigger_score < _env_float("FUNNEL_LOSS_GUARD_PURE_SOS_MIN_SCORE", "4.0"):
+    if keys == {"evr"} and config.pure_evr_observe_only and not is_mainline:
+        return "单EVR仅观察"
+    if keys == {"sos"} and config.pure_sos_observe_only and not is_mainline:
+        # 标准回放（2026-08-07，snapshot 2025-11-03..2026-07-20，162 交易日，两次独立
+        # ledger 去重后 493 条纯 SOS）：10 日中位 -3.20%、胜率 40.0%，对照非纯 SOS
+        # 中位 -1.27%、胜率 44.3%。均值受少数极端日主导（剔最差 5 日即转正），但中位
+        # 与胜率两个抗尾部口径在 5/10 日、两次 ledger 上方向一致。
+        # ABC 门槛松紧无法改善：met=2 与 met=3 的差异在所有周期 |t|<0.5。
+        return "单SOS仅观察"
+    if "sos" in keys and trigger_score < config.pure_sos_min_score:
         return "低分SOS"
-    if keys == {"evr"} and trigger_score < _env_float("FUNNEL_LOSS_GUARD_PURE_EVR_MIN_SCORE", "2.0"):
+    if keys == {"sos"} and df is not None and _springboard_met_count(df, keys) < config.pure_sos_min_abc:
+        # pure_sos_observe_only=False 时才会走到这里。met=3 未被证明优于 met=2
+        # （标准回放 |t|<0.5），保留 3 只是保守默认值，不代表已验证。
+        return "纯SOS确认强度不足"
+    evr_min_score = (
+        config.pure_evr_min_score_hot
+        if regime_norm in {"RISK_ON", "BEAR_REBOUND"}
+        else config.pure_evr_min_score_default
+    )
+    if keys == {"evr"} and trigger_score < evr_min_score:
         return "低分EVR"
-    if regime_norm in {"RISK_ON", "BEAR_REBOUND"} and _recent_overheat(df):
+    if regime_norm in {"RISK_ON", "BEAR_REBOUND"} and _recent_overheat(df, config):
         return f"{regime_norm}短期过热"
     return ""
 
@@ -195,6 +419,8 @@ def apply_loss_guard(
     code_to_total_score: dict[str, float],
     channel_map: dict[str, str],
     df_map: dict[str, pd.DataFrame],
+    config: CandidatePolicyConfig | None = None,
+    mainline_codes: set[str] | None = None,
 ) -> tuple[list[str], list[str], list[str], dict[str, int]]:
     kept: list[str] = []
     dropped: dict[str, int] = {}
@@ -203,9 +429,11 @@ def apply_loss_guard(
             code,
             regime,
             code_to_trigger_keys.get(code, []),
-            float(code_to_total_score.get(code, 0.0) or 0.0),
+            candidate_score_value(code_to_total_score.get(code)),
             str(channel_map.get(code, "") or ""),
             df_map,
+            config=config,
+            mainline_codes=mainline_codes,
         )
         if reason:
             dropped[reason] = dropped.get(reason, 0) + 1

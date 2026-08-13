@@ -1,71 +1,82 @@
-import type { FundamentalMetric, ValueSnapshot } from './kline'
+import type { FundamentalMetric, ValueScore, ValueSnapshot, ValueTone } from '@wyckoff/shared'
+import { buildValueScore as buildSharedValueScore, formatPromptPercent, sourceLabel, valueDataQuality, VALUE_RULESET_VERSION } from '@wyckoff/shared'
+
 import type { TranslationKey } from './preferences'
 
-export type ValueTone = 'good' | 'bad' | 'neutral'
 export type ValueView = 'quality' | 'risk'
-
-export interface ValueSignal {
-  label: string
-  tone: ValueTone
-}
-
-export interface ValueScore {
-  label: string
-  tone: ValueTone
-  score: number
-  strengths: ValueSignal[]
-  risks: ValueSignal[]
-}
 
 export type Translate = (key: TranslationKey, vars?: Record<string, string | number | null | undefined>) => string
 
+const VALUE_SIGNAL_TRANSLATION_KEYS: Record<string, TranslationKey> = {
+  ROE_STRONG: 'analysis.valueSignalRoeStrong',
+  ROE_LOSS: 'analysis.valueRiskRoeLoss',
+  NET_INCOME_GROWTH: 'analysis.valueSignalProfitGrowth',
+  NET_INCOME_DECLINE: 'analysis.valueRiskProfitDrop',
+  REVENUE_GROWTH: 'analysis.valueSignalRevenueGrowth',
+  REVENUE_DECLINE: 'analysis.valueRiskRevenueDrop',
+  GROSS_MARGIN_HIGH: 'analysis.valueSignalGrossMargin',
+  GROSS_MARGIN_LOW: 'analysis.valueRiskGrossMarginLow',
+  LOW_DEBT: 'analysis.valueSignalLowDebt',
+  HIGH_LEVERAGE: 'analysis.valueRiskHighDebt',
+  CASH_FLOW_MATCH: 'analysis.valueSignalCashHealthy',
+  CASH_FLOW_WEAK: 'analysis.valueRiskCashWeak',
+  PROFIT_CASH_FLOW_DIVERGENCE: 'analysis.valueRiskProfitCashFlowDivergence',
+  WEAK_CASH_EARNINGS: 'analysis.valueRiskWeakCashEarnings',
+}
+
 export function buildValueScore(metrics: FundamentalMetric | null, t?: Translate): ValueScore {
   const tr = (key: TranslationKey, fallback: string) => t ? t(key) : fallback
-  if (!metrics) return { label: tr('analysis.valueNoSource', '暂无'), tone: 'neutral', score: -99, strengths: [], risks: [] }
-
-  let score = 0
-  const strengths: ValueSignal[] = []
-  const risks: ValueSignal[] = []
-  const addStrength = (condition: boolean, label: string, points = 1) => {
-    if (condition) {
-      strengths.push({ label, tone: 'good' })
-      score += points
-    }
+  const score = buildSharedValueScore(metrics)
+  const label = score.severe
+    ? tr('analysis.valueScoreSevere', '高危')
+    : score.tone === 'good'
+      ? tr('analysis.valueScoreStrong', '稳健')
+      : score.tone === 'bad'
+        ? tr('analysis.valueScoreWeak', '承压')
+        : tr('analysis.valueScoreNeutral', '中性')
+  return {
+    ...score,
+    label: metrics ? label : tr('analysis.valueNoSource', '暂无'),
+    strengths: score.strengths.map(signal => ({ ...signal, label: tr(VALUE_SIGNAL_TRANSLATION_KEYS[signal.code || ''] || 'analysis.valueNoSignals', signal.label) })),
+    risks: score.risks.map(signal => ({ ...signal, label: tr(VALUE_SIGNAL_TRANSLATION_KEYS[signal.code || ''] || 'analysis.valueNoSignals', signal.label) })),
   }
-  const addRisk = (condition: boolean, label: string, points = 1) => {
-    if (condition) {
-      risks.push({ label, tone: 'bad' })
-      score -= points
-    }
-  }
-
-  addStrength((metrics.roe ?? -Infinity) >= 10, tr('analysis.valueSignalRoeStrong', 'ROE 较强'), 2)
-  addRisk((metrics.roe ?? Infinity) < 0, tr('analysis.valueRiskRoeLoss', 'ROE 为负'), 2)
-  addStrength((metrics.net_income_yoy ?? -Infinity) > 0, tr('analysis.valueSignalProfitGrowth', '净利润正增长'))
-  addRisk((metrics.net_income_yoy ?? Infinity) < 0, tr('analysis.valueRiskProfitDrop', '净利润下滑'))
-  addStrength((metrics.revenue_yoy ?? -Infinity) > 0, tr('analysis.valueSignalRevenueGrowth', '营收正增长'))
-  addRisk((metrics.revenue_yoy ?? Infinity) < 0, tr('analysis.valueRiskRevenueDrop', '营收下滑'))
-  addStrength((metrics.gross_margin ?? -Infinity) >= 30, tr('analysis.valueSignalGrossMargin', '毛利率较高'))
-  addRisk((metrics.gross_margin ?? Infinity) < 15, tr('analysis.valueRiskGrossMarginLow', '毛利率偏低'))
-  addStrength((metrics.debt_to_asset_ratio ?? Infinity) <= 55, tr('analysis.valueSignalLowDebt', '杠杆较低'))
-  addRisk((metrics.debt_to_asset_ratio ?? -Infinity) >= 70, tr('analysis.valueRiskHighDebt', '资产负债率偏高'), 2)
-  addStrength((metrics.operating_cash_to_revenue ?? -Infinity) >= 5, tr('analysis.valueSignalCashHealthy', '现金流匹配收入'))
-  addRisk((metrics.operating_cash_to_revenue ?? Infinity) < 0, tr('analysis.valueRiskCashWeak', '经营现金流偏弱'))
-
-  const tone: ValueTone = score >= 3 ? 'good' : score < 0 ? 'bad' : 'neutral'
-  const label = tone === 'good'
-    ? tr('analysis.valueScoreStrong', '稳健')
-    : tone === 'bad'
-      ? tr('analysis.valueScoreWeak', '承压')
-      : tr('analysis.valueScoreNeutral', '中性')
-  return { label, tone, score, strengths, risks }
 }
 
-export function sourceLabel(snapshot: ValueSnapshot): string {
-  if (snapshot.source === 'tickflow') return 'TickFlow'
-  if (snapshot.source === 'tushare') return 'Tushare'
-  return '--'
+export function valueDataQualityText(snapshot: ValueSnapshot, t: Translate): string {
+  const quality = valueDataQuality(snapshot)
+  if (quality.level === 'ready') return t('analysis.valueDataReady')
+  if (quality.level === 'limited') return t('analysis.valueDataLimited')
+  if (quality.level === 'stale') return t('analysis.valueDataStale')
+  return t('analysis.valueNoSource')
 }
+
+export function valueDataQualityTitle(snapshot: ValueSnapshot, t: Translate): string {
+  const quality = valueDataQuality(snapshot)
+  const fields = `${quality.coreFieldCount}/6`
+  const age = quality.ageDays === undefined ? '' : ` · ${quality.ageDays}${t('analysis.valueDataAgeDays')}`
+  return `${sourceLabel(snapshot)} · ${quality.asOf || t('analysis.valueNoSource')} · ${valueDataQualityText(snapshot, t)} · ${fields}${age}`
+}
+
+export function calculateInputSnapshotHash(
+  symbol: string,
+  klineData: { date: string }[],
+  valueSnapshot: ValueSnapshot,
+  valueRulesetVersion = VALUE_RULESET_VERSION,
+): string {
+  const start = klineData[0]?.date || ''
+  const end = klineData[klineData.length - 1]?.date || ''
+  const len = klineData.length
+  const metricsJson = valueSnapshot.metrics ? JSON.stringify(valueSnapshot.metrics) : 'none'
+  const source = valueSnapshot.source
+  const raw = `${symbol}:${start}:${end}:${len}:${source}:${metricsJson}:${valueRulesetVersion}`
+
+  let hash = 2166136261
+  for (let i = 0; i < raw.length; i++) {
+    hash = Math.imul(hash ^ raw.charCodeAt(i), 16777619)
+  }
+  return (hash >>> 0).toString(16)
+}
+
 
 export function valueUnavailableText(reason: ValueSnapshot['reason'], t: Translate): string {
   if (reason === 'unsupported-market') return t('analysis.valueUnsupported')
@@ -102,7 +113,8 @@ export function metricToneClass(tone: ValueTone): string {
   return 'text-foreground'
 }
 
-export function valueScoreClass(tone: ValueTone): string {
+export function valueScoreClass(tone: ValueTone, severe = false): string {
+  if (severe) return 'bg-up/20 text-up ring-1 ring-up/40'
   if (tone === 'good') return 'bg-down/10 text-down'
   if (tone === 'bad') return 'bg-up/10 text-up'
   return 'bg-muted text-muted-foreground'
@@ -114,31 +126,22 @@ export function signalClass(tone: ValueTone): string {
   return 'border-border text-muted-foreground'
 }
 
-export function buildValuePrompt(snapshot: ValueSnapshot): string {
-  const metrics = snapshot.metrics
-  if (!metrics) return '价值面摘要：暂无可用基本面指标，本次只基于量价结构分析。'
-  const rows = [
-    `价值面摘要（来源：${sourceLabel(snapshot)}${metrics.period_end ? `，报告期：${metrics.period_end}` : ''}）：`,
-    `ROE=${formatPromptPercent(metrics.roe)}，净利润同比=${formatPromptPercent(metrics.net_income_yoy)}，营收同比=${formatPromptPercent(metrics.revenue_yoy)}`,
-    `毛利率=${formatPromptPercent(metrics.gross_margin)}，净利率=${formatPromptPercent(metrics.net_margin)}，资产负债率=${formatPromptPercent(metrics.debt_to_asset_ratio)}`,
-    `经营现金流/营收=${formatPromptPercent(metrics.operating_cash_to_revenue)}，EPS=${formatPromptNumber(metrics.eps_basic)}，每股净资产=${formatPromptNumber(metrics.bps)}`,
-  ]
-  return rows.join('\n')
+/** Sorts descending by quality score, surfacing severe-risk items first regardless of score. */
+export function sortByValueRisk<T>(items: T[], metricsOf: (item: T) => FundamentalMetric | null): T[] {
+  return [...items].sort((a, b) => {
+    const scoreA = buildSharedValueScore(metricsOf(a))
+    const scoreB = buildSharedValueScore(metricsOf(b))
+    if (scoreA.severe !== scoreB.severe) return scoreA.severe ? -1 : 1
+    return scoreB.score - scoreA.score
+  })
 }
 
 export function buildValueDigest(snapshot: ValueSnapshot): string {
   const metrics = snapshot.metrics
   if (!metrics) return 'value: 暂无可用价值面指标'
+  const quality = valueDataQuality(snapshot)
   return [
-    `valueSource=${sourceLabel(snapshot)} period=${metrics.period_end || metrics.announce_date || 'unknown'}`,
+    `valueSource=${sourceLabel(snapshot)} period=${metrics.period_end || metrics.announce_date || 'unknown'} quality=${quality.level} coreFields=${quality.coreFieldCount}/6`,
     `valueMetrics roe=${formatPromptPercent(metrics.roe)} netProfitYoY=${formatPromptPercent(metrics.net_income_yoy)} revenueYoY=${formatPromptPercent(metrics.revenue_yoy)} grossMargin=${formatPromptPercent(metrics.gross_margin)} netMargin=${formatPromptPercent(metrics.net_margin)} debtRatio=${formatPromptPercent(metrics.debt_to_asset_ratio)} cashToRevenue=${formatPromptPercent(metrics.operating_cash_to_revenue)}`,
   ].join('\n')
-}
-
-export function formatPromptPercent(value: number | undefined): string {
-  return Number.isFinite(value) ? `${(value as number).toFixed(2)}%` : '暂无'
-}
-
-export function formatPromptNumber(value: number | undefined): string {
-  return Number.isFinite(value) ? (value as number).toFixed(2) : '暂无'
 }

@@ -1,6 +1,6 @@
 import { useEffect } from 'react'
 import { useLocation } from 'react-router'
-import { AlertTriangle, BarChart3, Bot, Briefcase, CalendarDays, CheckCircle2, CloudCog, Download, ExternalLink, GitBranch, MessageSquare, Moon, RadioTower, Rocket, Settings, Swords, Terminal, TrendingUp, Users, type LucideIcon } from 'lucide-react'
+import { AlertTriangle, BarChart3, Bot, Briefcase, CalendarDays, CheckCircle2, CloudCog, Download, ExternalLink, GitBranch, MessageSquare, RadioTower, Rocket, Settings, Swords, Terminal, TrendingUp, Users, type LucideIcon } from 'lucide-react'
 import { usePreferences, type Locale, type TranslationKey } from '@/lib/preferences'
 
 const workflows = [
@@ -30,7 +30,6 @@ const tools = [
   { nameKey: 'guide.tool.market', detailKey: 'guide.tool.market.detail' },
   { nameKey: 'guide.tool.tracking', detailKey: 'guide.tool.tracking.detail' },
   { nameKey: 'guide.tool.signal', detailKey: 'guide.tool.signal.detail' },
-  { nameKey: 'guide.tool.tail', detailKey: 'guide.tool.tail.detail' },
   { nameKey: 'guide.tool.export', detailKey: 'guide.tool.export.detail' },
   { nameKey: 'guide.tool.history', detailKey: 'guide.tool.history.detail' },
   { nameKey: 'guide.tool.model', detailKey: 'guide.tool.model.detail' },
@@ -48,11 +47,6 @@ const playbooks = [
     textKey: 'guide.playbook.mid.text',
   },
   {
-    labelKey: 'guide.playbook.tail',
-    icon: Moon,
-    textKey: 'guide.playbook.tail.text',
-  },
-  {
     labelKey: 'guide.playbook.review',
     icon: Download,
     textKey: 'guide.playbook.review.text',
@@ -65,7 +59,7 @@ const capabilityCopy = {
     title: 'Web 是日常工作台，后台负责重任务',
     intro: '当前 Web 端已经覆盖读盘、单股、多股、持仓、跟踪和导出这些高频动作；全市场漏斗、回测、回刷和运维任务继续放在 GitHub Actions、CLI 或数据库后台，避免把长任务和敏感权限塞进浏览器。',
     webTitle: 'Web 端已经接入',
-    webItems: ['单股 320 日日线结构图、价值快照、AI 报告与本地历史', '多股对抗的相对强弱、叠加/分图、价值面校准与本地历史', '持仓诊断支持数据库持仓和手动持仓，结果保存在当前浏览器', '白名单形态跟踪、白名单尾盘记录、批量行情导出、模型和数据源配置'],
+    webItems: ['单股 320 日日线结构图、价值快照、AI 报告与本地历史', '多股对抗的相对强弱、叠加/分图、价值面校准与本地历史', '持仓诊断支持数据库持仓和手动持仓，结果保存在当前浏览器', '白名单形态跟踪、批量行情导出、模型和数据源配置'],
     gapTitle: '系统有，但不放在 Web 里主跑',
     whyTitle: '为什么不全塞进 Web',
     costLinkText: '成本详见：COST_MODEL.md',
@@ -76,7 +70,7 @@ const capabilityCopy = {
     title: 'The web UI is the daily desk; background jobs carry the heavy work',
     intro: 'The web UI now covers the high-frequency loops: reading, single-stock analysis, stock battle, portfolio diagnosis, tracking, and export. Full-market funnels, backtests, repricing, and maintenance stay in GitHub Actions, CLI, or database-side jobs instead of pushing long jobs and sensitive permissions into the browser.',
     webTitle: 'Covered by the web UI',
-    webItems: ['Single-stock 320-day chart, value snapshot, AI report, and local history', 'Stock battle with relative strength, overlay/separate charts, value calibration, and local history', 'Portfolio diagnosis for database or manual positions, with browser-local result history', 'Allowlisted pattern tracking, allowlisted tail-buy logs, batch market-data export, model and data-source settings'],
+    webItems: ['Single-stock 320-day chart, value snapshot, AI report, and local history', 'Stock battle with relative strength, overlay/separate charts, value calibration, and local history', 'Portfolio diagnosis for database or manual positions, with browser-local result history', 'Allowlisted pattern tracking, batch market-data export, model and data-source settings'],
     gapTitle: 'Available in the system, but not browser-first',
     whyTitle: 'Why not put everything in the browser',
     costLinkText: 'Cost details: COST_MODEL.md',
@@ -99,7 +93,7 @@ const capabilityGaps = {
     ['全市场漏斗任务', 'A股保留完整 AI/通知链路；港股、美股每日扫描只写跟踪表并产出 Actions artifact。'],
     ['LLM 输入预览与飞书产物', '每日审核输入、完整报告、文件/文档分发更适合由 Actions 产出，Web 只承接查询和轻量分析。'],
     ['回测与参数网格', '牛熊周期、TopN、止损/止盈/持仓天数等批量计算适合后台长任务，Web 目前只展示部分结果。'],
-    ['信号生命周期与补价回刷', 'pending/confirmed/expired、推荐表现回刷、30 个交易日保留、MFE/MAE 统计都在后台维护。'],
+    ['信号生命周期与补价回刷', 'pending/survived/confirmed/expired、推荐表现回刷、30 个交易日保留、MFE/MAE 统计都在后台维护。'],
     ['CLI Agent 与本机文件流', 'CLI/TUI、长上下文 Agent、诊断导出、本机环境变量和文件产物不适合直接暴露给浏览器。'],
     ['Streamlit 历史页面', 'Streamlit MVP 已在 main 退场并归档到 release/streamlit；新能力默认进入 CF Pages、CLI、MCP 或 Actions。'],
     ['维护与数据库任务', '缓存清理、RLS/服务端密钥操作、日志 artifact、全量清库/回刷属于运维能力，Web 只保留安全入口。'],
@@ -108,7 +102,7 @@ const capabilityGaps = {
     ['Full-market funnel jobs', 'A-share scans run the full AI/notification pipeline; HK and US scans write tracking tables and artifacts only.'],
     ['LLM input previews and Feishu artifacts', 'Daily review inputs, full reports, and file/doc distribution fit Actions better; the web UI handles querying and lightweight analysis.'],
     ['Backtests and parameter grids', 'Bull/bear windows, TopN, stop-loss, take-profit, and holding-day grids are long-running backend workloads.'],
-    ['Signal lifecycle and repricing', 'pending/confirmed/expired updates, recommendation repricing, 30-trading-day retention, and MFE/MAE stats run in background jobs.'],
+    ['Signal lifecycle and repricing', 'pending/survived/confirmed/expired updates, recommendation repricing, 30-trading-day retention, and MFE/MAE stats run in background jobs.'],
     ['CLI Agent and local file flows', 'CLI/TUI, long-context agents, diagnostic exports, local env vars, and file artifacts should stay on the user machine.'],
     ['Archived Streamlit pages', 'The Streamlit MVP is retired from main and archived on release/streamlit; new work goes to CF Pages, CLI, MCP, or Actions.'],
     ['Maintenance and database jobs', 'Cache cleanup, service-role operations, log artifacts, full cleanup, and repricing are operational tools, not browser-first UI.'],
@@ -392,7 +386,7 @@ function CapabilityListCard({ icon: Icon, title, items, costLinkText, tone }: { 
 function CapabilityAccessCard({ title, locale }: { title: string; locale: Locale }) {
   const icons = [GitBranch, Terminal, Settings, Bot]
   return (
-    <article className="rounded-xl border border-border bg-background/80 p-4">
+    <article className="rounded-lg border border-border bg-background p-4">
       <div className="mb-3 flex items-center gap-2 text-sm font-semibold">
         <GitBranch size={17} className="text-primary" />
         {title}
@@ -401,7 +395,7 @@ function CapabilityAccessCard({ title, locale }: { title: string; locale: Locale
         {capabilityAccess[locale].map(([name, desc], index) => {
           const Icon = icons[index] ?? Bot
           return (
-            <div key={name} className="rounded-lg bg-muted/60 p-3">
+            <div key={name} className="rounded-md bg-muted/60 p-3">
               <div className="flex items-center gap-2 text-sm font-semibold">
                 <Icon size={15} className="text-primary" />
                 {name}

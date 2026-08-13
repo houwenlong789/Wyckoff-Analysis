@@ -1,0 +1,508 @@
+"""Agent-facing AI report tools."""
+
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any
+
+from agents.stock_data_helpers import code_to_name
+from agents.strategy_policy_context import report_with_strategy_policy_context, screen_strategy_policy
+from agents.tool_context import ToolContext, ensure_tushare_token, resolve_llm_config
+from core.candidate_guards import candidate_guard_summary
+from utils.safe import has_value as _has_value
+
+logger = logging.getLogger(__name__)
+
+_CN_CODE_RE = re.compile(r"(?i)^(?:SH|SZ|BJ)?\.?([0134568]\d{5})(?:\.(?:SH|SZ|BJ))?$")
+_CN_CODE_TOKEN_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:SH|SZ|BJ)?\.?([0134568]\d{5})(?:\.(?:SH|SZ|BJ))?(?![A-Za-z0-9])"
+)
+_REPORT_CODE_NAME_RE = re.compile(
+    r"(?i)(?P<prefix>(?:SH|SZ|BJ)?\.?(?P<code>[0134568]\d{5})(?:\.(?:SH|SZ|BJ))?)\s*[（(](?P<name>[^）)\n]{1,24})[）)]"
+)
+
+
+def generate_ai_report(stock_codes: Any = None, tool_context: ToolContext | None = None) -> dict:
+    """对指定股票列表生成威科夫三阵营 AI 深度研报。"""
+    try:
+        ensure_tushare_token(tool_context)
+        stock_items = _stock_code_items(stock_codes)
+        explicit_stock_items = bool(stock_items)
+        screen_result = last_screen_result(tool_context)
+        if not stock_items and (reason := screen_auto_handoff_block_reason(screen_result)):
+            status = screen_auto_handoff_block_status(screen_result)
+            return {
+                "error": f"{screen_auto_handoff_block_message(status)}: {reason}",
+                "status": status,
+                "reason": reason,
+            }
+        stock_items = stock_items or _screen_handoff_stock_items(tool_context)
+        if not stock_items:
+            return {"error": "请提供至少一个股票代码"}
+        provider, api_key, model, base_url = resolve_llm_config(tool_context)
+        if not api_key:
+            return {"error": "未配置 LLM API Key，无法生成 AI 研报。请通过 /model 或设置页面配置。"}
+        symbols_info = symbols_info_from_codes(stock_items[:10], tool_context)
+        if not symbols_info:
+            return {"error": "请提供至少一个有效股票代码"}
+        ok, reason, report_text = run_ai_report(
+            symbols_info,
+            provider=provider,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+        )
+        ok_bool = bool(ok)
+        reviewed_symbols = reviewed_symbols_from_info(symbols_info)
+        policy_screen = {} if explicit_stock_items else screen_result
+        report_text = report_with_strategy_policy_context(report_text, policy_screen)
+        report_text = normalize_report_symbol_names(report_text, reviewed_symbols)
+        guard_summary = candidate_guard_summary(reviewed_symbols)
+        result = {
+            "ok": ok_bool,
+            "reason": str(reason or ""),
+            "report_text": str(report_text or ""),
+            "model": model,
+            "stock_count": len(symbols_info),
+            "reviewed_codes": [row["code"] for row in reviewed_symbols],
+            "reviewed_symbols": reviewed_symbols,
+            "next_action": report_next_action(ok_bool, guard_summary),
+            "next_tool": report_next_tool(ok_bool, guard_summary),
+        }
+        if policy := screen_strategy_policy(policy_screen):
+            result["strategy_policy"] = policy
+        if guard_summary:
+            result["candidate_guard_summary"] = guard_summary
+        remember_ai_report(tool_context, result)
+        return result
+    except Exception as e:
+        logger.exception("generate_ai_report error")
+        return {"error": str(e)}
+
+
+def normalize_report_symbol_names(report_text: Any, symbols_info: list[dict]) -> str:
+    text = str(report_text or "")
+    name_map = _report_symbol_name_map(symbols_info)
+    if not text or not name_map:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        code = match.group("code")
+        expected = name_map.get(code)
+        current = str(match.group("name") or "").strip()
+        if not expected or not current or current == expected:
+            return match.group(0)
+        return f"{match.group('prefix')}（{expected}）"
+
+    return _REPORT_CODE_NAME_RE.sub(replace, text)
+
+
+def _report_symbol_name_map(symbols_info: list[dict]) -> dict[str, str]:
+    name_map: dict[str, str] = {}
+    for item in symbols_info:
+        if not isinstance(item, dict):
+            continue
+        code = _candidate_code(item)
+        name = str(item.get("name") or "").strip()
+        if code and name:
+            name_map[code] = name
+    return name_map
+
+
+def symbols_info_from_codes(stock_codes: Any, tool_context: ToolContext | None = None) -> list[dict]:
+    screen_symbols = screen_symbol_map(tool_context)
+    stock_codes = _stock_code_items(stock_codes)
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for item in stock_codes:
+        code = _candidate_code(item)
+        if not code:
+            continue
+        row = dict(screen_symbols.get(code) or {})
+        if isinstance(item, dict):
+            row.update({key: value for key, value in item.items() if _has_value(value)})
+        row["code"] = code
+        row["name"] = str(row.get("name") or code_to_name(code)).strip()
+        row["tag"] = str(row.get("tag") or "chat_request").strip()
+        row["selection_source"] = str(row.get("selection_source") or "explicit_report_input").strip()
+        if code in seen:
+            continue
+        seen.add(code)
+        rows.append(row)
+    return rows
+
+
+def screen_auto_handoff_block_reason(screen_result: dict[str, Any]) -> str:
+    if not isinstance(screen_result, dict):
+        return ""
+    action_plan = screen_result.get("action_plan") if isinstance(screen_result.get("action_plan"), dict) else {}
+    selection = screen_result.get("selection_brief") if isinstance(screen_result.get("selection_brief"), dict) else {}
+    if reason := data_quality_auto_handoff_block_reason(action_plan, selection):
+        return reason
+    if reason := screen_quality_gate_auto_handoff_block_reason(screen_result, action_plan):
+        return reason
+    if reason := recommendation_eval_auto_handoff_block_reason(screen_result, selection, action_plan):
+        return reason
+    if reason := watch_only_auto_handoff_block_reason(screen_result, selection, action_plan):
+        return reason
+    return ""
+
+
+def screen_auto_handoff_block_status(screen_result: dict[str, Any]) -> str:
+    if not isinstance(screen_result, dict):
+        return "blocked"
+    action_plan = screen_result.get("action_plan") if isinstance(screen_result.get("action_plan"), dict) else {}
+    selection = screen_result.get("selection_brief") if isinstance(screen_result.get("selection_brief"), dict) else {}
+    if data_quality_auto_handoff_block_reason(action_plan, selection):
+        return "blocked_by_data_quality"
+    if screen_quality_gate_auto_handoff_block_reason(screen_result, action_plan):
+        return "blocked_by_quality_gate"
+    if recommendation_eval_auto_handoff_block_reason(screen_result, selection, action_plan):
+        return "blocked_by_policy_guard"
+    if watch_only_auto_handoff_block_reason(screen_result, selection, action_plan):
+        return "blocked_by_watch_only"
+    return "blocked"
+
+
+def screen_auto_handoff_block_message(status: str) -> str:
+    if status == "blocked_by_data_quality":
+        return "上一轮筛选数据质量不足，不能自动续接 AI 研报"
+    if status == "blocked_by_quality_gate":
+        return "上一轮候选质量门槛未过，不能自动续接 AI 研报"
+    return "上一轮候选仍是只读观察，不能自动续接 AI 研报"
+
+
+def data_quality_auto_handoff_block_reason(action_plan: dict[str, Any], selection: dict[str, Any]) -> str:
+    gate = action_plan.get("data_quality_gate") if isinstance(action_plan.get("data_quality_gate"), dict) else {}
+    if gate:
+        return str(gate.get("reason") or "数据质量不足，先重跑或缩小扫描范围")
+    review = action_plan.get("review_targets") if isinstance(action_plan.get("review_targets"), dict) else {}
+    if review.get("status") == "blocked_by_data_quality":
+        return str(review.get("reason") or "数据质量不足，先重跑或缩小扫描范围")
+    if selection.get("status") == "blocked_by_data_quality":
+        return str(selection.get("headline") or "数据质量不足，先重跑或缩小扫描范围")
+    return ""
+
+
+def quality_gate_auto_handoff_block_reason(action_plan: dict[str, Any]) -> str:
+    if action_plan.get("ai_review_allowed"):
+        return ""
+    review = action_plan.get("review_targets") if isinstance(action_plan.get("review_targets"), dict) else {}
+    if review.get("status") == "blocked_by_quality_gate":
+        return str(review.get("reason") or "候选风险调整质量分低于AI复核门槛")
+    gate = action_plan.get("quality_gate") if isinstance(action_plan.get("quality_gate"), dict) else {}
+    if gate:
+        return str(gate.get("reason") or "候选风险调整质量分低于AI复核门槛")
+    return ""
+
+
+def screen_quality_gate_auto_handoff_block_reason(screen_result: dict[str, Any], action_plan: dict[str, Any]) -> str:
+    if reason := quality_gate_auto_handoff_block_reason(action_plan):
+        return reason
+    gate = screen_result.get("quality_gate") if isinstance(screen_result.get("quality_gate"), dict) else {}
+    if not gate or _screen_has_report_candidates(screen_result):
+        return ""
+    return str(gate.get("reason") or "候选风险调整质量分低于AI复核门槛")
+
+
+def _screen_has_report_candidates(screen_result: dict[str, Any]) -> bool:
+    return bool(
+        _stock_code_items(screen_result.get("symbols_for_report"))
+        or _stock_code_items(screen_result.get("report_candidates"))
+    )
+
+
+def recommendation_eval_auto_handoff_block_reason(
+    screen_result: dict[str, Any],
+    selection: dict[str, Any],
+    action_plan: dict[str, Any],
+) -> str:
+    scan_scope = screen_result.get("scan_scope") if isinstance(screen_result.get("scan_scope"), dict) else {}
+    if scan_scope.get("source") != "recommendation_event_eval":
+        return ""
+    if selection.get("status") == "ready_for_ai_review":
+        return ""
+    return str(
+        action_plan.get("reason")
+        or selection.get("headline")
+        or "推荐事件评估仍是观察候选，需先明确股票代码或等待排序门槛通过"
+    )
+
+
+def watch_only_auto_handoff_block_reason(
+    screen_result: dict[str, Any],
+    selection: dict[str, Any],
+    action_plan: dict[str, Any],
+) -> str:
+    if _screen_has_report_candidates(screen_result):
+        return ""
+    review = action_plan.get("review_targets") if isinstance(action_plan.get("review_targets"), dict) else {}
+    if _stock_code_items(review.get("codes")):
+        return ""
+    if not _has_explicit_watch_only_handoff(screen_result, selection, action_plan):
+        return ""
+    return str(
+        action_plan.get("reason")
+        or review.get("reason")
+        or selection.get("headline")
+        or "上一轮只有观察候选，未形成可自动续接的研报候选"
+    )
+
+
+def _has_explicit_watch_only_handoff(
+    screen_result: dict[str, Any],
+    selection: dict[str, Any],
+    action_plan: dict[str, Any],
+) -> bool:
+    if action_plan and selection.get("status") == "watch_only":
+        return True
+    return bool(
+        _stock_code_items(screen_result.get("watch_candidates"))
+        or _stock_code_items(action_plan.get("watch_candidates"))
+    )
+
+
+def _screen_handoff_stock_items(tool_context: ToolContext | None) -> list[Any]:
+    screen_result = last_screen_result(tool_context)
+    if not screen_result:
+        return []
+    for value in _screen_handoff_sources(screen_result):
+        items = _stock_code_items(value)
+        if items:
+            return items
+    return []
+
+
+def _screen_handoff_sources(screen_result: dict[str, Any]) -> list[Any]:
+    selection = screen_result.get("selection_brief") if isinstance(screen_result.get("selection_brief"), dict) else {}
+    action_plan = screen_result.get("action_plan") if isinstance(screen_result.get("action_plan"), dict) else {}
+    review_targets = action_plan.get("review_targets") if isinstance(action_plan.get("review_targets"), dict) else {}
+    return [
+        _tool_handoff_stock_codes(selection.get("tool_handoff")),
+        _tool_handoff_stock_codes(review_targets),
+        review_targets.get("codes"),
+        screen_result.get("symbols_for_report"),
+        screen_result.get("report_candidates"),
+        selection.get("best_candidates"),
+        selection.get("best_codes"),
+        screen_result.get("top_candidates"),
+    ]
+
+
+def _tool_handoff_stock_codes(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return []
+    args = payload.get("args")
+    if isinstance(args, dict) and args.get("stock_codes"):
+        return args["stock_codes"]
+    return []
+
+
+def _stock_code_items(value: Any) -> list[Any]:
+    if value in (None, ""):
+        return []
+    items = list(value) if isinstance(value, (list, tuple, set)) else [value]
+    out: list[Any] = []
+    for item in items:
+        if isinstance(item, str):
+            codes = _stock_codes_from_text(item)
+            out.extend(codes or (part for part in re.split(r"[,，、\n]+", item) if part.strip()))
+        else:
+            out.append(item)
+    return out
+
+
+def _candidate_code(item: Any) -> str:
+    if isinstance(item, dict):
+        return normalize_stock_code(item.get("code") or item.get("symbol"))
+    return normalize_stock_code(item)
+
+
+def normalize_stock_code(raw: Any) -> str:
+    text = str(raw or "").strip()
+    match = _CN_CODE_RE.fullmatch(text)
+    return match.group(1) if match else text
+
+
+def _stock_codes_from_text(text: str) -> list[str]:
+    codes = _CN_CODE_TOKEN_RE.findall(str(text or ""))
+    return list(dict.fromkeys(codes))
+
+
+def last_screen_result(tool_context: ToolContext | None) -> dict[str, Any]:
+    value = tool_context.state.get("last_screen_result") if tool_context else {}
+    return value if isinstance(value, dict) else {}
+
+
+def reviewed_symbols_from_info(symbols_info: list[dict]) -> list[dict]:
+    return [symbol for row in symbols_info if (symbol := _compact_symbol(row)).get("code")]
+
+
+def _compact_symbol(row: dict[str, Any]) -> dict:
+    payload = {field: _compact_symbol_value(row.get(field), field) for field in _COMPACT_SYMBOL_FIELDS}
+    payload["code"] = normalize_stock_code(row.get("code") or row.get("symbol"))
+    return {key: value for key, value in payload.items() if _has_value(value)}
+
+
+def screen_symbol_map(tool_context: ToolContext | None) -> dict[str, dict]:
+    if tool_context is None:
+        return {}
+    screen_result = tool_context.state.get("last_screen_result")
+    if not isinstance(screen_result, dict):
+        return {}
+    if screen_auto_handoff_block_status(screen_result) in {
+        "blocked_by_data_quality",
+        "blocked_by_quality_gate",
+        "blocked_by_policy_guard",
+    }:
+        return {}
+    symbols: dict[str, dict] = {}
+    for row in _screen_symbol_rows(screen_result):
+        code = _candidate_code(row)
+        if not code or not isinstance(row, dict):
+            continue
+        _merge_symbol_context(symbols.setdefault(code, {}), row)
+    return symbols
+
+
+def _merge_symbol_context(payload: dict[str, Any], row: dict[str, Any]) -> None:
+    for key, value in row.items():
+        if _has_value(value) and not _has_value(payload.get(key)):
+            payload[key] = value
+
+
+def _screen_symbol_rows(screen_result: dict[str, Any]) -> list[Any]:
+    rows = (
+        list(screen_result.get("symbols_for_report") or [])
+        + list(screen_result.get("report_candidates") or [])
+        + list(screen_result.get("top_candidates") or [])
+    )
+    selection_brief = screen_result.get("selection_brief")
+    if isinstance(selection_brief, dict) and isinstance(selection_brief.get("best_candidates"), list):
+        rows.extend(selection_brief["best_candidates"])
+    return rows
+
+
+def remember_ai_report(tool_context: ToolContext | None, result: dict[str, Any]) -> None:
+    if tool_context is not None:
+        tool_context.state["last_ai_report"] = result
+
+
+def _compact_symbol_value(value: Any, field: str = "") -> Any:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        if field in _NUMERIC_LIST_SYMBOL_FIELDS:
+            items = [item for item in value if isinstance(item, (int, float))]
+            return items or None
+        items = [str(item).strip() for item in value if str(item).strip()]
+        return items or None
+    text = str(value).strip()
+    return text or None
+
+
+def report_next_action(ok: bool, guard_summary: dict[str, Any] | None = None) -> str:
+    if ok:
+        if guard_summary:
+            return "研报已完成；候选存在禁止直接买入边界，下一步只进入组合攻防复核"
+        return "研报已完成，可结合持仓和候选进入组合攻防决策"
+    return "研报未成功生成，先处理失败原因后再继续复核"
+
+
+def report_next_tool(ok: bool, guard_summary: dict[str, Any] | None = None) -> dict:
+    if not ok:
+        return {}
+    reason = "研报已完成，可继续生成持仓去留和新标的攻防计划"
+    if guard_summary:
+        reason = "研报已完成，可继续生成组合攻防复核；候选护栏禁止把观察/未成熟候选直接写成买入"
+    return {
+        "tool": "generate_strategy_decision",
+        "args": {},
+        "reason": reason,
+    }
+
+
+_COMPACT_SYMBOL_FIELDS = (
+    "code",
+    "name",
+    "tag",
+    "track",
+    "stage",
+    "candidate_lane",
+    "entry_type",
+    "selection_source",
+    "source_type",
+    "strategic_theme",
+    "theme_score",
+    "theme_source",
+    "theme_event_id",
+    "theme_event_date",
+    "theme_event_title",
+    "theme_event_reason",
+    "priority_rank",
+    "priority_score",
+    "shadow_score",
+    "score",
+    "selection_strategy",
+    "recommend_date",
+    "is_ai_recommended",
+    "funnel_score",
+    "recommend_count",
+    "candidate_shadow_score",
+    "candidate_shadow_grade",
+    "entry_quality_score",
+    "entry_quality_grade",
+    "entry_quality_risk_flags",
+    "candidate_quality_score",
+    "risk_adjusted_quality_score",
+    "entry_risk_penalty",
+    "label_ready",
+    "label_status",
+    "rank_reason",
+    "tier",
+    "quality",
+    "quality_factors",
+    "risk_factors",
+    "action_status",
+    "trade_readiness",
+    "new_buy_allowed",
+    "ai_review_allowed",
+    "entry_zone",
+    "stop_loss",
+    "max_entry_price",
+    "position_size_pct",
+    "tape_condition",
+    "invalidate_condition",
+    "why",
+    "evidence",
+    "next_step",
+    "capital_migration_bonus",
+    "industry",
+    "sector",
+)
+_NUMERIC_LIST_SYMBOL_FIELDS = {"entry_zone"}
+
+
+def run_ai_report(
+    symbols_info: list[dict],
+    *,
+    provider: str,
+    api_key: str,
+    model: str,
+    base_url: str,
+) -> tuple[bool, str, str]:
+    from workflows.step3_batch_report import run as run_step3
+
+    return run_step3(
+        symbols_info,
+        webhook_url="",
+        api_key=api_key,
+        model=model,
+        benchmark_context=None,
+        notify=False,
+        provider=provider,
+        llm_base_url=base_url,
+    )

@@ -9,19 +9,22 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import threading
 from datetime import datetime, timedelta
 from typing import Any
 
 from core import constants as core_constants
+from core.candidate_metadata import CANDIDATE_ATTRIBUTION_COLUMNS
+from utils.safe import finite_float, safe_float
 
 logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
 
-_SCHEMA_VERSION = 12
+_SCHEMA_VERSION = 15
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -36,9 +39,33 @@ CREATE TABLE IF NOT EXISTS recommendation_tracking (
     recommend_reason TEXT DEFAULT '',
     initial_price REAL DEFAULT 0,
     current_price REAL DEFAULT 0,
+    change_pct REAL DEFAULT 0,
+    funnel_score REAL,
+    recommend_count INTEGER DEFAULT 0,
     is_ai_recommended INTEGER DEFAULT 0,
     rag_vetoed INTEGER DEFAULT 0,
     camp TEXT DEFAULT '',
+    selection_source TEXT DEFAULT '',
+    selection_rank INTEGER,
+    priority_score REAL,
+    trigger_score REAL,
+    capital_migration_bonus REAL,
+    stage TEXT DEFAULT '',
+    industry TEXT DEFAULT '',
+    strategy_version TEXT DEFAULT '',
+    candidate_lane TEXT DEFAULT '',
+    entry_type TEXT DEFAULT '',
+    signal_key TEXT DEFAULT '',
+    candidate_status TEXT DEFAULT '',
+    candidate_timing TEXT DEFAULT '',
+    candidate_risk TEXT DEFAULT '',
+    candidate_reasons TEXT DEFAULT '',
+    candidate_metrics TEXT DEFAULT '',
+    mainline_score REAL,
+    theme_score REAL,
+    stock_role_score REAL,
+    quality_score REAL,
+    timing_score REAL,
     synced_at TEXT DEFAULT (datetime('now')),
     UNIQUE(code, recommend_date)
 );
@@ -53,6 +80,22 @@ CREATE TABLE IF NOT EXISTS signal_pending (
     days_elapsed INTEGER DEFAULT 0,
     regime TEXT DEFAULT '',
     industry TEXT DEFAULT '',
+    snap_support REAL,
+    snap_ma20 REAL,
+    strategy_version TEXT DEFAULT '',
+    candidate_lane TEXT DEFAULT '',
+    entry_type TEXT DEFAULT '',
+    signal_key TEXT DEFAULT '',
+    candidate_status TEXT DEFAULT '',
+    candidate_timing TEXT DEFAULT '',
+    candidate_risk TEXT DEFAULT '',
+    candidate_reasons TEXT DEFAULT '',
+    candidate_metrics TEXT DEFAULT '',
+    mainline_score REAL,
+    theme_score REAL,
+    stock_role_score REAL,
+    quality_score REAL,
+    timing_score REAL,
     synced_at TEXT DEFAULT (datetime('now')),
     UNIQUE(code, signal_type, signal_date)
 );
@@ -115,41 +158,6 @@ CREATE TABLE IF NOT EXISTS chat_log (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS tail_buy_history (
-    code TEXT NOT NULL,
-    name TEXT DEFAULT '',
-    run_date TEXT NOT NULL,
-    signal_date TEXT NOT NULL,
-    signal_type TEXT DEFAULT '',
-    status TEXT DEFAULT '',
-    final_decision TEXT NOT NULL,
-    rule_decision TEXT DEFAULT '',
-    rule_score REAL DEFAULT 0,
-    priority_score REAL DEFAULT 0,
-    rule_reasons TEXT DEFAULT '',
-    llm_decision TEXT DEFAULT '',
-    llm_reason TEXT DEFAULT '',
-    llm_confidence REAL,
-    llm_model_used TEXT DEFAULT '',
-    initial_price REAL DEFAULT 0,
-    current_price REAL DEFAULT 0,
-    change_pct REAL DEFAULT 0,
-    price_updated_at TEXT DEFAULT '',
-    last_close REAL DEFAULT 0,
-    vwap REAL DEFAULT 0,
-    dist_vwap_pct REAL DEFAULT 0,
-    close_pos REAL DEFAULT 0,
-    day_ret_pct REAL DEFAULT 0,
-    last30_ret_pct REAL DEFAULT 0,
-    last15_ret_pct REAL DEFAULT 0,
-    tail30_volume_share REAL DEFAULT 0,
-    drop_from_high_pct REAL DEFAULT 0,
-    fetch_error TEXT DEFAULT '',
-    features_json TEXT DEFAULT '',
-    created_at TEXT DEFAULT (datetime('now')),
-    UNIQUE(code, run_date)
-);
-
 CREATE TABLE IF NOT EXISTS background_task_result (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id TEXT NOT NULL,
@@ -190,20 +198,57 @@ CREATE TABLE IF NOT EXISTS workflow_event (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS research_hypothesis (
+    hypothesis_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    thesis TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'exploring',
+    universe TEXT DEFAULT '',
+    signal_definition TEXT DEFAULT '',
+    invalidation_criteria TEXT DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS research_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hypothesis_id TEXT NOT NULL,
+    evidence_type TEXT NOT NULL,
+    artifact_ref TEXT NOT NULL,
+    verdict TEXT DEFAULT 'review',
+    summary TEXT DEFAULT '',
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(hypothesis_id, evidence_type, artifact_ref),
+    FOREIGN KEY(hypothesis_id) REFERENCES research_hypothesis(hypothesis_id)
+);
+
+CREATE TABLE IF NOT EXISTS research_transition (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hypothesis_id TEXT NOT NULL,
+    from_status TEXT NOT NULL,
+    to_status TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    checklist_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY(hypothesis_id) REFERENCES research_hypothesis(hypothesis_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_rec_date ON recommendation_tracking(recommend_date);
 CREATE INDEX IF NOT EXISTS idx_sig_status ON signal_pending(status);
 CREATE INDEX IF NOT EXISTS idx_mem_type ON agent_memory(memory_type);
 CREATE INDEX IF NOT EXISTS idx_mem_codes ON agent_memory(codes);
 CREATE INDEX IF NOT EXISTS idx_chatlog_session ON chat_log(session_id);
 CREATE INDEX IF NOT EXISTS idx_chatlog_created ON chat_log(created_at);
-CREATE INDEX IF NOT EXISTS idx_tail_run_date ON tail_buy_history(run_date);
-CREATE INDEX IF NOT EXISTS idx_tail_decision ON tail_buy_history(final_decision);
 CREATE INDEX IF NOT EXISTS idx_bg_task_session ON background_task_result(session_id);
 CREATE INDEX IF NOT EXISTS idx_bg_task_created ON background_task_result(created_at);
 CREATE INDEX IF NOT EXISTS idx_theme_radar_synced ON theme_radar_snapshot(synced_at);
 CREATE INDEX IF NOT EXISTS idx_workflow_run_session ON workflow_run(session_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_run_updated ON workflow_run(updated_at);
 CREATE INDEX IF NOT EXISTS idx_workflow_event_run ON workflow_event(run_id, id);
+CREATE INDEX IF NOT EXISTS idx_research_hypothesis_status ON research_hypothesis(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_research_evidence_hypothesis ON research_evidence(hypothesis_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_research_transition_hypothesis ON research_transition(hypothesis_id, created_at);
 
 -- FTS5 全文检索索引（记忆系统 hybrid search）
 CREATE VIRTUAL TABLE IF NOT EXISTS agent_memory_fts USING fts5(
@@ -247,8 +292,9 @@ def get_db() -> sqlite3.Connection:
 def init_db() -> None:
     conn = get_db()
     conn.executescript(_DDL)
+    _ensure_recommendation_tracking_columns(conn)
+    _ensure_signal_pending_columns(conn)
     _ensure_agent_memory_columns(conn)
-    _ensure_tail_buy_history_columns(conn)
     cur = conn.execute("SELECT MAX(version) FROM schema_version")
     row = cur.fetchone()
     current = row[0] if row and row[0] else 0
@@ -268,8 +314,9 @@ def init_db() -> None:
             logger.warning("migration: add metadata column failed", exc_info=True)
     if current < 8:
         _ensure_agent_memory_columns(conn)
-    if current < 9:
-        _ensure_tail_buy_history_columns(conn)
+    if current < 13:
+        _ensure_recommendation_tracking_columns(conn)
+        _ensure_signal_pending_columns(conn)
     if current < _SCHEMA_VERSION:
         conn.execute(
             "INSERT OR REPLACE INTO schema_version(version) VALUES(?)",
@@ -278,46 +325,111 @@ def init_db() -> None:
         conn.commit()
 
 
-def _ensure_agent_memory_columns(conn: sqlite3.Connection) -> None:
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(agent_memory)").fetchall()}
+def _ensure_recommendation_tracking_columns(conn: sqlite3.Connection) -> None:
     columns = {
-        "memory_level": "TEXT DEFAULT 'L1'",
-        "source_ref": "TEXT DEFAULT ''",
-        "confidence": "REAL DEFAULT 1.0",
-        "metadata": "TEXT DEFAULT ''",
+        "change_pct": "REAL DEFAULT 0",
+        "funnel_score": "REAL",
+        "recommend_count": "INTEGER DEFAULT 0",
+        "selection_source": "TEXT DEFAULT ''",
+        "selection_rank": "INTEGER",
+        "priority_score": "REAL",
+        "trigger_score": "REAL",
+        "capital_migration_bonus": "REAL",
+        "stage": "TEXT DEFAULT ''",
+        "industry": "TEXT DEFAULT ''",
+        **_candidate_sqlite_columns(),
     }
+    _ensure_columns(conn, "recommendation_tracking", columns)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rec_lane ON recommendation_tracking(candidate_lane)")
+
+
+def _ensure_signal_pending_columns(conn: sqlite3.Connection) -> None:
+    columns = {
+        "snap_support": "REAL",
+        "snap_ma20": "REAL",
+        **_candidate_sqlite_columns(),
+    }
+    _ensure_columns(conn, "signal_pending", columns)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sig_lane ON signal_pending(candidate_lane)")
+
+
+def _candidate_sqlite_columns() -> dict[str, str]:
+    json_columns = {"candidate_reasons", "candidate_metrics"}
+    real_columns = {"mainline_score", "theme_score", "stock_role_score", "quality_score", "timing_score"}
+    return {
+        column: "REAL" if column in real_columns else "TEXT DEFAULT ''"
+        for column in CANDIDATE_ATTRIBUTION_COLUMNS
+        if column not in json_columns
+    } | {column: "TEXT DEFAULT ''" for column in json_columns}
+
+
+_SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    """Add missing columns to *table*. Identifiers are whitelist-validated before
+    being interpolated into DDL, since sqlite3 cannot bind table/column names as
+    parameters.
+    """
+    if not _SQL_IDENTIFIER_RE.match(table):
+        raise ValueError(f"unsafe table identifier: {table!r}")
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     for name, ddl in columns.items():
+        if not _SQL_IDENTIFIER_RE.match(name):
+            raise ValueError(f"unsafe column identifier: {name!r}")
         if name not in existing:
-            conn.execute(f"ALTER TABLE agent_memory ADD COLUMN {name} {ddl}")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def _bulk_upsert(
+    conn: sqlite3.Connection,
+    table: str,
+    columns: list[str],
+    rows: list[dict],
+    value_fn: Any,
+    *,
+    timestamp_column: str = "synced_at",
+) -> int:
+    """INSERT OR REPLACE *rows* into *table*, appending `datetime('now')` as the last column."""
+    if not rows:
+        return 0
+    if not _SQL_IDENTIFIER_RE.match(table):
+        raise ValueError(f"unsafe table identifier: {table!r}")
+    placeholders = ", ".join("?" for _ in columns)
+    with conn:
+        conn.executemany(
+            f"""INSERT OR REPLACE INTO {table}
+               ({", ".join(columns)}, {timestamp_column})
+               VALUES ({placeholders}, datetime('now'))""",
+            [value_fn(r) for r in rows],
+        )
+    return len(rows)
+
+
+def _bulk_delete_by_codes(conn: sqlite3.Connection, table: str, codes: list[str]) -> int:
+    if not codes:
+        return 0
+    if not _SQL_IDENTIFIER_RE.match(table):
+        raise ValueError(f"unsafe table identifier: {table!r}")
+    placeholders = ",".join("?" for _ in codes)
+    with conn:
+        cur = conn.execute(f"DELETE FROM {table} WHERE code IN ({placeholders})", codes)
+    return cur.rowcount
+
+
+def _ensure_agent_memory_columns(conn: sqlite3.Connection) -> None:
+    _ensure_columns(
+        conn,
+        "agent_memory",
+        {
+            "memory_level": "TEXT DEFAULT 'L1'",
+            "source_ref": "TEXT DEFAULT ''",
+            "confidence": "REAL DEFAULT 1.0",
+            "metadata": "TEXT DEFAULT ''",
+        },
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_level ON agent_memory(memory_level)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_mem_source ON agent_memory(source_ref)")
-
-
-def _ensure_tail_buy_history_columns(conn: sqlite3.Connection) -> None:
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(tail_buy_history)").fetchall()}
-    columns = {
-        "rule_decision": "TEXT DEFAULT ''",
-        "llm_confidence": "REAL",
-        "llm_model_used": "TEXT DEFAULT ''",
-        "initial_price": "REAL DEFAULT 0",
-        "current_price": "REAL DEFAULT 0",
-        "change_pct": "REAL DEFAULT 0",
-        "price_updated_at": "TEXT DEFAULT ''",
-        "last_close": "REAL DEFAULT 0",
-        "vwap": "REAL DEFAULT 0",
-        "dist_vwap_pct": "REAL DEFAULT 0",
-        "close_pos": "REAL DEFAULT 0",
-        "day_ret_pct": "REAL DEFAULT 0",
-        "last30_ret_pct": "REAL DEFAULT 0",
-        "last15_ret_pct": "REAL DEFAULT 0",
-        "tail30_volume_share": "REAL DEFAULT 0",
-        "drop_from_high_pct": "REAL DEFAULT 0",
-        "fetch_error": "TEXT DEFAULT ''",
-        "features_json": "TEXT DEFAULT ''",
-    }
-    for name, ddl in columns.items():
-        if name not in existing:
-            conn.execute(f"ALTER TABLE tail_buy_history ADD COLUMN {name} {ddl}")
 
 
 def _backfill_background_tasks_from_chat_log(conn: sqlite3.Connection) -> None:
@@ -343,7 +455,7 @@ def _backfill_background_tasks_from_chat_log(conn: sqlite3.Connection) -> None:
             except json.JSONDecodeError:
                 payload = {"raw": raw_json}
         result_json = json.dumps(payload, ensure_ascii=False, default=str)
-        summary = result_json[:2000] + ("..." if len(result_json) > 2000 else "")
+        summary = background_task_result_summary(tool_name, f"chatlog_{row['id']}", payload, result_json)
         conn.execute(
             """INSERT OR IGNORE INTO background_task_result
                (task_id, session_id, tool_name, status, result_json, summary, created_at)
@@ -392,6 +504,76 @@ def _migrate_fts5_memory(conn: sqlite3.Connection) -> None:
         logger.warning("fts5 memory migration failed", exc_info=True)
 
 
+def _recommendation_local_values(row: dict) -> tuple:
+    base = (
+        str(row.get("code", "")).strip(),
+        str(row.get("name", "")).strip(),
+        int(row.get("recommend_date", 0) or 0),
+        str(row.get("recommend_reason", "")).strip(),
+        safe_float(row.get("initial_price")),
+        safe_float(row.get("current_price")),
+        safe_float(row.get("change_pct")),
+        finite_float(row.get("funnel_score")),
+        int(row.get("recommend_count", 0) or 0),
+        1 if row.get("is_ai_recommended") else 0,
+        str(row.get("camp", "")).strip(),
+        str(row.get("selection_source", "")).strip(),
+        _nullable_int(row.get("selection_rank")),
+        finite_float(row.get("priority_score")),
+        finite_float(row.get("trigger_score")),
+        finite_float(row.get("capital_migration_bonus")),
+        str(row.get("stage", "")).strip(),
+        str(row.get("industry", "")).strip(),
+    )
+    return base + _candidate_local_values(row)
+
+
+def _signal_local_values(row: dict) -> tuple:
+    base = (
+        str(row.get("code", "")).strip(),
+        str(row.get("name", "")).strip(),
+        str(row.get("signal_type", "")).strip(),
+        str(row.get("signal_date", "")).strip(),
+        str(row.get("status", "pending")).strip(),
+        safe_float(row.get("signal_score")),
+        int(row.get("days_elapsed", 0) or 0),
+        str(row.get("regime", "")).strip(),
+        str(row.get("industry", "")).strip(),
+        finite_float(row.get("snap_support")),
+        finite_float(row.get("snap_ma20")),
+    )
+    return base + _candidate_local_values(row)
+
+
+def _candidate_local_values(row: dict) -> tuple:
+    return tuple(_candidate_local_value(column, row.get(column)) for column in CANDIDATE_ATTRIBUTION_COLUMNS)
+
+
+def _candidate_local_value(column: str, value: Any) -> Any:
+    if column in {"candidate_reasons", "candidate_metrics"}:
+        return _json_text(value)
+    if column in {"mainline_score", "theme_score", "stock_role_score", "quality_score", "timing_score"}:
+        return finite_float(value)
+    return str(value or "").strip()
+
+
+def _json_text(value: Any) -> str:
+    if value in (None, "", [], {}):
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _nullable_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Recommendation tracking
 # ---------------------------------------------------------------------------
@@ -401,27 +583,28 @@ def save_recommendations(rows: list[dict]) -> int:
     if not rows:
         return 0
     conn = get_db()
-    with conn:
-        conn.executemany(
-            """INSERT OR REPLACE INTO recommendation_tracking
-               (code, name, recommend_date, recommend_reason, initial_price,
-                current_price, is_ai_recommended, camp, synced_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
-            [
-                (
-                    str(r.get("code", "")).strip(),
-                    str(r.get("name", "")).strip(),
-                    int(r.get("recommend_date", 0)),
-                    str(r.get("recommend_reason", "")).strip(),
-                    float(r.get("initial_price", 0) or 0),
-                    float(r.get("current_price", 0) or 0),
-                    1 if r.get("is_ai_recommended") else 0,
-                    str(r.get("camp", "")).strip(),
-                )
-                for r in rows
-            ],
-        )
-    return len(rows)
+    columns = [
+        "code",
+        "name",
+        "recommend_date",
+        "recommend_reason",
+        "initial_price",
+        "current_price",
+        "change_pct",
+        "funnel_score",
+        "recommend_count",
+        "is_ai_recommended",
+        "camp",
+        "selection_source",
+        "selection_rank",
+        "priority_score",
+        "trigger_score",
+        "capital_migration_bonus",
+        "stage",
+        "industry",
+        *CANDIDATE_ATTRIBUTION_COLUMNS,
+    ]
+    return _bulk_upsert(conn, "recommendation_tracking", columns, rows, _recommendation_local_values)
 
 
 def load_recommendations(*, limit: int = 100) -> list[dict]:
@@ -442,41 +625,25 @@ def save_signals(rows: list[dict]) -> int:
     if not rows:
         return 0
     conn = get_db()
-    with conn:
-        conn.executemany(
-            """INSERT OR REPLACE INTO signal_pending
-               (code, name, signal_type, signal_date, status, signal_score,
-                days_elapsed, regime, industry, synced_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
-            [
-                (
-                    str(r.get("code", "")).strip(),
-                    str(r.get("name", "")).strip(),
-                    str(r.get("signal_type", "")).strip(),
-                    str(r.get("signal_date", "")).strip(),
-                    str(r.get("status", "pending")).strip(),
-                    float(r.get("signal_score", 0) or 0),
-                    int(r.get("days_elapsed", 0) or 0),
-                    str(r.get("regime", "")).strip(),
-                    str(r.get("industry", "")).strip(),
-                )
-                for r in rows
-            ],
-        )
-    return len(rows)
+    columns = [
+        "code",
+        "name",
+        "signal_type",
+        "signal_date",
+        "status",
+        "signal_score",
+        "days_elapsed",
+        "regime",
+        "industry",
+        "snap_support",
+        "snap_ma20",
+        *CANDIDATE_ATTRIBUTION_COLUMNS,
+    ]
+    return _bulk_upsert(conn, "signal_pending", columns, rows, _signal_local_values)
 
 
 def delete_recommendations(codes: list[str]) -> int:
-    if not codes:
-        return 0
-    conn = get_db()
-    placeholders = ",".join("?" for _ in codes)
-    with conn:
-        cur = conn.execute(
-            f"DELETE FROM recommendation_tracking WHERE code IN ({placeholders})",
-            codes,
-        )
-    return cur.rowcount
+    return _bulk_delete_by_codes(get_db(), "recommendation_tracking", codes)
 
 
 def load_signals(*, status: str | None = None, limit: int = 200) -> list[dict]:
@@ -525,16 +692,7 @@ def load_signals_by_codes(codes: list[str]) -> dict[str, dict]:
 
 
 def delete_signals(codes: list[str]) -> int:
-    if not codes:
-        return 0
-    conn = get_db()
-    placeholders = ",".join("?" for _ in codes)
-    with conn:
-        cur = conn.execute(
-            f"DELETE FROM signal_pending WHERE code IN ({placeholders})",
-            codes,
-        )
-    return cur.rowcount
+    return _bulk_delete_by_codes(get_db(), "signal_pending", codes)
 
 
 # ---------------------------------------------------------------------------
@@ -550,18 +708,6 @@ def save_market_signal(trade_date: str, data: dict) -> None:
                (trade_date, data_json, synced_at) VALUES (?, ?, datetime('now'))""",
             (str(trade_date).strip(), json.dumps(data, ensure_ascii=False)),
         )
-
-
-def load_latest_market_signal() -> dict | None:
-    conn = get_db()
-    cur = conn.execute("SELECT data_json FROM market_signal_daily ORDER BY trade_date DESC LIMIT 1")
-    row = cur.fetchone()
-    if not row:
-        return None
-    try:
-        return json.loads(row["data_json"])
-    except (json.JSONDecodeError, TypeError):
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +840,17 @@ def upsert_local_position(
             )
 
 
+def set_local_position_stop(portfolio_id: str, code: str, stop_loss: float | None) -> int:
+    """只更新 stop_loss 列，不新建持仓。返回受影响行数。"""
+    conn = get_db()
+    with conn:
+        cur = conn.execute(
+            "UPDATE portfolio_position SET stop_loss=?, synced_at=datetime('now') WHERE portfolio_id=? AND code=?",
+            (float(stop_loss) if stop_loss is not None else None, portfolio_id, code),
+        )
+        return cur.rowcount or 0
+
+
 def delete_local_position(portfolio_id: str, code: str) -> None:
     conn = get_db()
     with conn:
@@ -721,6 +878,7 @@ def update_local_free_cash(portfolio_id: str, free_cash: float) -> None:
 _MEMORY_KEEP_LIMITS: dict[str, int] = {
     "preference": 50,
     "persona": 5,
+    "playbook": 20,
     "scenario": 20,
     "session": 50,
     "fact": 50,
@@ -728,12 +886,35 @@ _MEMORY_KEEP_LIMITS: dict[str, int] = {
     "decision": 30,
     "market_view": 20,
 }
+_MEMORY_RECALL_WEIGHTS = {
+    "fts": 0.8,
+    "code": 1.2,
+    "keyword": 0.25,
+}
+_MEMORY_DECAY_HALF_LIFE_DAYS = {
+    "decision": 14.0,
+    "playbook": 21.0,
+    "scenario": 21.0,
+    "stock_opinion": 14.0,
+    "market_view": 14.0,
+    "fact": 14.0,
+}
+_MEMORY_RETENTION_DAYS = {
+    "decision": 45,
+    "playbook": 60,
+    "scenario": 60,
+    "stock_opinion": 45,
+    "market_view": 30,
+    "fact": 45,
+    "session": 30,
+}
+_MEMORY_NO_DECAY_TYPES = {"preference", "persona"}
 
 
 def _memory_level(memory_type: str) -> str:
     if memory_type == "persona":
         return "L3"
-    if memory_type == "scenario":
+    if memory_type in {"playbook", "scenario"}:
         return "L2"
     return "L1"
 
@@ -895,21 +1076,54 @@ def search_memory_fts(query: str, limit: int = 10) -> list[dict]:
         return []
 
 
+def _memory_codes(row: dict) -> set[str]:
+    raw = str(row.get("codes", "") or "")
+    return {part.strip() for part in raw.split(",") if len(part.strip()) == 6 and part.strip().isdigit()}
+
+
+def _scope_memory_results(candidates: dict[int, dict], codes: list[str] | None) -> dict[int, dict]:
+    current_codes = set(codes or [])
+    scoped: dict[int, dict] = {}
+    for mid, row in candidates.items():
+        mem_codes = _memory_codes(row)
+        if not mem_codes or mem_codes & current_codes:
+            scoped[mid] = row
+    return scoped
+
+
+def _memory_decay(row: dict, age_days: float, fallback_half_life_days: float) -> float:
+    import math
+
+    if row.get("memory_type") in _MEMORY_NO_DECAY_TYPES:
+        return 1.0
+    half_life = _MEMORY_DECAY_HALF_LIFE_DAYS.get(str(row.get("memory_type") or ""), fallback_half_life_days)
+    return math.pow(2, -age_days / max(half_life, 1.0))
+
+
+def _memory_age_days(row: dict) -> float | None:
+    created = row.get("created_at", "")
+    if not created:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(created))
+    except (ValueError, TypeError):
+        return None
+    return max((datetime.utcnow() - dt).total_seconds() / 86400, 0)
+
+
 def search_memory_hybrid(
     *,
     query_text: str,
     codes: list[str] | None = None,
     keywords: list[str] | None = None,
     limit: int = 8,
-    decay_half_life_days: float = 30.0,
+    decay_half_life_days: float = 14.0,
+    strict_code_scope: bool = False,
 ) -> list[dict]:
     """Hybrid search: FTS5 全文 + 代码匹配 + 关键词 LIKE + 时间衰减加权。
 
     返回按综合得分排序的记忆列表，每条带 _score 字段。
     """
-    import math
-    from datetime import datetime
-
     candidates: dict[int, dict] = {}
 
     def _merge(items: list[dict], source_weight: float) -> None:
@@ -924,34 +1138,24 @@ def search_memory_hybrid(
     # 1. FTS5 全文检索（最高权重）
     if query_text and len(query_text.strip()) >= 2:
         fts_results = search_memory_fts(query_text, limit=limit * 2)
-        _merge(fts_results, 1.0)
+        _merge(fts_results, _MEMORY_RECALL_WEIGHTS["fts"])
 
     # 2. 股票代码精确匹配
     if codes:
         code_results = search_memory(codes=codes, limit=limit * 2)
-        _merge(code_results, 0.85)
+        _merge(code_results, _MEMORY_RECALL_WEIGHTS["code"])
 
     # 3. 关键词 LIKE 检索
     if keywords:
         kw_results = search_memory_by_keywords(keywords, limit=limit * 2)
-        _merge(kw_results, 0.6)
+        _merge(kw_results, _MEMORY_RECALL_WEIGHTS["keyword"])
 
-    # 4. 时间衰减加权
-    now = datetime.utcnow()
+    if strict_code_scope:
+        candidates = _scope_memory_results(candidates, codes)
+
     for m in candidates.values():
-        created = m.get("created_at", "")
-        if created:
-            try:
-                dt = datetime.fromisoformat(str(created))
-                age_days = max((now - dt).total_seconds() / 86400, 0)
-                decay = math.pow(2, -age_days / decay_half_life_days)
-            except (ValueError, TypeError):
-                decay = 0.5
-        else:
-            decay = 0.5
-        # 高层用户画像不衰减
-        if m.get("memory_type") in ("preference", "persona"):
-            decay = 1.0
+        age_days = _memory_age_days(m)
+        decay = 0.5 if age_days is None else _memory_decay(m, age_days, decay_half_life_days)
         m["_score"] = m.get("_score", 0.5) * decay
 
     # 按得分排序
@@ -959,15 +1163,30 @@ def search_memory_hybrid(
     return ranked[:limit]
 
 
+def _prune_agent_memory(conn: sqlite3.Connection, *, fallback_keep_days: int) -> int:
+    deleted = 0
+    for memory_type, keep_days in _MEMORY_RETENTION_DAYS.items():
+        cutoff = (datetime.utcnow() - timedelta(days=keep_days)).isoformat()
+        cur = conn.execute(
+            "DELETE FROM agent_memory WHERE memory_type=? AND created_at < ?",
+            (memory_type, cutoff),
+        )
+        deleted += cur.rowcount
+    cutoff = (datetime.utcnow() - timedelta(days=fallback_keep_days)).isoformat()
+    cur = conn.execute(
+        "DELETE FROM agent_memory WHERE created_at < ? AND memory_type NOT IN (?, ?)",
+        (cutoff, "preference", "persona"),
+    )
+    return deleted + cur.rowcount
+
+
+prune_agent_memory_for_connection = _prune_agent_memory
+
+
 def prune_memories(keep_days: int = 90) -> int:
     conn = get_db()
-    cutoff = (datetime.utcnow() - timedelta(days=keep_days)).isoformat()
     with conn:
-        cur = conn.execute(
-            "DELETE FROM agent_memory WHERE created_at < ? AND memory_type NOT IN ('preference', 'persona')",
-            (cutoff,),
-        )
-        return cur.rowcount
+        return _prune_agent_memory(conn, fallback_keep_days=keep_days)
 
 
 # ---------------------------------------------------------------------------
@@ -1071,9 +1290,7 @@ def save_background_task_result(
 ) -> int:
     """Persist a completed CLI background task result for dashboard history."""
     result_json = json.dumps(result, ensure_ascii=False, default=str)
-    summary = result_json
-    if len(summary) > 2000:
-        summary = summary[:2000] + "..."
+    summary = background_task_result_summary(tool_name, task_id, result, result_json)
     conn = get_db()
     with conn:
         cur = conn.execute(
@@ -1083,6 +1300,24 @@ def save_background_task_result(
             (task_id, session_id, tool_name, status, result_json, summary),
         )
         return cur.lastrowid or 0
+
+
+def background_task_result_summary(
+    tool_name: str,
+    task_id: str,
+    result: Any,
+    result_json: str | None = None,
+) -> str:
+    try:
+        from utils.tool_result_preview import serialize_tool_result, tool_result_preview
+
+        content = result_json if result_json is not None else serialize_tool_result(result)
+        if len(content) <= 3000:
+            return content
+        return tool_result_preview(tool_name, result, content)
+    except Exception:
+        raw = result_json if result_json is not None else json.dumps(result, ensure_ascii=False, default=str)
+        return raw[:2000] + ("..." if len(raw) > 2000 else "")
 
 
 def load_background_task_results(*, limit: int = 100) -> list[dict]:
@@ -1129,86 +1364,173 @@ def get_session_preview(session_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tail-buy history
+# Research hypotheses
 # ---------------------------------------------------------------------------
 
 
-def save_tail_buy_results(rows: list[dict]) -> int:
-    if not rows:
-        return 0
+def create_research_hypothesis(row: dict[str, Any]) -> dict[str, Any]:
+    init_db()
     conn = get_db()
     with conn:
-        conn.executemany(
-            """INSERT OR REPLACE INTO tail_buy_history
-               (code, name, run_date, signal_date, signal_type, status,
-                final_decision, rule_decision, rule_score, priority_score, rule_reasons,
-                llm_decision, llm_reason, llm_confidence, llm_model_used,
-                initial_price, current_price, change_pct, price_updated_at,
-                last_close, vwap, dist_vwap_pct, close_pos, day_ret_pct,
-                last30_ret_pct, last15_ret_pct, tail30_volume_share, drop_from_high_pct,
-                fetch_error, features_json, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
-            [_tail_buy_insert_values(r) for r in rows],
+        conn.execute(
+            """INSERT INTO research_hypothesis
+               (hypothesis_id, title, thesis, status, universe, signal_definition, invalidation_criteria)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                row["hypothesis_id"],
+                row["title"],
+                row["thesis"],
+                row["status"],
+                row.get("universe", ""),
+                row.get("signal_definition", ""),
+                row.get("invalidation_criteria", ""),
+            ),
         )
-    return len(rows)
+    return load_research_hypothesis(row["hypothesis_id"]) or {}
 
 
-def _tail_buy_insert_values(r: dict) -> tuple[Any, ...]:
-    return (
-        str(r.get("code", "")).strip(),
-        str(r.get("name", "")).strip(),
-        str(r.get("run_date", "")).strip(),
-        str(r.get("signal_date", "")).strip(),
-        str(r.get("signal_type", "")).strip(),
-        str(r.get("status", "")).strip(),
-        str(r.get("final_decision", "")).strip(),
-        str(r.get("rule_decision", "")).strip(),
-        float(r.get("rule_score", 0) or 0),
-        float(r.get("priority_score", 0) or 0),
-        str(r.get("rule_reasons", "")).strip(),
-        str(r.get("llm_decision", "")).strip(),
-        str(r.get("llm_reason", "")).strip(),
-        r.get("llm_confidence"),
-        str(r.get("llm_model_used", "")).strip(),
-        float(r.get("initial_price", 0) or 0),
-        float(r.get("current_price", 0) or 0),
-        float(r.get("change_pct", 0) or 0),
-        str(r.get("price_updated_at", "")).strip(),
-        float(r.get("last_close", 0) or 0),
-        float(r.get("vwap", 0) or 0),
-        float(r.get("dist_vwap_pct", 0) or 0),
-        float(r.get("close_pos", 0) or 0),
-        float(r.get("day_ret_pct", 0) or 0),
-        float(r.get("last30_ret_pct", 0) or 0),
-        float(r.get("last15_ret_pct", 0) or 0),
-        float(r.get("tail30_volume_share", 0) or 0),
-        float(r.get("drop_from_high_pct", 0) or 0),
-        str(r.get("fetch_error", "")).strip(),
-        str(r.get("features_json", "")).strip(),
-    )
-
-
-def load_tail_buy_history(
-    *,
-    run_date: str = "",
-    decision: str = "",
-    limit: int = 50,
-) -> list[dict]:
+def list_research_hypotheses(*, status: str = "", limit: int = 50) -> list[dict[str, Any]]:
+    init_db()
     conn = get_db()
-    clauses: list[str] = []
     params: list[Any] = []
-    if run_date:
-        clauses.append("run_date = ?")
-        params.append(run_date.strip())
-    if decision:
-        clauses.append("final_decision = ?")
-        params.append(decision.strip().upper())
-    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    cur = conn.execute(
-        f"SELECT * FROM tail_buy_history {where} ORDER BY run_date DESC, priority_score DESC LIMIT ?",
-        params + [min(max(limit, 1), 200)],
-    )
-    return [dict(r) for r in cur.fetchall()]
+    where = ""
+    if status:
+        where = "WHERE status=?"
+        params.append(status)
+    params.append(max(1, min(int(limit), 200)))
+    rows = conn.execute(
+        f"""SELECT * FROM research_hypothesis {where}
+            ORDER BY updated_at DESC LIMIT ?""",
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def load_research_hypothesis(hypothesis_id: str) -> dict[str, Any] | None:
+    init_db()
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM research_hypothesis WHERE hypothesis_id=?",
+        (hypothesis_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    evidence = conn.execute(
+        """SELECT * FROM research_evidence WHERE hypothesis_id=?
+           ORDER BY created_at DESC, id DESC""",
+        (hypothesis_id,),
+    ).fetchall()
+    result["evidence"] = [_research_evidence_row(item) for item in evidence]
+    transitions = conn.execute(
+        """SELECT * FROM research_transition WHERE hypothesis_id=?
+           ORDER BY created_at DESC, id DESC""",
+        (hypothesis_id,),
+    ).fetchall()
+    result["transitions"] = [_research_transition_row(item) for item in transitions]
+    return result
+
+
+def update_research_hypothesis(hypothesis_id: str, changes: dict[str, Any]) -> dict[str, Any] | None:
+    allowed = {
+        "title",
+        "thesis",
+        "status",
+        "universe",
+        "signal_definition",
+        "invalidation_criteria",
+    }
+    values = {key: value for key, value in changes.items() if key in allowed and value is not None}
+    if not values:
+        return load_research_hypothesis(hypothesis_id)
+    assignments = ", ".join(f"{key}=?" for key in values)
+    conn = get_db()
+    with conn:
+        cursor = conn.execute(
+            f"""UPDATE research_hypothesis SET {assignments}, updated_at=datetime('now')
+                WHERE hypothesis_id=?""",
+            [*values.values(), hypothesis_id],
+        )
+    return load_research_hypothesis(hypothesis_id) if cursor.rowcount else None
+
+
+def link_research_evidence(row: dict[str, Any]) -> dict[str, Any]:
+    init_db()
+    conn = get_db()
+    with conn:
+        conn.execute(
+            """INSERT INTO research_evidence
+               (hypothesis_id, evidence_type, artifact_ref, verdict, summary, metrics_json)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(hypothesis_id, evidence_type, artifact_ref) DO UPDATE SET
+                 verdict=excluded.verdict, summary=excluded.summary,
+                 metrics_json=excluded.metrics_json, created_at=datetime('now')""",
+            (
+                row["hypothesis_id"],
+                row["evidence_type"],
+                row["artifact_ref"],
+                row.get("verdict", "review"),
+                row.get("summary", ""),
+                json.dumps(row.get("metrics") or {}, ensure_ascii=False, default=str),
+            ),
+        )
+        conn.execute(
+            "UPDATE research_hypothesis SET updated_at=datetime('now') WHERE hypothesis_id=?",
+            (row["hypothesis_id"],),
+        )
+    return load_research_hypothesis(row["hypothesis_id"]) or {}
+
+
+def transition_research_hypothesis(
+    hypothesis_id: str,
+    *,
+    from_status: str,
+    to_status: str,
+    reason: str,
+    checklist: dict[str, Any],
+) -> dict[str, Any] | None:
+    conn = get_db()
+    with conn:
+        cursor = conn.execute(
+            """UPDATE research_hypothesis SET status=?, updated_at=datetime('now')
+               WHERE hypothesis_id=? AND status=?""",
+            (to_status, hypothesis_id, from_status),
+        )
+        if not cursor.rowcount:
+            return None
+        conn.execute(
+            """INSERT INTO research_transition
+               (hypothesis_id, from_status, to_status, reason, checklist_json)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                hypothesis_id,
+                from_status,
+                to_status,
+                reason,
+                json.dumps(checklist, ensure_ascii=False, default=str),
+            ),
+        )
+    return load_research_hypothesis(hypothesis_id)
+
+
+def _research_evidence_row(row: sqlite3.Row) -> dict[str, Any]:
+    result = dict(row)
+    raw_metrics = result.pop("metrics_json", "{}")
+    try:
+        result["metrics"] = json.loads(raw_metrics or "{}")
+    except json.JSONDecodeError:
+        result["metrics"] = {}
+    return result
+
+
+def _research_transition_row(row: sqlite3.Row) -> dict[str, Any]:
+    result = dict(row)
+    raw_checklist = result.pop("checklist_json", "{}")
+    try:
+        result["checklist"] = json.loads(raw_checklist or "{}")
+    except json.JSONDecodeError:
+        result["checklist"] = {}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1271,10 +1593,5 @@ def cleanup_old_records(days: int = 30) -> dict[str, int]:
                WHERE run_id NOT IN (SELECT run_id FROM workflow_run)""",
         )
         deleted["workflow_event"] = cur.rowcount
-        cur = conn.execute(
-            """DELETE FROM agent_memory
-               WHERE created_at < ? AND memory_type NOT IN ('preference', 'persona')""",
-            (cutoff,),
-        )
-        deleted["agent_memory"] = cur.rowcount
+        deleted["agent_memory"] = _prune_agent_memory(conn, fallback_keep_days=days)
     return deleted
